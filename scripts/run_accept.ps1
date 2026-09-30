@@ -26,7 +26,8 @@ try {
     foreach ($cfg in @(@('prod', ''), @('cached', ''), @('cached', '--spec-adapt'))) {
       $v = $cfg[0]; $x = $cfg[1]; $tag = if ($x) { "$v-adapt" } else { $v }
       Log "case 5 bench $tag"
-      python -X utf8 $A serve --variant $v --extra "$x" *>> "$O\c5.out"
+      $ex = if ($x) { @("--extra=$x") } else { @() }   # "--extra --spec-adapt" would be parsed as its own option
+      python -X utf8 $A serve --variant $v @ex *>> "$O\c5.out"
       foreach ($i in 1..3) { python -X utf8 "$D\step3_bench.py" run --base-url http://127.0.0.1:18101 --label "$tag-$i" --out "$O\bench-$tag.jsonl" *>> "$O\c5.out" }
     }
     

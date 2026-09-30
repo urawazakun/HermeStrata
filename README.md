@@ -73,6 +73,13 @@ scripts/                server launcher (PowerShell), Hermes launcher (.cmd), GP
 
 Scripts resolve the project root from `HERMESTRATA_ROOT` (default: the parent of `scripts/`); model and pack paths come from the launcher's config section. Paths only matter at startup, not for speed.
 
+## Reading the final code
+
+`pwsh scripts/materialize.ps1` clones both upstreams at the pinned bases and applies the patch series (one commit per
+patch) into `materialized/strata` and `materialized/hermes-agent`, so the current state can be read as plain source
+instead of composing the patches in your head. Checked: the Strata result has the same tree hash as the source commit
+the patches were generated from.
+
 ## Patch bases
 
 The Strata series is pinned to upstream commit
