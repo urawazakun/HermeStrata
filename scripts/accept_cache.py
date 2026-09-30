@@ -19,7 +19,7 @@ SRC_ACCEPT = Path(os.environ.get("ACCEPT_SRC", ROOT / "strata-accept"))
 BODY = json.loads((ROOT / "briefs" / "dumps-growing-lcp" / "bisect-body.json").read_text(encoding="utf-8"))["request"]["body"]
 PORT = 18101
 URL = f"http://127.0.0.1:{PORT}"
-COLD = ["--prompt-cache", "0", "--tip-cache-gib", "0", "--prompt-cache-root", "0"]
+COLD = ["--prompt-cache", "0", "--tip-cache-gib", "0", "--prompt-cache-root", "0", "--no-root-disk"]
 OUT.mkdir(parents=True, exist_ok=True)
 PIDFILE = OUT / "server.pid"
 
@@ -55,6 +55,9 @@ def start(variant, extra=()):
         if pr.poll() is not None:
             sys.exit(f"server exited rc={pr.returncode}; see {log}")
         time.sleep(3)
+    else:
+        stop()
+        sys.exit(f"server readiness timed out after 900s; see {log}")
     print(f"[{variant}] up in {time.time() - t0:.0f}s  log={log}  args+={' '.join(args[-8:])}", flush=True)
     return log
 
