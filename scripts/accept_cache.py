@@ -13,9 +13,9 @@ from pathlib import Path
 ROOT = Path(os.environ.get("HERMESTRATA_ROOT", Path(__file__).resolve().parent.parent))  # project root
 OUT = ROOT / "logs" / "accept"
 PROD_CFG = ROOT / "deploy-strata" / "strata-qwen-iq3_s.run.json"
-EXE_ACCEPT = ROOT / "build-strata-accept" / "strata.exe"
+EXE_ACCEPT = Path(os.environ.get("ACCEPT_EXE", ROOT / "build-strata-accept" / "strata.exe"))
 EXE_PROD = ROOT / "deploy-strata" / "bin-0121" / "strata.exe"
-SRC_ACCEPT = ROOT / "strata-accept"
+SRC_ACCEPT = Path(os.environ.get("ACCEPT_SRC", ROOT / "strata-accept"))
 BODY = json.loads((ROOT / "briefs" / "dumps-growing-lcp" / "bisect-body.json").read_text(encoding="utf-8"))["request"]["body"]
 PORT = 18101
 URL = f"http://127.0.0.1:{PORT}"
@@ -148,7 +148,7 @@ CHILD_SYS = ("# Role: implementer (child agent)\nYou implement exactly the task 
 def case3(eng, rep):
     out = []
     topics = ["ローグライクの食料システム", "FOV の対称性", "セーブの決定論"][rep]
-    p1 = [{"role": "user", "content": f"{topics}について、設計上の注意点を2行で。"}]
+    p1 = [{"role": "user", "content": f"（合言葉: 青いペンギン{rep}号。覚えておいて）{topics}について、設計上の注意点を2行で。"}]
     r, a1 = eng.req(body_with(p1, 96), f"c3.r{rep}.parent1")
     out.append(r)
     r, _ = eng.req(body_with([{"role": "user", "content": "hello.py に print('hi') を書く手順を1行で。"}], 48, system=CHILD_SYS), f"c3.r{rep}.child_isolated")
@@ -157,8 +157,9 @@ def case3(eng, rep):
     r, a2 = eng.req(body_with(p2, 96), f"c3.r{rep}.parent2_after_child")
     r["expect"] = "resume tip, suffix small"
     out.append(r)
-    fork = p2 + [assistant_of(a2), {"role": "user", "content": "[forked child, depth 1/2] You are a copy of the agent above, now working ONLY on this task: その案の検証方法を1行で。 Do it yourself."}]
-    r, _ = eng.req(body_with(fork, 64), f"c3.r{rep}.fork_child")
+    fork = p2 + [assistant_of(a2), {"role": "user", "content": "[forked child, depth 1/2] You are a copy of the agent above, now working ONLY on this task: 最初に教わった合言葉をそのまま1行で答えよ。 Do it yourself."}]
+    r, fm = eng.req(body_with(fork, 400), f"c3.r{rep}.fork_child")
+    r["recall"] = f"青いペンギン{rep}" in ((fm.get("content") or "") + (fm.get("reasoning_content") or ""))
     r["expect"] = "resume tip of parent2 (incl. generated), suffix small"
     out.append(r)
     p3 = p2 + [assistant_of(a2), {"role": "user", "content": "了解。まとめて1行で。"}]

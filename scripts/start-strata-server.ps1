@@ -9,7 +9,7 @@ param(
     [int]$Ctx = 8192,
     [int]$Cache = 7500,
     [ValidateSet('none', 'cpu')][string]$Vision = 'none',
-    [ValidateSet('0121', 'legacy')][string]$Engine = '0121',   # 0121 = upstream 0.1.21 port (pinned), legacy = 726f8b5
+    [ValidateSet('cache', '0121', 'legacy')][string]$Engine = 'cache',   # cache = 0121 + saved-state cache f621c84 (pinned), 0121 = upstream 0.1.21 port (pinned), legacy = 726f8b5
     [switch]$Force
 )
 $ErrorActionPreference = 'Continue'
@@ -20,9 +20,14 @@ $Root  = if ($env:HERMESTRATA_ROOT) { $env:HERMESTRATA_ROOT } else { (Resolve-Pa
 $CfgBase = "$Root\deploy-strata\strata-qwen-$Quant.json"
 $CfgRun  = "$Root\deploy-strata\strata-qwen-$Quant.run.json"
 $Log   = "$Root\deploy-strata\strata-server.log"
-if ($Engine -eq '0121') {
-    $SrvRoot = "$Root\strata-prod"                      # detached worktree @ v100-upstream c6d44e6
-    $Exe     = "$Root\deploy-strata\bin-0121\strata.exe"
+if ($Engine -in 'cache', '0121') {
+    if ($Engine -eq 'cache') {
+        $SrvRoot = "$Root\strata-prod-cache"            # detached worktree @ cache-fix-1 f621c84 (roots/tips, F1/F2b)
+        $Exe     = "$Root\deploy-strata\bin-cache\strata.exe"
+    } else {
+        $SrvRoot = "$Root\strata-prod"                  # detached worktree @ v100-upstream c6d44e6
+        $Exe     = "$Root\deploy-strata\bin-0121\strata.exe"
+    }
     # 0.1.21 packs cache slots per blob size: the same N takes ~25% more VRAM; 2800 OOMs the verify graphs at ctx 128K.
     # Max per ctx leaving ~1.9 GB free (ctx sweep 2026-09-29, strata-up/dev-18101/ctx-sweep.jsonl)
     # KV streaming (upstream --kv-resident): 20480 cells per QSA layer in VRAM, the rest in pinned host memory,
@@ -66,7 +71,8 @@ for ($i = 0; $i -lt $cfg.args.Count; $i++) {
 $kept += @('--max-context', "$Ctx", '--expert-cache', "$Cache")
 $Kv = 'fp16'
 if ($Ctx -gt 8192) { $kept += @('--kv', 'int8'); $Kv = 'int8' }
-if ($Engine -eq '0121' -and $KvResident) { $kept += @('--kv-resident', "$KvResident"); $Kv += "+stream$KvResident" }
+if (($Engine -in 'cache', '0121') -and $KvResident) { $kept += @('--kv-resident', "$KvResident"); $Kv += "+stream$KvResident" }
+if ($Engine -eq 'cache') { $kept += @('--root-dir', "$Root\strata-cache\roots") }   # pinned roots persist across restarts (E3)
 if ($Vision -eq 'cpu') {
     # images: strata-vision (llama.cpp mtmd + mmproj) on the CPU, ~300 image tokens per picture; engine takes GENI
     $kept += '--vision'
