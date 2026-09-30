@@ -70,6 +70,8 @@ Not yet measured on GPU: tip-budget eviction under pressure (item 6 of the ledge
 
 Production now runs the 0.1.30-based series (GPU acceptance on V100, same settings as above): saved states, root-disk, parent/child/fork and planted-fact recall all pass; Japanese answers +12-15% vs the 0.1.21 build (0.1.27 CJK draft head); a 39K-token prompt reads 12% faster; 8K-doc decode 25.1 vs 23.2 tok/s (0.1.29). Known gap: an identical repeated request resumes in ~1.3 s (was 0.1-0.5 s). The 0.1.21 series and its history stay in `patches/strata-0.1.21/`.
 
+> **WIP refactor (not in production):** `patches/wip-refactor/` applies on top of `patches/strata/` (behaviour-preserving readability refactor from the ChatGPT review: restore candidate selection, two-phase disk restore, saved_state split, cache-protocol client). Brief and progress: `docs/wip/`. Updated every ~2 h while it runs.
+
 ## Layout
 
 ```

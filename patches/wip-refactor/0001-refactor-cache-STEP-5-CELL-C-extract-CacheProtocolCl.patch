@@ -1,0 +1,1115 @@
+From cef6954024dc10dbdb29bc0ff89a285cadc46624 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Thu, 1 Oct 2026 07:09:31 +0900
+Subject: [PATCH 1/4] refactor(cache): STEP 5 (CELL-C) extract
+ CacheProtocolClient from StrataEngine
+
+Behaviour-preserving: CACHE_BEGIN/row parsing, drain, timeout/deadline, desync kill and HTTP 503/501 mapping move to serve/cache_protocol.py with focused tests in serve/test_cache_protocol.py. StrataEngine keeps process management and delegates; serve/server.py re-exports keep existing imports working.
+---
+ serve/cache_protocol.py      | 294 +++++++++++++++++++++++
+ serve/server.py              | 273 ++++-----------------
+ serve/test_cache_protocol.py | 450 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 794 insertions(+), 223 deletions(-)
+ create mode 100644 serve/cache_protocol.py
+ create mode 100644 serve/test_cache_protocol.py
+
+diff --git a/serve/cache_protocol.py b/serve/cache_protocol.py
+new file mode 100644
+index 0000000..da6a6db
+--- /dev/null
++++ b/serve/cache_protocol.py
+@@ -0,0 +1,294 @@
++"""serve/cache_protocol.py - STEP 5 (BRIEF CELL-C): the engine's S2 cache pipe protocol, extracted from
++StrataEngine behaviour-preserving (same wire protocol, same errors, same HTTP mapping).
++
++The server writes one line (`CACHE INVENTORY` or `CACHE DROP`) and reads `CACHE_BEGIN ...` item lines
++(`CACHE memory|disk ...`) up to `CACHE_END` (`ERR ...` on engine failure). Parsing is strict (exact field
++sets, bounded counts, post-CACHE_END count/byte validation); a failure reuses the pipe ONLY after consuming
++CACHE_END or the standalone ERR line, else the engine is stopped for a clean restart (a late ERR must never
++reach a future GEN). Engines without a cache pipe are 501, never a fabricated success. All deadlines use the
++monotonic clock.
++
++Ownership split: `CacheProtocolClient` owns only the protocol (op gate, stdin write, CACHE_BEGIN / row
++parsing, drain, timeout/deadline, desync kill). `StrataEngine` (serve/server.py) keeps process management
++(spawn, restart, unload, `ended`) and delegates to a client bound to its current proc/lines. The HTTP layer
++(GET/DELETE /v1/cache) is unchanged: EngineDied/TimeoutError/ValueError -> 503, NotImplementedError -> 501.
++"""
++from __future__ import annotations
++
++import queue
++import time
++
++
++class EngineDied(RuntimeError):
++    """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
++
++
++# ------------------------------------------------------------------------------------------------ S2 cache control
++# (tunables live here; serve/server.py re-exports them, and StrataEngine passes its module's current values
++# into the client on every exchange, so patching serve.server.CACHE_DRAIN_S in tests keeps working.)
++CACHE_TIMEOUT_S = 30.0            # one cache exchange may wait this long (post-DONE capture runs first)
++CACHE_DRAIN_S = 5.0               # after a malformed reply, how long to discard until CACHE_END
++CACHE_MAX_ITEMS = 100000          # bound on inventory lines per exchange
++
++
++def format_cache_command(op: str) -> str:
++    """The stdin line for a cache exchange: `CACHE INVENTORY` or `CACHE DROP` (ValueError otherwise)."""
++    if op not in ("INVENTORY", "DROP"):
++        raise ValueError(f"unknown cache op {op!r}")
++    return f"CACHE {op}\n"
++
++
++def _cache_int(fields: dict, key: str) -> int:
++    try:
++        v = int(fields[key])
++    except (KeyError, TypeError, ValueError):
++        raise ValueError(f"bad cache field {key!r}") from None
++    if v < 0:
++        raise ValueError(f"bad cache field {key!r}")
++    return v
++
++
++def _cache_fields(parts: list, allowed: set, what: str) -> dict:
++    """Split `k=v` tokens strictly: no duplicates, no unknown fields, no bare tokens."""
++    fields = {}
++    for tok in parts:
++        k, sep, v = tok.partition("=")
++        if not sep or not k or not v:
++            raise ValueError(f"bad cache field {tok!r} in {what}")
++        if k in fields:
++            raise ValueError(f"duplicate cache field {k!r} in {what}")
++        if k not in allowed:
++            raise ValueError(f"unknown cache field {k!r} in {what}")
++        fields[k] = v
++    return fields
++
++
++# Every count the engine reports is bounded: roots are a handful, tips fit the byte budget, disk fits the cap.
++_CACHE_BEGIN_INVENTORY = {"budget", "used", "roots", "tips", "disk", "disk_enabled"}
++_CACHE_BEGIN_DROP = _CACHE_BEGIN_INVENTORY | {"dropped"}
++_CACHE_ITEM_MEMORY = {"kind", "pinned", "ids_len", "bytes", "last_use"}
++_CACHE_ITEM_DISK = {"kind", "pinned", "ids_len", "bytes"}
++
++
++def parse_cache_begin(line: str, expect_dropped: bool) -> dict:
++    """`CACHE_BEGIN ...` -> {"dropped"?, "tip_budget_bytes", "tip_bytes", "roots", "tips", "disk", "disk_enabled"}.
++
++    Strict: exact field set (dropped only for DROP), every count within CACHE_MAX_ITEMS."""
++    parts = line.split()
++    if not parts or parts[0] != "CACHE_BEGIN":
++        raise ValueError("not a CACHE_BEGIN line")
++    fields = _cache_fields(parts[1:], _CACHE_BEGIN_DROP if expect_dropped else _CACHE_BEGIN_INVENTORY,
++                           "CACHE_BEGIN")
++    out = {}
++    if expect_dropped:
++        out["dropped"] = _cache_int(fields, "dropped")
++    out["tip_budget_bytes"] = _cache_int(fields, "budget")
++    out["tip_bytes"] = _cache_int(fields, "used")
++    out["roots"] = _cache_int(fields, "roots")
++    out["tips"] = _cache_int(fields, "tips")
++    out["disk"] = _cache_int(fields, "disk")
++    if out["roots"] > CACHE_MAX_ITEMS or out["tips"] > CACHE_MAX_ITEMS or out["disk"] > CACHE_MAX_ITEMS:
++        raise ValueError("cache counts out of range")
++    if "disk_enabled" not in fields or fields["disk_enabled"] not in ("0", "1"):
++        raise ValueError("bad cache field 'disk_enabled'")
++    out["disk_enabled"] = fields["disk_enabled"] == "1"
++    for key in ("budget", "used", "roots", "tips", "disk", "dropped"):
++        if key in fields and fields[key] != str(_cache_int(fields, key)):
++            raise ValueError(f"bad cache field {key!r}")
++    return out
++
++
++def parse_cache_item(line: str) -> dict:
++    """`CACHE memory|disk kind=... ...` -> {"source", "kind", "pinned", "ids_len", "bytes", "last_use"?}.
++
++    Strict: exact field set per source (memory rows carry last_use, disk rows never do)."""
++    parts = line.split()
++    if len(parts) < 3 or parts[0] != "CACHE" or parts[1] not in ("memory", "disk"):
++        raise ValueError("not a CACHE item line")
++    source = parts[1]
++    fields = _cache_fields(parts[2:], _CACHE_ITEM_MEMORY if source == "memory" else _CACHE_ITEM_DISK,
++                           "CACHE item")
++    if fields.get("kind") not in ("root", "tip"):
++        raise ValueError("bad cache kind")
++    if source == "disk" and fields["kind"] != "root":
++        raise ValueError("disk holds pinned roots only")
++    pinned = _cache_int(fields, "pinned")
++    if pinned not in (0, 1):
++        raise ValueError("bad cache pinned flag")
++    if bool(pinned) != (fields["kind"] == "root"):
++        raise ValueError("only roots are pinned")
++    out = {"source": source, "kind": fields["kind"], "pinned": bool(pinned),
++           "ids_len": _cache_int(fields, "ids_len"), "bytes": _cache_int(fields, "bytes")}
++    if source == "memory":
++        out["last_use"] = _cache_int(fields, "last_use")
++    return out
++
++
++def validate_cache_inventory(begin: dict, memory: list, disk_items: list) -> None:
++    """Cross-check a complete exchange: row counts match CACHE_BEGIN, tip bytes sum to `used`, and the
++    budget covers them. Raises ValueError on any truncation or mismatch (called after CACHE_END, so the
++    caller must NOT drain on failure: the next reply is already on the wire)."""
++    roots = sum(1 for i in memory if i["kind"] == "root")
++    tips = sum(1 for i in memory if i["kind"] == "tip")
++    if roots != begin["roots"] or tips != begin["tips"] or len(disk_items) != begin["disk"]:
++        raise ValueError(f"cache row counts do not match CACHE_BEGIN "
++                         f"(roots {roots}/{begin['roots']}, tips {tips}/{begin['tips']}, "
++                         f"disk {len(disk_items)}/{begin['disk']})")
++    tip_bytes = sum(i["bytes"] for i in memory if i["kind"] == "tip")
++    if tip_bytes != begin["tip_bytes"]:
++        raise ValueError(f"cache tip bytes {tip_bytes} do not match CACHE_BEGIN used {begin['tip_bytes']}")
++    if begin["tip_bytes"] > begin["tip_budget_bytes"]:
++        raise ValueError("cache tip bytes exceed the budget")
++
++
++class CacheProtocolClient:
++    """One side of the S2 cache exchange over an engine pipe: `proc` (stdin write, kill) plus the shared
++    stdout `lines` queue and an `exit_code` callable for death messages.
++
++    Lifecycle (`ended`, restart, unload) stays with StrataEngine: `invalidate()` only marks this pipe
++    desynchronized and stops the process, never a usable pipe again. A client is bound to one process and
++    queue; after a restart the engine binds a fresh one (a late reply from the old process can never be
++    trusted as a fresh answer). Raises EngineDied (dead pipe or a desynchronized one), TimeoutError (no
++    CACHE_END in time) or ValueError (the engine's ERR line, or a strict parse/count rejection) - the HTTP
++    layer maps all three to 503."""
++
++    def __init__(self, proc, lines: "queue.Queue", exit_code=None,
++                 timeout: float = CACHE_TIMEOUT_S, drain_timeout: float = CACHE_DRAIN_S,
++                 max_items: int = CACHE_MAX_ITEMS):
++        self.proc = proc
++        self.lines = lines
++        self._exit_code = exit_code          # StrataEngine.exit_code (bound); None keeps "exit code None"
++        self.timeout = timeout
++        self.drain_timeout = drain_timeout
++        self.max_items = max_items
++        self.desynced = False                # an exchange left the pipe mid-response (see invalidate)
++
++    def _code(self):
++        return self._exit_code() if callable(self._exit_code) else None
++
++    def invalidate(self) -> None:
++        """A cache exchange left the pipe mid-response (no CACHE_END or ERR consumed): a late reply could be
++        trusted as a fresh answer, or leak generation tokens into a later request. Stop the engine instead -
++        the next generation restarts it via the existing alive()/restart() flow, and cache calls fail as
++        EngineDied until then. Never returns a usable pipe."""
++        self.desynced = True
++        try:
++            self.proc.kill()
++        except OSError:
++            pass
++
++    def drain(self, timeout: float | None = None) -> str:
++        """Consume a failed exchange's remainder: "end"/"err" when a response boundary was consumed (the pipe
++        is reusable), "dead" when the engine died mid-drain, "open" when nothing bounded arrived (desync)."""
++        if timeout is None:
++            timeout = self.drain_timeout
++        end = time.monotonic() + timeout
++        for _ in range(self.max_items):
++            try:
++                line = self.lines.get(timeout=max(0.0, end - time.monotonic()))
++            except queue.Empty:
++                return "open"
++            if line is None:
++                return "dead"
++            if line.strip() == "CACHE_END" or line.startswith("ERR"):
++                return "end" if line.strip() == "CACHE_END" else "err"
++        return "open"
++
++    def rpc(self, op: str, timeout: float | None = None) -> dict:
++        """One `CACHE <op>` exchange (the caller holds Service.fifo).
++
++        Returns {"memory": {"tip_budget_bytes", "tip_bytes", "items": [...]}, "disk": {"enabled", "items":
++        [...]}} plus {"dropped": n} for DROP. Raises EngineDied (dead pipe or a desynchronized one, stopped
++        for safety), TimeoutError (no CACHE_END in time) or ValueError (the engine's ERR line, or a strict
++        parse/count rejection). The pipe is reused after a failure ONLY when a response boundary (CACHE_END
++        or the standalone ERR line) was consumed - a late ERR is never left for a future GEN (which would
++        raise on it and orphan its real tokens), and post-CACHE_END count errors never drain (the next reply
++        is already on the wire). Otherwise the engine is stopped for a clean restart. All deadlines use the
++        monotonic clock."""
++        if timeout is None:
++            timeout = self.timeout
++        format_cache_command(op)                          # ValueError on an unknown op, before touching the pipe
++        if self.desynced:
++            raise EngineDied("the cache protocol desynchronized; the engine was stopped for a clean restart")
++        try:
++            self.proc.stdin.write(f"CACHE {op}\n")
++            self.proc.stdin.flush()
++        except OSError:
++            self.invalidate()
++            raise EngineDied(f"the engine stopped unexpectedly (exit code {self._code()})") from None
++        expect_dropped = op == "DROP"
++        begin, memory, disk_items, disk_enabled = None, [], [], False
++        terminal: str | None = None                       # "end" once CACHE_END is consumed, "err" on ERR
++        deadline = time.monotonic() + timeout
++        try:
++            for _ in range(self.max_items + 2):
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError(f"the engine did not answer CACHE {op} in time")
++                try:
++                    line = self.lines.get(timeout=remaining)
++                except queue.Empty:
++                    raise TimeoutError(f"the engine did not answer CACHE {op} in time") from None
++                if line is None:
++                    self.invalidate()
++                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self._code()})")
++                if line.startswith("ERR"):
++                    # A standalone terminal: the whole response. Never drained (nothing follows it) and the
++                    # pipe stays reusable - but never left queued, where a future GEN would raise on it.
++                    terminal = "err"
++                    raise ValueError(line[4:].strip() or "the engine refused the cache command")
++                s = line.strip()
++                if s == "CACHE_END":
++                    terminal = "end"
++                    if begin is None:
++                        raise ValueError("CACHE_END without CACHE_BEGIN")
++                    break
++                if s.startswith("CACHE_BEGIN"):
++                    if begin is not None:
++                        raise ValueError("two CACHE_BEGIN lines")
++                    begin = parse_cache_begin(s, expect_dropped)
++                    disk_enabled = begin.pop("disk_enabled")
++                    continue
++                if s.startswith("CACHE "):
++                    if begin is None:
++                        raise ValueError("CACHE item before CACHE_BEGIN")
++                    item = parse_cache_item(s)
++                    if len(memory) + len(disk_items) >= self.max_items:
++                        raise ValueError("too many cache items")
++                    (memory if item.pop("source") == "memory" else disk_items).append(item)
++                    continue
++                # Anything else on an idle pipe (a GEN-protocol stray, a blank line, garbage) is a protocol
++                # violation, never absorbed: trusting the rest of the reply after it is how stale inventories
++                # and orphaned tokens happen.
++                raise ValueError(f"unexpected engine line during CACHE {op}: {s[:60]!r}")
++            else:
++                raise ValueError("too many cache lines")
++        except TimeoutError:
++            if self.drain() not in ("end", "err"):
++                self.invalidate()
++            raise
++        except ValueError:
++            if terminal is None and self.drain() not in ("end", "err"):
++                self.invalidate()
++            raise
++        if begin is None:                                 # unreachable (CACHE_END requires begin), kept explicit
++            raise ValueError("no CACHE_BEGIN from the engine")
++        # Post-terminal count validation: CACHE_END is already consumed, so no drain here - draining would eat
++        # the NEXT reply. A mismatch still fails the call, but the pipe stays reusable.
++        validate_cache_inventory(begin, memory, disk_items)
++        out = {"memory": {"tip_budget_bytes": begin["tip_budget_bytes"], "tip_bytes": begin["tip_bytes"],
++                          "items": memory},
++               "disk": {"enabled": disk_enabled, "items": disk_items}}
++        return {"dropped": begin["dropped"], **out} if expect_dropped else out
++
++    @staticmethod
++    def error_response(exc: BaseException) -> tuple:
++        """HTTP status/body for a cache failure: EngineDied/TimeoutError/ValueError -> 503,
++        NotImplementedError -> 501. The exact mapping (and strings) the /v1/cache handlers always
++        sent - EngineDied keeps its "; the next request restarts it" suffix."""
++        if isinstance(exc, EngineDied):
++            return 503, {"error": {"type": "server_error",
++                                   "message": f"{exc}; the next request restarts it"}}
++        if isinstance(exc, NotImplementedError):
++            return 501, {"error": {"type": "unsupported", "message": str(exc)}}
++        return 503, {"error": {"type": "server_error", "message": str(exc)}}
+diff --git a/serve/server.py b/serve/server.py
+index 4748b20..4c5d5ac 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -55,6 +55,10 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
+ from serve.frontend import _has_image  # noqa: E402  (keeper id wrapper mirrors anthropic_to_messages' image path)
+ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+ from serve.winjob import contain  # noqa: E402
++from serve.cache_protocol import (CACHE_DRAIN_S, CACHE_MAX_ITEMS, CACHE_TIMEOUT_S,  # noqa: E402, F401
++                                  CacheProtocolClient, EngineDied, format_cache_command,  # noqa: E402, F401
++                                  parse_cache_begin, parse_cache_item,  # noqa: E402, F401
++                                  validate_cache_inventory)  # noqa: E402, F401  (re-exported: tests import them here)
+ 
+ IM_END = "<|im_end|>"
+ IMAGE_PAD = "<|image_pad|>"
+@@ -105,10 +109,6 @@ class MockEngine:
+         return {"dropped": 0, **inv} if op == "DROP" else inv
+ 
+ 
+-class EngineDied(RuntimeError):
+-    """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+-
+-
+ class GpuBusy(RuntimeError):
+     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
+     model server) is using it, so the engine is not started into the little that is left."""
+@@ -429,119 +429,58 @@ class StrataEngine:
+         except Exception:
+             self.proc.kill()
+ 
++    def _cache_client(self) -> CacheProtocolClient:
++        """The pipe-protocol client bound to the current process and line queue (serve/cache_protocol.py).
++
++        Rebuilt when the process or queue changed (restart) or when constructed without __init__ (tests);
++        the server's current CACHE_* tunables are refreshed on every access, so patching
++        serve.server.CACHE_DRAIN_S keeps working. The engine mirrors the client's desync flag into
++        _cache_desync/ended for the existing readers (alive, cache_rpc's desync gate)."""
++        c = getattr(self, "_cache_proto", None)
++        if c is None or getattr(c, "proc", None) is not self.proc or getattr(c, "lines", None) is not self.lines:
++            c = CacheProtocolClient(self.proc, self.lines,
++                                    exit_code=getattr(self, "exit_code", None),
++                                    timeout=CACHE_TIMEOUT_S, drain_timeout=CACHE_DRAIN_S,
++                                    max_items=CACHE_MAX_ITEMS)
++            if getattr(self, "_cache_desync", False):
++                c.desynced = True
++            self._cache_proto = c
++        else:
++            c._exit_code = getattr(self, "exit_code", None)
++            c.timeout, c.drain_timeout, c.max_items = CACHE_TIMEOUT_S, CACHE_DRAIN_S, CACHE_MAX_ITEMS
++            if getattr(self, "_cache_desync", False):
++                c.desynced = True
++        return c
++
+     def _cache_invalidate(self):
+-        """A cache exchange left the pipe mid-response (no CACHE_END or ERR consumed): a late reply could be
+-        trusted as a fresh answer, or leak generation tokens into a later request. Stop the engine instead -
+-        the next generation restarts it via the existing alive()/restart() flow, and cache calls fail as
+-        EngineDied until then. Never returns a usable pipe."""
++        """Stop the engine after a desynchronized cache exchange; the next generation restarts it via the
++        existing alive()/restart() flow (protocol detail lives in CacheProtocolClient.invalidate)."""
++        self._cache_client().invalidate()
+         self._cache_desync = True
+-        try:
+-            self.proc.kill()
+-        except OSError:
+-            pass
+         self.ended = True
+ 
+     def _cache_drain(self) -> str:
+-        """Consume a failed exchange's remainder: "end"/"err" when a response boundary was consumed (the pipe
+-        is reusable), "dead" when the engine died mid-drain, "open" when nothing bounded arrived (desync)."""
+-        end = time.monotonic() + CACHE_DRAIN_S
+-        for _ in range(CACHE_MAX_ITEMS):
+-            try:
+-                line = self.lines.get(timeout=max(0.0, end - time.monotonic()))
+-            except queue.Empty:
+-                return "open"
+-            if line is None:
+-                return "dead"
+-            if line.strip() == "CACHE_END" or line.startswith("ERR"):
+-                return "end" if line.strip() == "CACHE_END" else "err"
+-        return "open"
++        """Consume a failed exchange's remainder (see CacheProtocolClient.drain)."""
++        return self._cache_client().drain()
+ 
+     def cache_rpc(self, op, timeout=None):
+         """S2: one `CACHE <op>` exchange with the resident engine (the caller holds Service.fifo).
+ 
+-        Returns {"memory": {"tip_budget_bytes", "tip_bytes", "items": [...]}, "disk": {"enabled", "items":
+-        [...]}} plus {"dropped": n} for DROP. Raises EngineDied (dead pipe or a desynchronized one, stopped
+-        for safety), TimeoutError (no CACHE_END in time) or ValueError (the engine's ERR line, or a strict
+-        parse/count rejection). The pipe is reused after a failure ONLY when a response boundary (CACHE_END
+-        or the standalone ERR line) was consumed - a late ERR is never left for a future GEN (which would
+-        raise on it and orphan its real tokens), and post-CACHE_END count errors never drain (the next reply
+-        is already on the wire). Otherwise the engine is stopped for a clean restart. All deadlines use the
+-        monotonic clock."""
++        Process management stays here; the pipe protocol (CACHE_BEGIN / row parsing / drain / timeout /
++        desync kill, same errors and messages) lives in CacheProtocolClient. Raises EngineDied, TimeoutError
++        or ValueError exactly as before - the HTTP layer maps all three to 503."""
+         if timeout is None:
+             timeout = CACHE_TIMEOUT_S
+         format_cache_command(op)                          # ValueError on an unknown op, before touching the pipe
+         if getattr(self, "_cache_desync", False):
+             raise EngineDied("the cache protocol desynchronized; the engine was stopped for a clean restart")
++        client = self._cache_client()
+         try:
+-            self.proc.stdin.write(f"CACHE {op}\n")
+-            self.proc.stdin.flush()
+-        except OSError:
+-            self._cache_invalidate()
+-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+-        expect_dropped = op == "DROP"
+-        begin, memory, disk_items, disk_enabled = None, [], [], False
+-        terminal: str | None = None                       # "end" once CACHE_END is consumed, "err" on ERR
+-        deadline = time.monotonic() + timeout
+-        try:
+-            for _ in range(CACHE_MAX_ITEMS + 2):
+-                remaining = deadline - time.monotonic()
+-                if remaining <= 0:
+-                    raise TimeoutError(f"the engine did not answer CACHE {op} in time")
+-                try:
+-                    line = self.lines.get(timeout=remaining)
+-                except queue.Empty:
+-                    raise TimeoutError(f"the engine did not answer CACHE {op} in time") from None
+-                if line is None:
+-                    self._cache_invalidate()
+-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+-                if line.startswith("ERR"):
+-                    # A standalone terminal: the whole response. Never drained (nothing follows it) and the
+-                    # pipe stays reusable - but never left queued, where a future GEN would raise on it.
+-                    terminal = "err"
+-                    raise ValueError(line[4:].strip() or "the engine refused the cache command")
+-                s = line.strip()
+-                if s == "CACHE_END":
+-                    terminal = "end"
+-                    if begin is None:
+-                        raise ValueError("CACHE_END without CACHE_BEGIN")
+-                    break
+-                if s.startswith("CACHE_BEGIN"):
+-                    if begin is not None:
+-                        raise ValueError("two CACHE_BEGIN lines")
+-                    begin = parse_cache_begin(s, expect_dropped)
+-                    disk_enabled = begin.pop("disk_enabled")
+-                    continue
+-                if s.startswith("CACHE "):
+-                    if begin is None:
+-                        raise ValueError("CACHE item before CACHE_BEGIN")
+-                    item = parse_cache_item(s)
+-                    if len(memory) + len(disk_items) >= CACHE_MAX_ITEMS:
+-                        raise ValueError("too many cache items")
+-                    (memory if item.pop("source") == "memory" else disk_items).append(item)
+-                    continue
+-                # Anything else on an idle pipe (a GEN-protocol stray, a blank line, garbage) is a protocol
+-                # violation, never absorbed: trusting the rest of the reply after it is how stale inventories
+-                # and orphaned tokens happen.
+-                raise ValueError(f"unexpected engine line during CACHE {op}: {s[:60]!r}")
+-            else:
+-                raise ValueError("too many cache lines")
+-        except TimeoutError:
+-            if self._cache_drain() not in ("end", "err"):
+-                self._cache_invalidate()
+-            raise
+-        except ValueError:
+-            if terminal is None and self._cache_drain() not in ("end", "err"):
+-                self._cache_invalidate()
+-            raise
+-        if begin is None:                                 # unreachable (CACHE_END requires begin), kept explicit
+-            raise ValueError("no CACHE_BEGIN from the engine")
+-        # Post-terminal count validation: CACHE_END is already consumed, so no drain here - draining would eat
+-        # the NEXT reply. A mismatch still fails the call, but the pipe stays reusable.
+-        validate_cache_inventory(begin, memory, disk_items)
+-        out = {"memory": {"tip_budget_bytes": begin["tip_budget_bytes"], "tip_bytes": begin["tip_bytes"],
+-                          "items": memory},
+-               "disk": {"enabled": disk_enabled, "items": disk_items}}
+-        return {"dropped": begin["dropped"], **out} if expect_dropped else out
++            return client.rpc(op, timeout=timeout)
++        finally:
++            if getattr(client, "desynced", False):
++                self._cache_desync = True
++                self.ended = True
+ 
+ 
+ class Vision:
+@@ -771,122 +710,12 @@ def is_aux_request(req: dict, tools) -> bool:
+ # (inserts and mounts advance it); the live ConvCheckpoint chain is per-request history and is NOT reported.
+ # Disk rows are index metadata only (payloads never loaded); memory and disk are separate sections, and no
+ # tokens, payloads, filesystem paths or identity internals ever reach HTTP.
+-CACHE_TIMEOUT_S = 30.0            # one cache exchange may wait this long (post-DONE capture runs first)
+-CACHE_DRAIN_S = 5.0               # after a malformed reply, how long to discard until CACHE_END
+-CACHE_MAX_ITEMS = 100000          # bound on inventory lines per exchange
++# (STEP 5: the pipe-protocol tunables and parsing live in serve/cache_protocol.py and are re-exported
++# at the top of this module, so `serve.server.CACHE_TIMEOUT_S` etc. keep working; patching
++# serve.server.CACHE_DRAIN_S still tunes the drain because StrataEngine passes its current values in.)
+ CACHE_FIFO_TIMEOUT_S = 30.0       # how long a cache call waits for a busy engine before answering 503 busy
+ 
+ 
+-def format_cache_command(op: str) -> str:
+-    """The stdin line for a cache exchange: `CACHE INVENTORY` or `CACHE DROP` (ValueError otherwise)."""
+-    if op not in ("INVENTORY", "DROP"):
+-        raise ValueError(f"unknown cache op {op!r}")
+-    return f"CACHE {op}\n"
+-
+-
+-def _cache_int(fields: dict, key: str) -> int:
+-    try:
+-        v = int(fields[key])
+-    except (KeyError, TypeError, ValueError):
+-        raise ValueError(f"bad cache field {key!r}") from None
+-    if v < 0:
+-        raise ValueError(f"bad cache field {key!r}")
+-    return v
+-
+-
+-def _cache_fields(parts: list, allowed: set, what: str) -> dict:
+-    """Split `k=v` tokens strictly: no duplicates, no unknown fields, no bare tokens."""
+-    fields = {}
+-    for tok in parts:
+-        k, sep, v = tok.partition("=")
+-        if not sep or not k or not v:
+-            raise ValueError(f"bad cache field {tok!r} in {what}")
+-        if k in fields:
+-            raise ValueError(f"duplicate cache field {k!r} in {what}")
+-        if k not in allowed:
+-            raise ValueError(f"unknown cache field {k!r} in {what}")
+-        fields[k] = v
+-    return fields
+-
+-
+-# Every count the engine reports is bounded: roots are a handful, tips fit the byte budget, disk fits the cap.
+-_CACHE_BEGIN_INVENTORY = {"budget", "used", "roots", "tips", "disk", "disk_enabled"}
+-_CACHE_BEGIN_DROP = _CACHE_BEGIN_INVENTORY | {"dropped"}
+-_CACHE_ITEM_MEMORY = {"kind", "pinned", "ids_len", "bytes", "last_use"}
+-_CACHE_ITEM_DISK = {"kind", "pinned", "ids_len", "bytes"}
+-
+-
+-def parse_cache_begin(line: str, expect_dropped: bool) -> dict:
+-    """`CACHE_BEGIN ...` -> {"dropped"?, "tip_budget_bytes", "tip_bytes", "roots", "tips", "disk", "disk_enabled"}.
+-
+-    Strict: exact field set (dropped only for DROP), every count within CACHE_MAX_ITEMS."""
+-    parts = line.split()
+-    if not parts or parts[0] != "CACHE_BEGIN":
+-        raise ValueError("not a CACHE_BEGIN line")
+-    fields = _cache_fields(parts[1:], _CACHE_BEGIN_DROP if expect_dropped else _CACHE_BEGIN_INVENTORY,
+-                           "CACHE_BEGIN")
+-    out = {}
+-    if expect_dropped:
+-        out["dropped"] = _cache_int(fields, "dropped")
+-    out["tip_budget_bytes"] = _cache_int(fields, "budget")
+-    out["tip_bytes"] = _cache_int(fields, "used")
+-    out["roots"] = _cache_int(fields, "roots")
+-    out["tips"] = _cache_int(fields, "tips")
+-    out["disk"] = _cache_int(fields, "disk")
+-    if out["roots"] > CACHE_MAX_ITEMS or out["tips"] > CACHE_MAX_ITEMS or out["disk"] > CACHE_MAX_ITEMS:
+-        raise ValueError("cache counts out of range")
+-    if "disk_enabled" not in fields or fields["disk_enabled"] not in ("0", "1"):
+-        raise ValueError("bad cache field 'disk_enabled'")
+-    out["disk_enabled"] = fields["disk_enabled"] == "1"
+-    for key in ("budget", "used", "roots", "tips", "disk", "dropped"):
+-        if key in fields and fields[key] != str(_cache_int(fields, key)):
+-            raise ValueError(f"bad cache field {key!r}")
+-    return out
+-
+-
+-def parse_cache_item(line: str) -> dict:
+-    """`CACHE memory|disk kind=... ...` -> {"source", "kind", "pinned", "ids_len", "bytes", "last_use"?}.
+-
+-    Strict: exact field set per source (memory rows carry last_use, disk rows never do)."""
+-    parts = line.split()
+-    if len(parts) < 3 or parts[0] != "CACHE" or parts[1] not in ("memory", "disk"):
+-        raise ValueError("not a CACHE item line")
+-    source = parts[1]
+-    fields = _cache_fields(parts[2:], _CACHE_ITEM_MEMORY if source == "memory" else _CACHE_ITEM_DISK,
+-                           "CACHE item")
+-    if fields.get("kind") not in ("root", "tip"):
+-        raise ValueError("bad cache kind")
+-    if source == "disk" and fields["kind"] != "root":
+-        raise ValueError("disk holds pinned roots only")
+-    pinned = _cache_int(fields, "pinned")
+-    if pinned not in (0, 1):
+-        raise ValueError("bad cache pinned flag")
+-    if bool(pinned) != (fields["kind"] == "root"):
+-        raise ValueError("only roots are pinned")
+-    out = {"source": source, "kind": fields["kind"], "pinned": bool(pinned),
+-           "ids_len": _cache_int(fields, "ids_len"), "bytes": _cache_int(fields, "bytes")}
+-    if source == "memory":
+-        out["last_use"] = _cache_int(fields, "last_use")
+-    return out
+-
+-
+-def validate_cache_inventory(begin: dict, memory: list, disk_items: list) -> None:
+-    """Cross-check a complete exchange: row counts match CACHE_BEGIN, tip bytes sum to `used`, and the
+-    budget covers them. Raises ValueError on any truncation or mismatch (called after CACHE_END, so the
+-    caller must NOT drain on failure: the next reply is already on the wire)."""
+-    roots = sum(1 for i in memory if i["kind"] == "root")
+-    tips = sum(1 for i in memory if i["kind"] == "tip")
+-    if roots != begin["roots"] or tips != begin["tips"] or len(disk_items) != begin["disk"]:
+-        raise ValueError(f"cache row counts do not match CACHE_BEGIN "
+-                         f"(roots {roots}/{begin['roots']}, tips {tips}/{begin['tips']}, "
+-                         f"disk {len(disk_items)}/{begin['disk']})")
+-    tip_bytes = sum(i["bytes"] for i in memory if i["kind"] == "tip")
+-    if tip_bytes != begin["tip_bytes"]:
+-        raise ValueError(f"cache tip bytes {tip_bytes} do not match CACHE_BEGIN used {begin['tip_bytes']}")
+-    if begin["tip_bytes"] > begin["tip_budget_bytes"]:
+-        raise ValueError("cache tip bytes exceed the budget")
+-
+-
+ def _keeper_openai_request(req: dict) -> tuple:
+     """openai_to_messages + id annotation (server-only; the template ignores the extra keys). Assistant tool
+     calls keep their `id`, tool messages keep `tool_call_id`. Mapping is 1:1 with the raw messages."""
+@@ -2429,12 +2258,11 @@ def make_handler(svc: Service):
+                     try:
+                         self._json(200, svc.cache_inventory())
+                     except EngineDied as e:
+-                        self._json(503, {"error": {"type": "server_error",
+-                                                   "message": f"{e}; the next request restarts it"}})
++                        self._json(*CacheProtocolClient.error_response(e))
+                     except NotImplementedError as e:
+-                        self._json(501, {"error": {"type": "unsupported", "message": str(e)}})
++                        self._json(*CacheProtocolClient.error_response(e))
+                     except (TimeoutError, ValueError) as e:
+-                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
++                        self._json(*CacheProtocolClient.error_response(e))
+             else:
+                 self._json(404, {"error": {"message": "not found"}})
+ 
+@@ -2449,12 +2277,11 @@ def make_handler(svc: Service):
+                 try:
+                     self._json(200, svc.cache_drop())
+                 except EngineDied as e:
+-                    self._json(503, {"error": {"type": "server_error",
+-                                               "message": f"{e}; the next request restarts it"}})
++                    self._json(*CacheProtocolClient.error_response(e))
+                 except NotImplementedError as e:
+-                    self._json(501, {"error": {"type": "unsupported", "message": str(e)}})
++                    self._json(*CacheProtocolClient.error_response(e))
+                 except (TimeoutError, ValueError) as e:
+-                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
++                    self._json(*CacheProtocolClient.error_response(e))
+             else:
+                 self._json(404, {"error": {"message": "not found"}})
+ 
+diff --git a/serve/test_cache_protocol.py b/serve/test_cache_protocol.py
+new file mode 100644
+index 0000000..fc65c78
+--- /dev/null
++++ b/serve/test_cache_protocol.py
+@@ -0,0 +1,450 @@
++"""serve/test_cache_protocol.py - STEP 5 (BRIEF CELL-C) focused tests for serve/cache_protocol.py.
++
++Covers the extracted CacheProtocolClient (CACHE_BEGIN / row parsing / drain / timeout / desync kill),
++StrataEngine's delegation (process management stays there: kill, ended, desync mirror, rebind on
++restart), the serve.server re-exports existing mocks/tests import, and the HTTP mapping (503/501).
++
++    python -m unittest serve.test_cache_protocol -v
++"""
++from __future__ import annotations
++
++import json
++import queue
++import sys
++import unittest
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from serve.cache_protocol import (CACHE_DRAIN_S, CACHE_MAX_ITEMS, CACHE_TIMEOUT_S, CacheProtocolClient,  # noqa: E402
++                                  EngineDied, format_cache_command, parse_cache_begin, parse_cache_item,
++                                  validate_cache_inventory)
++from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, serve  # noqa: E402
++from serve.frontend import ChatTemplate  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[1]
++CTX = 4096
++
++
++class Stdin:
++    def __init__(self):
++        self.written = []
++
++    def write(self, s):
++        self.written.append(s)
++
++    def flush(self):
++        pass
++
++
++class Proc:
++    def __init__(self, stdin):
++        self.stdin = stdin
++        self.kills = 0
++
++    def kill(self):
++        self.kills += 1
++
++    def poll(self):
++        return None if self.kills == 0 else -9
++
++    def wait(self, timeout=None):
++        return -9
++
++
++def make_client(lines, **kw):
++    """A CacheProtocolClient over a fake pipe preloaded with `lines` (None = engine death)."""
++    kw.setdefault("exit_code", lambda: -9)
++    stdin = Stdin()
++    proc = Proc(stdin)
++    q: queue.Queue = queue.Queue()
++    for ln in lines:
++        q.put(ln)
++    return CacheProtocolClient(proc, q, **kw), stdin, proc
++
++
++INV = ["CACHE_BEGIN budget=100 used=20 roots=1 tips=1 disk=1 disk_enabled=1",
++       "CACHE memory kind=root pinned=1 ids_len=40 bytes=10 last_use=7",
++       "CACHE memory kind=tip pinned=0 ids_len=60 bytes=20 last_use=9",
++       "CACHE disk kind=root pinned=1 ids_len=40 bytes=300",
++       "CACHE_END"]
++
++
++class CacheClientPipe(unittest.TestCase):
++    """The protocol client against a fake pipe: grammar, drain, timeout, desync kill."""
++
++    def test_inventory_ok(self):
++        client, stdin, _ = make_client(list(INV))
++        out = client.rpc("INVENTORY", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"])
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 100)
++        self.assertEqual(out["memory"]["tip_bytes"], 20)
++        self.assertEqual([i["kind"] for i in out["memory"]["items"]], ["root", "tip"])
++        self.assertEqual(out["disk"], {"enabled": True, "items": [
++            {"kind": "root", "pinned": True, "ids_len": 40, "bytes": 300}]})
++        self.assertNotIn("dropped", out)
++
++    def test_drop_ok(self):
++        client, stdin, _ = make_client(
++            ["CACHE_BEGIN dropped=2 budget=100 used=0 roots=1 tips=0 disk=0 disk_enabled=0",
++             "CACHE memory kind=root pinned=1 ids_len=40 bytes=10 last_use=7",
++             "CACHE_END"])
++        out = client.rpc("DROP", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE DROP\n"])
++        self.assertEqual(out["dropped"], 2)
++        self.assertEqual(len(out["memory"]["items"]), 1)
++
++    def test_stray_is_rejected_not_absorbed(self):
++        """A GEN-protocol stray (or a pre-BEGIN item) fails the exchange; the drain consumes the bounded
++        reply and the next exchange starts clean."""
++        client, stdin, _ = make_client(
++            ["T 5",
++             "CACHE_BEGIN budget=0 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++             "CACHE_END",
++             "CACHE_BEGIN budget=7 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++             "CACHE_END"])
++        with self.assertRaises(ValueError):
++            client.rpc("INVENTORY", timeout=5)
++        out = client.rpc("INVENTORY", timeout=5)
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 7)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++        client2, _, _ = make_client(["CACHE memory kind=tip pinned=0 ids_len=1 bytes=1 last_use=1",
++                                     "CACHE_END"])
++        with self.assertRaises(ValueError):
++            client2.rpc("INVENTORY", timeout=5)
++
++    def test_err_never_drains(self):
++        """The standalone ERR line is the whole response: reported, never drained, pipe stays clean."""
++        client, stdin, _ = make_client(
++            ["ERR boom",
++             "CACHE_BEGIN budget=1 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++             "CACHE_END"])
++        with self.assertRaises(ValueError) as ctx:
++            client.rpc("INVENTORY", timeout=5)
++        self.assertIn("boom", str(ctx.exception))
++        out = client.rpc("INVENTORY", timeout=5)   # the second reply is intact: no drain ate it
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 1)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++
++    def test_malformed_is_drained(self):
++        client, _stdin, _proc = make_client(
++            ["CACHE_BEGIN budget=1 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++             "CACHE memory kind=tip pinned=0 ids_len=1 bytes=1",   # no last_use
++             "CACHE_END",
++             "CACHE_BEGIN budget=2 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "CACHE_END"])
++        with self.assertRaises(ValueError):
++            client.rpc("INVENTORY", timeout=5)
++        self.assertEqual(client.rpc("INVENTORY", timeout=5)["memory"]["tip_budget_bytes"], 2)
++
++    def test_count_mismatch_never_drains_next_reply(self):
++        """CACHE_END is already consumed when counts are checked: the failure must not eat the next reply."""
++        client, stdin, _ = make_client(
++            ["CACHE_BEGIN budget=100 used=50 roots=0 tips=1 disk=0 disk_enabled=0",
++             "CACHE_END",                       # claims a tip that never arrives
++             "CACHE_BEGIN budget=100 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++             "CACHE_END"])
++        with self.assertRaises(ValueError):
++            client.rpc("INVENTORY", timeout=5)
++        out = client.rpc("INVENTORY", timeout=5)
++        self.assertEqual(out["memory"]["tip_bytes"], 0)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++
++    def test_dead_pipe_kills_and_desyncs(self):
++        client, _stdin, proc = make_client([None])
++        with self.assertRaises(EngineDied):
++            client.rpc("INVENTORY", timeout=5)
++        self.assertTrue(client.desynced)
++        self.assertEqual(proc.kills, 1)
++        with self.assertRaises(EngineDied):       # never reused without touching the pipe
++            client.rpc("INVENTORY", timeout=5)
++
++    def test_timeout_without_boundary_desyncs(self):
++        """No boundary arrives: the pipe is stopped, never reused."""
++        client, stdin, proc = make_client([], timeout=0.2, drain_timeout=0.2)
++        with self.assertRaises(TimeoutError):
++            client.rpc("INVENTORY")
++        self.assertTrue(client.desynced)
++        self.assertEqual(proc.kills, 1)           # the engine was stopped for a clean restart
++        with self.assertRaises(EngineDied):
++            client.rpc("INVENTORY", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"])   # the dead pipe was never reused
++
++    def test_timeout_late_reply_is_discarded_not_trusted(self):
++        """The late reply arrives inside the drain: discarded, TimeoutError stands, the next exchange reads
++        only fresh lines (stale budget=111 never surfaces)."""
++        client, stdin, _ = make_client(
++            ["CACHE_BEGIN budget=111 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "CACHE_END"])
++        with self.assertRaises(TimeoutError):
++            client.rpc("INVENTORY", timeout=0)     # immediate deadline: nothing consumed yet
++        self.assertFalse(client.desynced)          # the boundary was consumed: reusable
++        for ln in ("CACHE_BEGIN budget=222 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "CACHE_END"):
++            client.lines.put(ln)
++        out = client.rpc("INVENTORY", timeout=5)
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 222)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++
++    def test_late_err_never_reaches_gen(self):
++        """A late ERR is swallowed by the drain (pipe reusable) instead of waiting for a future GEN, which
++        would raise on it and orphan its real tokens."""
++        client, _, _ = make_client(["ERR late boom"])
++        with self.assertRaises(TimeoutError):
++            client.rpc("INVENTORY", timeout=0)
++        self.assertFalse(client.desynced)
++        self.assertTrue(client.lines.empty())            # nothing left for any future reader
++        for ln in ("CACHE_BEGIN budget=3 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "CACHE_END"):
++            client.lines.put(ln)
++        self.assertEqual(client.rpc("INVENTORY", timeout=5)["memory"]["tip_budget_bytes"], 3)
++
++    def test_malformed_open_desyncs(self):
++        """Malformed with no boundary after it: stopped, not reused."""
++        client, _, proc = make_client(
++            ["CACHE_BEGIN budget=1 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "GARBAGE"],
++            timeout=5, drain_timeout=0.2)
++        with self.assertRaises(ValueError):
++            client.rpc("INVENTORY")
++        self.assertTrue(client.desynced)
++        self.assertEqual(proc.kills, 1)
++        with self.assertRaises(EngineDied):
++            client.rpc("INVENTORY", timeout=5)
++
++    def test_end_without_begin_does_not_drain_next_reply(self):
++        client, _, _ = make_client(
++            ["CACHE_END",
++             "CACHE_BEGIN budget=3 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++             "CACHE_END"])
++        with self.assertRaisesRegex(ValueError, "without CACHE_BEGIN"):
++            client.rpc("INVENTORY", timeout=5)
++        self.assertFalse(client.desynced)
++        self.assertEqual(client.rpc("INVENTORY", timeout=5)["memory"]["tip_budget_bytes"], 3)
++
++    def test_bad_op_never_touches_the_pipe(self):
++        client, stdin, _ = make_client([])
++        with self.assertRaises(ValueError):
++            client.rpc("WIPE", timeout=5)
++        self.assertEqual(stdin.written, [])
++
++
++def fake_engine(lines):
++    """A StrataEngine bound to a fake pipe (no GPU): exercises the delegation, not the protocol."""
++    stdin, proc = Stdin(), None
++    proc = Proc(stdin)
++    eng = StrataEngine.__new__(StrataEngine)
++    eng.proc = proc
++    eng.lines = queue.Queue()
++    eng.ended = False
++    eng._cache_desync = False
++    for ln in lines:
++        eng.lines.put(ln)
++    eng.exit_code = lambda: -9
++    return eng, stdin, proc
++
++
++class CacheEngineDelegation(unittest.TestCase):
++    """StrataEngine keeps process management and delegates: same results, same flags, rebind on restart."""
++
++    def test_delegates_inventory(self):
++        eng, stdin, _ = fake_engine(list(INV))
++        out = eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"])
++        self.assertEqual(out["memory"]["tip_bytes"], 20)
++        self.assertFalse(eng._cache_desync)
++
++    def test_mirrors_desync_and_ended(self):
++        eng, stdin, proc = fake_engine([None])
++        with self.assertRaises(EngineDied):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertTrue(eng._cache_desync)
++        self.assertTrue(eng.ended)
++        self.assertEqual(proc.kills, 1)
++        self.assertFalse(eng.alive())
++        with self.assertRaises(EngineDied):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"])   # the dead pipe was never reused
++
++    def test_wrapper_validates_op_before_binding(self):
++        """An invalid op ValueErrors even on an engine without proc/lines (base order: op gate first)."""
++        eng = StrataEngine.__new__(StrataEngine)
++        with self.assertRaises(ValueError):
++            eng.cache_rpc("WIPE", timeout=5)
++
++    def test_wrapper_desync_before_binding(self):
++        """A desynced engine raises EngineDied for a valid op without requiring proc/lines."""
++        eng = StrataEngine.__new__(StrataEngine)
++        eng._cache_desync = True
++        with self.assertRaises(EngineDied):
++            eng.cache_rpc("INVENTORY", timeout=5)
++
++    def test_rebinds_after_restart(self):
++        """A fresh process and queue get a fresh client: no stale desync, no stale lines."""
++        eng, stdin, _ = fake_engine([None])
++        with self.assertRaises(EngineDied):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertTrue(eng._cache_desync)
++        stdin2 = Stdin()
++        eng.proc = Proc(stdin2)                   # restart: a new process ...
++        eng.lines = queue.Queue()                 # ... and a new queue
++        for ln in INV:
++            eng.lines.put(ln)
++        eng.ended = False
++        eng._cache_desync = False
++        out = eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 100)
++        self.assertEqual(stdin2.written, ["CACHE INVENTORY\n"])
++
++    def test_wrappers_match_client(self):
++        eng, _, _ = fake_engine(["CACHE_END"])
++        self.assertEqual(eng._cache_drain(), "end")   # boundary consumed: pipe reusable
++        eng2, _, proc2 = fake_engine([])
++        eng2._cache_invalidate()
++        self.assertTrue(eng2._cache_desync)
++        self.assertTrue(eng2.ended)
++        self.assertEqual(proc2.kills, 1)
++
++    def test_server_reexports(self):
++        import serve.server as srv
++        import serve.cache_protocol as cp
++
++        self.assertIs(srv.EngineDied, cp.EngineDied)
++        self.assertIs(srv.format_cache_command, cp.format_cache_command)
++        self.assertIs(srv.parse_cache_begin, cp.parse_cache_begin)
++        self.assertIs(srv.parse_cache_item, cp.parse_cache_item)
++        self.assertIs(srv.validate_cache_inventory, cp.validate_cache_inventory)
++        self.assertEqual((srv.CACHE_TIMEOUT_S, srv.CACHE_DRAIN_S, srv.CACHE_MAX_ITEMS),
++                         (CACHE_TIMEOUT_S, CACHE_DRAIN_S, CACHE_MAX_ITEMS))
++        self.assertEqual((CACHE_TIMEOUT_S, CACHE_DRAIN_S, CACHE_MAX_ITEMS), (30.0, 5.0, 100000))
++        # the helpers still parse exactly as before
++        self.assertEqual(parse_cache_begin("CACHE_BEGIN budget=8 used=0 roots=0 tips=0 disk=0 disk_enabled=1",
++                                           False)["tip_budget_bytes"], 8)
++        self.assertEqual(parse_cache_item("CACHE disk kind=root pinned=1 ids_len=40 bytes=300")["bytes"], 300)
++        validate_cache_inventory({"tip_budget_bytes": 100, "tip_bytes": 0, "roots": 0, "tips": 0, "disk": 0},
++                                 [], [])
++
++
++class CacheHTTPMapping(unittest.TestCase):
++    """HTTP mapping over the delegated path: 200 through a real pipe, EngineDied/Timeout/Value -> 503,
++    engines without the pipe -> 501."""
++
++    def http(self, svc):
++        httpd = serve(svc, port=0)
++        self.addCleanup(httpd.server_close)
++        self.addCleanup(httpd.shutdown)
++        return f"http://127.0.0.1:{httpd.server_address[1]}"
++
++    def req(self, base, method, path, body=None):
++        data = json.dumps(body).encode() if body is not None else None
++        r = urllib.request.Request(base + path, data=data, method=method)
++        try:
++            with urllib.request.urlopen(r, timeout=30) as resp:
++                return resp.status, resp.read().decode()
++        except urllib.error.HTTPError as e:
++            with e:
++                return e.code, e.read().decode()
++
++    def test_pipe_backed_inventory_is_200(self):
++        eng, _, _ = fake_engine(list(INV))
++        tok = ByteTokenizer()
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        base = self.http(svc)
++        code, text = self.req(base, "GET", "/v1/cache")
++        self.assertEqual(code, 200, text)
++        self.assertEqual(json.loads(text)["memory"]["tip_bytes"], 20)
++
++    def test_engine_failures_are_503(self):
++        for exc in (EngineDied("the engine stopped unexpectedly (exit code -9)"),
++                    TimeoutError("the engine did not answer CACHE INVENTORY in time"),
++                    ValueError("CACHE_END without CACHE_BEGIN")):
++            with self.subTest(exc=repr(exc)):
++                class Failing(MockEngine):
++                    def cache_rpc(self, op, timeout=None):
++                        raise exc
++
++                tok = ByteTokenizer()
++                svc = Service(Failing(tok, "</think>\n\nok", max_context=CTX), tok,
++                              ChatTemplate(ROOT / "serve/chat_template.jinja"))
++                base = self.http(svc)
++                for method in ("GET", "DELETE"):
++                    code, text = self.req(base, method, "/v1/cache")
++                    self.assertEqual(code, 503, (method, text))
++
++    def test_unsupported_engine_is_501(self):
++        class BareEngine(MockEngine):
++            cache_rpc = None                          # custom engines predate the cache pipe
++
++        tok = ByteTokenizer()
++        svc = Service(BareEngine(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        base = self.http(svc)
++        for method in ("GET", "DELETE"):
++            code, body = self.req(base, method, "/v1/cache")
++            self.assertEqual(code, 501, body)
++            self.assertEqual(json.loads(body)["error"]["type"], "unsupported")
++
++    def test_error_response_exact(self):
++        """The mapping inside the client: exact status/body per failure kind."""
++        self.assertEqual(CacheProtocolClient.error_response(
++            EngineDied("the engine stopped unexpectedly (exit code -9)")),
++            (503, {"error": {"type": "server_error", "message":
++                             "the engine stopped unexpectedly (exit code -9); the next request restarts it"}}))
++        self.assertEqual(CacheProtocolClient.error_response(
++            NotImplementedError("this engine does not support /v1/cache")),
++            (501, {"error": {"type": "unsupported",
++                             "message": "this engine does not support /v1/cache"}}))
++        self.assertEqual(CacheProtocolClient.error_response(
++            TimeoutError("the engine did not answer CACHE INVENTORY in time")),
++            (503, {"error": {"type": "server_error",
++                             "message": "the engine did not answer CACHE INVENTORY in time"}}))
++        self.assertEqual(CacheProtocolClient.error_response(ValueError("CACHE_END without CACHE_BEGIN")),
++                         (503, {"error": {"type": "server_error",
++                                          "message": "CACHE_END without CACHE_BEGIN"}}))
++
++    def test_error_bodies_exact_over_http(self):
++        """Exact status/body per failure over HTTP, both verbs: EngineDied restart suffix, 501,
++        timeout 503, parse 503."""
++        cases = [
++            ("dead", EngineDied("the engine stopped unexpectedly (exit code -9)"), 503,
++             {"error": {"type": "server_error", "message":
++                        "the engine stopped unexpectedly (exit code -9); the next request restarts it"}}),
++            ("unsupported", NotImplementedError("this engine does not support /v1/cache"), 501,
++             {"error": {"type": "unsupported", "message": "this engine does not support /v1/cache"}}),
++            ("timeout", TimeoutError("the engine did not answer CACHE INVENTORY in time"), 503,
++             {"error": {"type": "server_error",
++                        "message": "the engine did not answer CACHE INVENTORY in time"}}),
++            ("parse", ValueError("CACHE_END without CACHE_BEGIN"), 503,
++             {"error": {"type": "server_error", "message": "CACHE_END without CACHE_BEGIN"}}),
++        ]
++        for name, exc, code, body in cases:
++            with self.subTest(name=name):
++                class Failing(MockEngine):
++                    def cache_rpc(self, op, timeout=None):
++                        raise exc
++
++                tok = ByteTokenizer()
++                svc = Service(Failing(tok, "</think>\n\nok", max_context=CTX), tok,
++                              ChatTemplate(ROOT / "serve/chat_template.jinja"))
++                base = self.http(svc)
++                for method in ("GET", "DELETE"):
++                    with self.subTest(method=method):
++                        got_code, text = self.req(base, method, "/v1/cache")
++                        self.assertEqual(got_code, code, text)
++                        self.assertEqual(json.loads(text), body)
++
++    def test_malformed_then_gen_still_works(self):
++        """A 503 from the delegated pipe leaves no stale reply: the next generation still answers."""
++        class Garbage(MockEngine):
++            def cache_rpc(self, op, timeout=None):
++                raise ValueError("CACHE_END without CACHE_BEGIN")
++
++        tok = ByteTokenizer()
++        svc = Service(Garbage(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        base = self.http(svc)
++        self.assertEqual(self.req(base, "GET", "/v1/cache")[0], 503)
++        code, text = self.req(base, "POST", "/v1/chat/completions",
++                              {"model": "m", "messages": [{"role": "user", "content": "hi"}],
++                               "max_tokens": 5})
++        self.assertEqual(code, 200, text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.54.0.windows.1
+

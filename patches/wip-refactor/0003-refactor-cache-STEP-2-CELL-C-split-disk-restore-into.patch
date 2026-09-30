@@ -1,0 +1,719 @@
+From db0cbfff6fb109134d1196483cb79c5ff9fbf591 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Thu, 1 Oct 2026 07:59:12 +0900
+Subject: [PATCH 3/4] refactor(cache): STEP 2 (CELL-C) split disk restore into
+ validate and mount phases
+
+---
+ include/strata/program/restore.hpp |  64 +++++++
+ src/program/generate.cpp           | 297 +++++++++++++++--------------
+ src/program/restore.cpp            |  80 ++++++++
+ src/program/restore_test.cpp       | 205 ++++++++++++++++++++
+ 4 files changed, 508 insertions(+), 138 deletions(-)
+
+diff --git a/include/strata/program/restore.hpp b/include/strata/program/restore.hpp
+index 7e60866..9810095 100644
+--- a/include/strata/program/restore.hpp
++++ b/include/strata/program/restore.hpp
+@@ -221,4 +221,68 @@ class RestoreWalk {
+     std::vector<std::string> disk_skip_;
+ };
+ 
++// ---- Disk restore phases: validate (no GPU mutation) then mount (GPU mutation). -------------
++//
++// Phase 1 loads the lazy payload and runs full validation without touching the GPU; phase 2
++// uploads, refills the ring and pairs the boundary cell, resetting for coherence on any
++// failure. Both catch internally and return typed outcomes; the walk consumes them with a
++// switch (no phase-level try/catch/continue). The drivers never touch the index themselves:
++// index disposition is encoded in the outcome for the caller (drop = drop_path only, never
++// file deletion). Attempt logs print inside the drivers in original order (reason strings
++// borrowed from the caller, never copied for metadata); only the fatal ERR line stays with
++// the caller, selected by the FatalMount/FatalRepair disposition.
++
++/// Phase-1 index disposition: the entry is validated (mount it), dropped from the index by
++/// the driver itself (caller drops nothing; chain stays alive), or transiently failed (index
++/// and chain kept, try shorter).
++enum class DiskValidateDisposition : uint8_t { Proceed, DroppedIndex, KeepIndex };
++
++struct DiskValidateOutcome {
++    DiskValidateDisposition disposition = DiskValidateDisposition::KeepIndex;
++    RestoreFail fail = RestoreFail::None;
++};
++
++/// Non-owning phase-1 seams (function + borrowed context, synchronous use only).
++using DiskLoadFn = bool (*)(const saved_state::RootDiskStore::Entry&, saved_state::SavedItem&,
++                            std::string&, void*);
++using DiskValidateFn = bool (*)(const saved_state::SavedItem&, std::string&, void*);
++using DiskDropFn = void (*)(const std::string&, void*);
++
++/// Phase 1: lazy load (any false drops the index, including unreadable/stopped stores - never
++/// classified retryable) then full validation (any false drops the index); the drop runs
++/// inside the same try, so a throwing drop is a transient keep exactly as before. Throws on
++/// any side keep the index and the chain. True/true proceeds to the mount phase.
++DiskValidateOutcome validate_disk_candidate(
++    const saved_state::RootDiskStore::Entry& dent, saved_state::SavedItem& mount, std::string& why,
++    int64_t sk, DiskLoadFn load, void* load_ctx, DiskValidateFn validate, void* validate_ctx,
++    DiskDropFn drop, void* drop_ctx);
++
++/// Phase-2 disposition: restored (record success), fallthrough (reset held: kill chain, keep
++/// index, try shorter), or fatal (reset failed: fail the request with the mount/repair ERR).
++enum class DiskMountDisposition : uint8_t { Restored, Fallthrough, FatalMount, FatalRepair };
++
++struct DiskMountOutcome {
++    DiskMountDisposition disposition = DiskMountDisposition::Fallthrough;
++    RestoreFail fail = RestoreFail::None;
++};
++
++/// Non-owning phase-2 seams (functions + one borrowed context, synchronous use only). Upload
++/// covers device-sync, stage uploads, MTP rows and ordering syncs (false includes the initial
++/// device-not-idle: it resets exactly like a failed upload); refill is the ring refill after
++/// a good upload; repair pairs boundary cell k-1. Any seam may throw (transient). Reset runs
++/// the full coherence reset; false is fatal.
++struct DiskMountSteps {
++    bool (*upload)(void*);
++    void (*refill)(void*);
++    bool (*repair)(void*);
++    bool (*reset)(void*);
++    void* ctx;
++};
++
++/// Phase 2: upload, ring refill, then boundary repair in order; any failure or throw resets
++/// for coherence (reset failure is fatal). upload_why/repair_why are borrowed for the attempt
++/// logs (filled by the seams, as before). Restored carries fail None.
++DiskMountOutcome mount_disk_candidate(const DiskMountSteps& steps, int64_t sk,
++                                      const std::string& upload_why, const std::string& repair_why);
++
+ }  // namespace strata::program::restore
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 7519e60..55e8cc8 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1692,6 +1692,112 @@ static bool f1_cold_reset_all(strata::core::SessionState& ss, const strata::core
+     return true;
+ }
+ 
++// Disk-phase seams for restore::validate_disk_candidate / mount_disk_candidate: one borrowed
++// context (F1RestoreCtx lifetime) plus non-owning functions, never heap ownership. Reason
++// strings live here exactly as before; the walk owns the attempt flow through typed outcomes.
++struct F1DiskSeams {
++    saved::RootDiskStore* disk = nullptr;
++    const std::vector<int64_t>* ids = nullptr;
++    const std::vector<int32_t>* ids32 = nullptr;
++    const std::vector<saved::ImgKey>* req_simgs = nullptr;
++    bool cvec_cached = true;
++    int64_t n = 0;
++    const strata::core::ModelGeometry* g = nullptr;
++    strata::core::SessionState* ss = nullptr;
++    std::vector<std::unique_ptr<GpuStage>>* stages = nullptr;
++    strata::core::MtpDrafter* mtp = nullptr;
++    const saved::SavedItem* mount_src = nullptr;
++    int64_t sk = 0;
++    size_t hcn = 0;
++    void* main_cs = nullptr;
++    cudaStream_t main_stream = nullptr;
++    std::vector<ConvCheckpoint>* checks = nullptr;
++    int64_t* live_bdry_L = nullptr;
++    std::string upload_why;
++    std::string repair_why;
++};
++
++static bool f1_disk_load_item(const saved::RootDiskStore::Entry& e, saved::SavedItem& out,
++                              std::string& why, void* p) {
++    return static_cast<F1DiskSeams*>(p)->disk->load_item(e, out, why);
++}
++
++static bool f1_disk_validate_item(const saved::SavedItem& item, std::string& why, void* p) {
++    const F1DiskSeams* s = static_cast<const F1DiskSeams*>(p);
++    return saved_validate_for_restore(item, *s->ids32, *s->req_simgs, s->cvec_cached, s->n, *s->g,
++                                      *s->ss, *s->stages, *s->mtp, why);
++}
++
++static void f1_disk_drop_path(const std::string& path, void* p) {
++    static_cast<F1DiskSeams*>(p)->disk->drop_path(path);
++}
++
++static bool f1_disk_upload(void* p) {
++    F1DiskSeams* s = static_cast<F1DiskSeams*>(p);
++    bool ok = cudaDeviceSynchronize() == cudaSuccess;
++    std::string& why2 = s->upload_why;
++    if (!ok) why2 = "device not idle";
++    if (ok && !saved_restore_stage(*s->ss, *s->g, s->mount_src->stages[0], s->mount_src->ids, s->sk,
++                                   s->main_cs, why2))
++        ok = false;
++    for (size_t i = 0; ok && i < s->stages->size(); ++i) {
++        const strata::core::OnDevice on((*s->stages)[i]->dev);
++        if (!saved_restore_stage((*s->stages)[i]->ss, *s->g, s->mount_src->stages[i + 1],
++                                 s->mount_src->ids, s->sk, (void*)(*s->stages)[i]->stream, why2))
++            ok = false;
++    }
++    if (ok && !saved_restore_mtp(*s->mtp, *s->g, s->mount_src->mtp, why2)) ok = false;
++    if (ok) {   // order the streamed-slot resets before any later resolve reads them
++        if (cudaDeviceSynchronize() != cudaSuccess) { why2 = "restore sync failed"; ok = false; }
++        for (size_t i = 0; ok && i < s->stages->size(); ++i) {
++            const strata::core::OnDevice on((*s->stages)[i]->dev);
++            if (cudaDeviceSynchronize() != cudaSuccess) {
++                why2 = "stage sync failed";
++                ok = false;
++            }
++        }
++    }
++    return ok;
++}
++
++static void f1_disk_refill(void* p) {
++    F1DiskSeams* s = static_cast<F1DiskSeams*>(p);
++    s->mtp->kv_restore(s->sk);
++}
++
++static bool f1_disk_repair(void* p) {
++    F1DiskSeams* s = static_cast<F1DiskSeams*>(p);
++    const saved::BoundaryRow& b = s->mount_src->boundary;
++    const int32_t btok = (int32_t)(*s->ids)[(size_t)s->sk];
++    std::string& be = s->repair_why;
++    bool bok = b.row.size() == s->hcn && s->hcn > 0;
++    try {
++        const strata::core::OnDevice on_row(s->mtp->device());
++        std::unique_ptr<float, CudaFreeDel> bdev;
++        float* raw = nullptr;
++        if (bok && cudaMalloc(&raw, s->hcn * sizeof(float)) == cudaSuccess) {
++            bdev.reset(raw);
++            if (cudaMemcpy(bdev.get(), b.row.data(), s->hcn * sizeof(float), cudaMemcpyHostToDevice) ==
++                cudaSuccess)
++                bok = s->mtp->prefill(bdev.get(), &btok, 1, s->sk - 1, be);
++            else
++                bok = false;
++        } else {
++            bok = false;
++        }
++    } catch (const std::exception& ex) {
++        bok = false;
++        be = ex.what();
++    } catch (...) { bok = false; }
++    return bok;
++}
++
++static bool f1_disk_reset(void* p) {
++    F1DiskSeams* s = static_cast<F1DiskSeams*>(p);
++    return f1_cold_reset_all(*s->ss, *s->g, *s->stages, *s->checks, *s->live_bdry_L, s->main_cs,
++                             s->main_stream);
++}
++
+ static int f1_restore_run(F1RestoreCtx& c) {
+     const int64_t n = c.n;
+     const std::vector<int64_t>& ids = *c.ids;
+@@ -1803,147 +1909,62 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                 const int64_t sk = f1_cand.sk_disk;
+                 const std::string dent_path = f1_cand.disk.path;
+                 std::string why;
+-                // Phase 1 (no GPU touched): lazy load + full validation. A throw here keeps the
+-                // chain alive. Load/validation failures drop the index entry: without this a corrupt
+-                // file pins its key (enqueue dedups against the index) and a recaptured root could
+-                // never replace it. The file itself stays for trim; the rewrite replaces it.
+-                try {
+-                if (!root_disk_store.load_item(f1_cand.disk, disk_mount, why)) {
+-                    std::fprintf(stderr, "strata serve: root-disk at %lld tokens unreadable "
+-                                         "(%s): trying shorter\n",
+-                                 (long long)f1_cand.sk_disk, why.c_str());
+-                    root_disk_store.drop_path(f1_cand.disk.path);
+-                    f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Corruption);
++                // Phase 1 (no GPU touched): lazy load + full validation. Load/validation
++                // failures drop the index entry: without this a corrupt file pins its key
++                // (enqueue dedups against the index) and a recaptured root could never
++                // replace it. The file itself stays for trim; the rewrite replaces it.
++                F1DiskSeams seams;
++                seams.disk = &root_disk_store;
++                seams.ids = &ids;
++                seams.ids32 = &ids32;
++                seams.req_simgs = &req_simgs;
++                seams.cvec_cached = cvec_cached;
++                seams.n = n;
++                seams.g = &g;
++                seams.ss = &ss;
++                seams.stages = &stages;
++                seams.mtp = &mtp;
++                seams.mount_src = &disk_mount;
++                seams.sk = sk;
++                seams.hcn = f1_hcn;
++                seams.main_cs = main_cs;
++                seams.main_stream = main_stream;
++                seams.checks = &checks;
++                seams.live_bdry_L = &live_bdry_L;
++                restore::DiskValidateOutcome v = restore::validate_disk_candidate(
++                    f1_cand.disk, disk_mount, why, sk, f1_disk_load_item, &seams,
++                    f1_disk_validate_item, &seams, f1_disk_drop_path, &seams);
++                if (v.disposition != restore::DiskValidateDisposition::Proceed) {
++                    f1_outcome = restore::RestoreResult::failure(v.fail);
+                     continue;
+                 }
+-                if (!saved_validate_for_restore(disk_mount, ids32, req_simgs, cvec_cached, n, g,
+-                                                ss, stages, mtp, why)) {
+-                    std::fprintf(stderr, "strata serve: root-disk at %lld tokens ineligible "
+-                                         "(%s): trying shorter\n",
+-                                 (long long)f1_cand.sk_disk, why.c_str());
+-                    root_disk_store.drop_path(f1_cand.disk.path);
+-                    f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Validation);
+-                    continue;
+-                }
+-                } catch (const std::exception& ex) {
+-                    std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw (%s): "
+-                                         "trying shorter\n",
+-                                 (long long) sk, ex.what());
+-                    f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Transient);
+-                    continue;
+-                } catch (...) {
+-                    std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw: "
+-                                         "trying shorter\n",
+-                                 (long long) sk);
+-                    f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Transient);
+-                    continue;
++                // Phase 2 (may write the GPU): upload + ring refill + boundary repair in
++                // order. Any failure or throw resets for coherence and falls through to
++                // shorter candidates; the file stays indexed throughout (an upload/repair
++                // failure is transient, not corruption). A failed reset fails the request.
++                restore::DiskMountSteps steps;
++                steps.upload = f1_disk_upload;
++                steps.refill = f1_disk_refill;
++                steps.repair = f1_disk_repair;
++                steps.reset = f1_disk_reset;
++                steps.ctx = &seams;
++                restore::DiskMountOutcome m = restore::mount_disk_candidate(
++                    steps, sk, seams.upload_why, seams.repair_why);
++                switch (m.disposition) {
++                    case restore::DiskMountDisposition::Restored:
++                        break;
++                    case restore::DiskMountDisposition::Fallthrough:
++                        f1_walk.kill_chain();   // a mount was attempted: live/chain no longer trustworthy
++                        f1_outcome = restore::RestoreResult::failure(m.fail);
++                        live_ok = false;
++                        continue;
++                    case restore::DiskMountDisposition::FatalMount:
++                        std::printf("ERR SavedState cold reset failed after a failed mount\n");
++                        return 1;
++                    case restore::DiskMountDisposition::FatalRepair:
++                        std::printf("ERR SavedState cold reset failed after a failed repair\n");
++                        return 1;
+                 }
+-                        // Phase 2 (may write the GPU): upload + ring refill + boundary repair. Any failure
+-                        // or throw resets for coherence, kills live/chain, and tries shorter. The file stays
+-                        // indexed throughout: an upload/repair failure is transient, not corruption.
+-                        const saved::SavedItem* mount_src = &disk_mount;
+-                        try {
+-                        bool ok = cudaDeviceSynchronize() == cudaSuccess;
+-                        std::string why2;
+-                        if (!ok) why2 = "device not idle";
+-                        if (ok && !saved_restore_stage(ss, g, mount_src->stages[0], mount_src->ids, sk, main_cs,
+-                                                       why2))
+-                            ok = false;
+-                        for (size_t i = 0; ok && i < stages.size(); ++i) {
+-                            const strata::core::OnDevice on(stages[i]->dev);
+-                            if (!saved_restore_stage(stages[i]->ss, g, mount_src->stages[i + 1],
+-                                                     mount_src->ids, sk, (void*)stages[i]->stream, why2))
+-                                ok = false;
+-                        }
+-                        if (ok && !saved_restore_mtp(mtp, g, mount_src->mtp, why2)) ok = false;
+-                        if (ok) {   // order the streamed-slot resets before any later resolve reads them
+-                            if (cudaDeviceSynchronize() != cudaSuccess) { why2 = "restore sync failed"; ok = false; }
+-                            for (size_t i = 0; ok && i < stages.size(); ++i) {
+-                                const strata::core::OnDevice on(stages[i]->dev);
+-                                if (cudaDeviceSynchronize() != cudaSuccess) {
+-                                    why2 = "stage sync failed";
+-                                    ok = false;
+-                                }
+-                            }
+-                        }
+-                        if (!ok) {
+-                            std::fprintf(stderr, "strata serve: root-disk restore at %lld tokens failed (%s): "
+-                                                 "trying shorter\n",
+-                                         (long long) sk, why2.c_str());
+-                            if (!f1_cold_reset_all(ss, g, stages, checks, live_bdry_L, main_cs, main_stream)) {
+-                                std::printf("ERR SavedState cold reset failed after a failed mount\n");
+-                                return 1;
+-                            }
+-                            f1_walk.kill_chain();   // a mount was attempted: live/chain no longer trustworthy
+-                            f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Mount);
+-                            live_ok = false;
+-                            continue;
+-                        }
+-                        mtp.kv_restore(sk);
+-                        {
+-                            const saved::BoundaryRow& b = mount_src->boundary;
+-                            const int32_t btok = (int32_t) ids[(size_t) sk];
+-                            std::string be;
+-                            bool bok = b.row.size() == f1_hcn && f1_hcn > 0;
+-                            try {
+-                                const strata::core::OnDevice on_row(mtp.device());
+-                                std::unique_ptr<float, CudaFreeDel> bdev;
+-                                float* raw = nullptr;
+-                                if (bok && cudaMalloc(&raw, f1_hcn * sizeof(float)) == cudaSuccess) {
+-                                    bdev.reset(raw);
+-                                    if (cudaMemcpy(bdev.get(), b.row.data(), f1_hcn * sizeof(float),
+-                                                   cudaMemcpyHostToDevice) == cudaSuccess)
+-                                        bok = mtp.prefill(bdev.get(), &btok, 1, sk - 1, be);
+-                                    else
+-                                        bok = false;
+-                                } else {
+-                                    bok = false;
+-                                }
+-                            } catch (const std::exception& ex) {
+-                                bok = false;
+-                                be = ex.what();
+-                            } catch (...) { bok = false; }
+-                            if (!bok) {
+-                                std::fprintf(stderr, "strata serve: root-disk boundary repair at %lld failed "
+-                                                     "(%s): trying shorter\n",
+-                                             (long long) sk, be.empty() ? "staging failed" : be.c_str());
+-                                if (!f1_cold_reset_all(ss, g, stages, checks, live_bdry_L, main_cs, main_stream)) {
+-                                    std::printf("ERR SavedState cold reset failed after a failed repair\n");
+-                                    return 1;
+-                                }
+-                                f1_walk.kill_chain();
+-                                f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::MtpBoundary);
+-                                live_ok = false;
+-                                continue;
+-                            }
+-                        }
+-                        } catch (const std::exception& ex) {
+-                            // The GPU may be partially written: reset for coherence, kill live/chain, and
+-                            // try shorter. No result was recorded yet, so nothing stale remains.
+-                            std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw (%s): "
+-                                                 "trying shorter\n",
+-                                         (long long) sk, ex.what());
+-                            if (!f1_cold_reset_all(ss, g, stages, checks, live_bdry_L, main_cs, main_stream)) {
+-                                std::printf("ERR SavedState cold reset failed after a failed mount\n");
+-                                return 1;
+-                            }
+-                            f1_walk.kill_chain();
+-                            f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Transient);
+-                            live_ok = false;
+-                            continue;
+-                        } catch (...) {
+-                            std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw: "
+-                                                 "trying shorter\n",
+-                                         (long long) sk);
+-                            if (!f1_cold_reset_all(ss, g, stages, checks, live_bdry_L, main_cs, main_stream)) {
+-                                std::printf("ERR SavedState cold reset failed after a failed mount\n");
+-                                return 1;
+-                            }
+-                            f1_walk.kill_chain();
+-                            f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Transient);
+-                            live_ok = false;
+-                            continue;
+-                        }
+                         resume = sk;
+                         from_live = false;
+                         from_saved = true;
+diff --git a/src/program/restore.cpp b/src/program/restore.cpp
+index 3170712..f0e1410 100644
+--- a/src/program/restore.cpp
++++ b/src/program/restore.cpp
+@@ -188,4 +188,84 @@ RestoreCandidate RestoreWalk::next() const {
+     return c;
+ }
+ 
++DiskValidateOutcome validate_disk_candidate(
++    const saved_state::RootDiskStore::Entry& dent, saved_state::SavedItem& mount, std::string& why,
++    int64_t sk, DiskLoadFn load, void* load_ctx, DiskValidateFn validate, void* validate_ctx,
++    DiskDropFn drop, void* drop_ctx) {
++    // Phase 1 (no GPU touched): lazy load + full validation. Load/validation failures drop the
++    // index entry inside this same try: without this a corrupt file pins its key (enqueue
++    // dedups against the index) and a recaptured root could never replace it, while a
++    // throwing drop is a transient keep exactly as before. The file itself stays for trim;
++    // the rewrite replaces it. Dropping is index-only, never file deletion.
++    try {
++        if (!load(dent, mount, why, load_ctx)) {
++            std::fprintf(stderr, "strata serve: root-disk at %lld tokens unreadable "
++                                 "(%s): trying shorter\n",
++                         (long long) sk, why.c_str());
++            drop(dent.path, drop_ctx);
++            return {DiskValidateDisposition::DroppedIndex, RestoreFail::Corruption};
++        }
++        if (!validate(mount, why, validate_ctx)) {
++            std::fprintf(stderr, "strata serve: root-disk at %lld tokens ineligible "
++                                 "(%s): trying shorter\n",
++                         (long long) sk, why.c_str());
++            drop(dent.path, drop_ctx);
++            return {DiskValidateDisposition::DroppedIndex, RestoreFail::Validation};
++        }
++    } catch (const std::exception& ex) {
++        std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw (%s): "
++                             "trying shorter\n",
++                     (long long) sk, ex.what());
++        return {DiskValidateDisposition::KeepIndex, RestoreFail::Transient};
++    } catch (...) {
++        std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw: "
++                             "trying shorter\n",
++                     (long long) sk);
++        return {DiskValidateDisposition::KeepIndex, RestoreFail::Transient};
++    }
++    return {DiskValidateDisposition::Proceed, RestoreFail::None};
++}
++
++DiskMountOutcome mount_disk_candidate(const DiskMountSteps& steps, int64_t sk,
++                                      const std::string& upload_why,
++                                      const std::string& repair_why) {
++    // Phase 2 (may write the GPU): upload + ring refill + boundary repair in order. Any failure
++    // or throw resets for coherence and falls through to shorter candidates; the file stays
++    // indexed throughout (an upload/repair failure is transient, not corruption). A failed
++    // reset is fatal (the caller prints the mount/repair ERR and fails the request).
++    try {
++        if (!steps.upload(steps.ctx)) {
++            std::fprintf(stderr, "strata serve: root-disk restore at %lld tokens failed (%s): "
++                                 "trying shorter\n",
++                         (long long) sk, upload_why.c_str());
++            if (!steps.reset(steps.ctx)) return {DiskMountDisposition::FatalMount, RestoreFail::Mount};
++            return {DiskMountDisposition::Fallthrough, RestoreFail::Mount};
++        }
++        steps.refill(steps.ctx);
++        if (!steps.repair(steps.ctx)) {
++            std::fprintf(stderr, "strata serve: root-disk boundary repair at %lld failed "
++                                 "(%s): trying shorter\n",
++                         (long long) sk, repair_why.empty() ? "staging failed" : repair_why.c_str());
++            if (!steps.reset(steps.ctx))
++                return {DiskMountDisposition::FatalRepair, RestoreFail::MtpBoundary};
++            return {DiskMountDisposition::Fallthrough, RestoreFail::MtpBoundary};
++        }
++    } catch (const std::exception& ex) {
++        // The GPU may be partially written: reset for coherence and try shorter. No result was
++        // recorded yet, so nothing stale remains.
++        std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw (%s): "
++                             "trying shorter\n",
++                     (long long) sk, ex.what());
++        if (!steps.reset(steps.ctx)) return {DiskMountDisposition::FatalMount, RestoreFail::Transient};
++        return {DiskMountDisposition::Fallthrough, RestoreFail::Transient};
++    } catch (...) {
++        std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw: "
++                             "trying shorter\n",
++                     (long long) sk);
++        if (!steps.reset(steps.ctx)) return {DiskMountDisposition::FatalMount, RestoreFail::Transient};
++        return {DiskMountDisposition::Fallthrough, RestoreFail::Transient};
++    }
++    return {DiskMountDisposition::Restored, RestoreFail::None};
++}
++
+ }  // namespace strata::program::restore
+diff --git a/src/program/restore_test.cpp b/src/program/restore_test.cpp
+index 6c78842..43da5c6 100644
+--- a/src/program/restore_test.cpp
++++ b/src/program/restore_test.cpp
+@@ -148,6 +148,79 @@ void write_file(const std::string& path, const std::vector<uint8_t>& buf) {
+     o.write((const char*) buf.data(), (std::streamsize) buf.size());
+     o.close();
+ }
++
++// ---- Step-2 phase seams (non-owning fakes; production wires the GPU-backed versions) ----
++bool dval_accept(const saved::SavedItem&, std::string&, void*) { return true; }
++
++bool dval_reject(const saved::SavedItem&, std::string& why, void*) {
++    why = "fake-invalid";
++    return false;
++}
++
++bool dval_throw(const saved::SavedItem&, std::string&, void*) { throw std::runtime_error("fake throw"); }
++
++bool dload_store(const saved::RootDiskStore::Entry& e, saved::SavedItem& out, std::string& why,
++                 void* p) {
++    return static_cast<saved::RootDiskStore*>(p)->load_item(e, out, why);
++}
++
++bool dload_throw(const saved::RootDiskStore::Entry&, saved::SavedItem&, std::string&, void*) {
++    throw std::runtime_error("fake load throw");
++}
++
++void ddrop_store(const std::string& path, void* p) {
++    static_cast<saved::RootDiskStore*>(p)->drop_path(path);
++}
++
++void ddrop_throw_std(const std::string&, void*) { throw std::runtime_error("fake drop throw"); }
++
++void ddrop_throw_int(const std::string&, void*) { throw 42; }
++
++struct MSeams {
++    std::vector<int> seq;   // 1 upload, 2 refill, 3 repair, 9 reset - call order proof
++    int resets = 0;
++    bool upload_ret = true;
++    bool repair_ret = true;
++    bool reset_ret = true;
++    int throw_at = 0;   // 0 none, 1 upload, 2 refill, 3 repair
++};
++
++bool m_upload(void* p) {
++    MSeams* s = static_cast<MSeams*>(p);
++    s->seq.push_back(1);
++    if (s->throw_at == 1) throw std::runtime_error("fake upload throw");
++    return s->upload_ret;
++}
++
++void m_refill(void* p) {
++    MSeams* s = static_cast<MSeams*>(p);
++    s->seq.push_back(2);
++    if (s->throw_at == 2) throw std::runtime_error("fake refill throw");
++}
++
++bool m_repair(void* p) {
++    MSeams* s = static_cast<MSeams*>(p);
++    s->seq.push_back(3);
++    if (s->throw_at == 3) throw std::runtime_error("fake repair throw");
++    return s->repair_ret;
++}
++
++bool m_reset(void* p) {
++    MSeams* s = static_cast<MSeams*>(p);
++    ++s->resets;
++    s->seq.push_back(9);
++    return s->reset_ret;
++}
++
++restore::DiskMountSteps m_steps(MSeams* s) {
++    restore::DiskMountSteps steps;
++    steps.upload = m_upload;
++    steps.refill = m_refill;
++    steps.repair = m_repair;
++    steps.reset = m_reset;
++    steps.ctx = s;
++    return steps;
++}
+ }  // namespace
+ 
+ int main() {
+@@ -479,6 +552,138 @@ int main() {
+               "disk(100) still tryable after RAM");
+         fs::remove_all("rootdisk-restore-tmp", ec);
+     }
++    {   // Phase 1 (no GPU touched): any load false drops the index (unreadable and stopped
++        // alike - never classified retryable); any validation false drops it; the drop runs
++        // inside the same try, so a throwing drop is a transient keep. Throws elsewhere keep
++        // the index and the chain. Dropping is index-only: the file stays for trim and the
++        // freed key no longer matches (a recaptured root can queue again).
++        const std::string sub = "rootdisk-step2-tmp/validate";
++        std::error_code ec;
++        fs::remove_all("rootdisk-step2-tmp", ec);
++        fs::create_directories(sub, ec);
++        check(!ec, "step2 validate tmpdir created");
++        const saved::RootDiskHeader h = disk_header();
++        const saved::SavedItem d120 = make_item(120, 0);
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, d120, buf, why), "step2 validate fixture encodes");
++        const std::string fpath = sub + "/root-" + saved::root_file_key(h, d120) + ".hstr";
++        write_file(fpath, buf);
++        saved::RootDiskStore store;
++        check(store.start(disk_config(sub), why) && store.enabled() && store.indexed() == 1,
++              "step2 validate store starts");
++        const std::vector<int32_t> ids32 = req32(250);
++        saved::RootDiskStore::Entry dent;
++        check(store.find_match(ids32, no_simgs, true, {}, -1, 250, dent) &&
++                  dent.meta.ids.size() == 120,
++              "step2 validate entry matches");
++        using restore::DiskValidateDisposition;
++        saved::SavedItem mount;
++        restore::DiskValidateOutcome v = restore::validate_disk_candidate(
++            dent, mount, why, 120, dload_store, &store, dval_accept, nullptr, ddrop_store, &store);
++        check(v.disposition == DiskValidateDisposition::Proceed && v.fail == restore::RestoreFail::None &&
++                  mount.ids.size() == 120,
++              "load ok + valid proceeds with the payload");
++        v = restore::validate_disk_candidate(dent, mount, why, 120, dload_store, &store, dval_throw,
++                                             nullptr, ddrop_store, &store);
++        check(v.disposition == DiskValidateDisposition::KeepIndex &&
++                  v.fail == restore::RestoreFail::Transient && store.indexed() == 1,
++              "validation throw keeps index and chain");
++        v = restore::validate_disk_candidate(dent, mount, why, 120, dload_throw, nullptr, dval_accept,
++                                             nullptr, ddrop_store, &store);
++        check(v.disposition == DiskValidateDisposition::KeepIndex &&
++                  v.fail == restore::RestoreFail::Transient && store.indexed() == 1,
++              "load throw keeps index and chain");
++        v = restore::validate_disk_candidate(dent, mount, why, 120, dload_store, &store, dval_reject,
++                                             nullptr, ddrop_throw_std, nullptr);
++        check(v.disposition == DiskValidateDisposition::KeepIndex &&
++                  v.fail == restore::RestoreFail::Transient && store.indexed() == 1,
++              "throwing drop is a transient keep");
++        v = restore::validate_disk_candidate(dent, mount, why, 120, dload_store, &store, dval_reject,
++                                             nullptr, ddrop_throw_int, nullptr);
++        check(v.disposition == DiskValidateDisposition::KeepIndex &&
++                  v.fail == restore::RestoreFail::Transient && store.indexed() == 1,
++              "non-std throwing drop is a transient keep");
++        v = restore::validate_disk_candidate(dent, mount, why, 120, dload_store, &store, dval_reject,
++                                             nullptr, ddrop_store, &store);
++        check(v.disposition == DiskValidateDisposition::DroppedIndex &&
++                  v.fail == restore::RestoreFail::Validation && store.indexed() == 0,
++              "validation false really drops the index");
++        check(fs::exists(fpath), "dropped file stays for trim (never deleted)");
++        check(!store.find_match(ids32, no_simgs, true, {}, -1, 250, dent),
++              "freed key no longer matches (recapture can queue again)");
++        saved::RootDiskStore::Entry missing;
++        missing.path = sub + "/root-0000000000000000.hstr";
++        v = restore::validate_disk_candidate(missing, mount, why, 120, dload_store, &store, dval_accept,
++                                             nullptr, ddrop_store, &store);
++        check(v.disposition == DiskValidateDisposition::DroppedIndex &&
++                  v.fail == restore::RestoreFail::Corruption,
++              "unreadable file drops the index (never retryable)");
++        fs::remove_all("rootdisk-step2-tmp", ec);
++    }
++    {   // Phase 2 driver: upload, refill, repair in order; any failure or throw resets (even a
++        // no-write upload false); reset failure is fatal with the mount/repair distinction.
++        // Reason strings are borrowed for logs; the driver records no failure metadata.
++        using restore::DiskMountDisposition;
++        const std::string uw = "device not idle";
++        const std::string be;
++        MSeams s;
++        restore::DiskMountOutcome m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::Restored && m.fail == restore::RestoreFail::None &&
++                  s.seq == std::vector<int>{1, 2, 3} && s.resets == 0,
++              "clean mount restores in order, no reset");
++        s = MSeams{};
++        s.upload_ret = false;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::Fallthrough && m.fail == restore::RestoreFail::Mount &&
++                  s.seq == std::vector<int>{1, 9} && s.resets == 1,
++              "upload false resets (even with no write) and falls through");
++        s = MSeams{};
++        s.upload_ret = false;
++        s.reset_ret = false;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::FatalMount && m.fail == restore::RestoreFail::Mount,
++              "upload false + reset false is FatalMount");
++        s = MSeams{};
++        s.repair_ret = false;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::Fallthrough &&
++                  m.fail == restore::RestoreFail::MtpBoundary && s.seq == std::vector<int>{1, 2, 3, 9} &&
++                  s.resets == 1,
++              "repair false resets after refill and falls through");
++        s = MSeams{};
++        s.repair_ret = false;
++        s.reset_ret = false;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::FatalRepair &&
++                  m.fail == restore::RestoreFail::MtpBoundary,
++              "repair false + reset false is FatalRepair");
++        s = MSeams{};
++        s.throw_at = 1;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::Fallthrough &&
++                  m.fail == restore::RestoreFail::Transient && s.resets == 1,
++              "upload throw is transient with reset");
++        s = MSeams{};
++        s.throw_at = 2;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::Fallthrough &&
++                  m.fail == restore::RestoreFail::Transient && s.seq == std::vector<int>{1, 2, 9},
++              "refill throw is transient with reset");
++        s = MSeams{};
++        s.throw_at = 3;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::Fallthrough &&
++                  m.fail == restore::RestoreFail::Transient,
++              "repair throw is transient with reset");
++        s = MSeams{};
++        s.throw_at = 1;
++        s.reset_ret = false;
++        m = restore::mount_disk_candidate(m_steps(&s), 120, uw, be);
++        check(m.disposition == DiskMountDisposition::FatalMount &&
++                  m.fail == restore::RestoreFail::Transient,
++              "throw + reset false is FatalMount");
++    }
+     if (g_fail == 0)
+         std::printf("restore_test: all ok\n");
+     else
+-- 
+2.54.0.windows.1
+
