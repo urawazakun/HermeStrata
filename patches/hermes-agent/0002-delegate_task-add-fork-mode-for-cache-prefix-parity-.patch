@@ -15,14 +15,14 @@ provider response so request #1 is a warm cache read. Non-fork path
 unchanged. Tests: tests/tools/test_delegate_fork.py (12 tests).
 ---
  agent/agent_init.py               |   4 +
- agent/tool_executor.py            |  11 +
+ agent/tool_executor.py            |  14 +
  agent/turn_tool_round.py          |   4 +
- tests/tools/test_delegate_fork.py | 362 ++++++++++++++++++++++++++++++
+ tests/tools/test_delegate_fork.py | 372 ++++++++++++++++++++++++++++++
  tools/delegate_tool.py            |  85 +++++--
  tools/delegate_tool_child_run.py  |  10 +
  tools/delegate_tool_config.py     |   8 +
  tools/delegate_tool_fork.py       | 315 ++++++++++++++++++++++++++
- 8 files changed, 786 insertions(+), 13 deletions(-)
+ 8 files changed, 799 insertions(+), 13 deletions(-)
  create mode 100644 tests/tools/test_delegate_fork.py
  create mode 100644 tools/delegate_tool_fork.py
 
@@ -45,21 +45,24 @@ diff --git a/agent/tool_executor.py b/agent/tool_executor.py
 index 518b714f..44b99227 100644
 --- a/agent/tool_executor.py
 +++ b/agent/tool_executor.py
-@@ -622,6 +622,17 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
+@@ -622,6 +622,20 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
  def _pre_tool_block(agent, ref: _ToolCallRef):
      """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
      hook-modified args applied. Hook failures never block."""
 +    # Fork-child restriction (delegate_task fork mode): blocked tools stay
 +    # advertised for tools[] cache parity and refuse here, at call time.
-+    # Agent-attribute check (not thread-local) so worker threads see it.
++    # This guard is fail-closed for fork children: an enforcement failure must
++    # never silently restore a blocked capability just to preserve cache parity.
 +    try:
 +        from tools.delegate_tool_fork import fork_child_block_message
-+
 +        _fork_block = fork_child_block_message(agent, ref.name)
-+        if _fork_block is not None:
-+            return _fork_block, ref.args
 +    except Exception:
-+        pass
++        if getattr(agent, "_is_fork_child", False):
++            logger.exception("Fork-child tool restriction check failed")
++            return json.dumps({"error": "Fork-child restriction enforcement failed; tool call refused."}), ref.args
++        _fork_block = None
++    if _fork_block is not None:
++        return _fork_block, ref.args
      try:
          from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
  
@@ -83,7 +86,7 @@ new file mode 100644
 index 00000000..2e4d0a25
 --- /dev/null
 +++ b/tests/tools/test_delegate_fork.py
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,372 @@
 +#!/usr/bin/env python3
 +"""Tests for delegate_task fork mode (prompt-cache prefix parity).
 +
@@ -401,6 +404,16 @@ index 00000000..2e4d0a25
 +        self.assertIn("not available to a forked child", json.loads(message)["error"])
 +        message, _ = _pre_tool_block(child, _ToolCallRef("terminal", {}, "t", "c", []))
 +        self.assertIsNone(message)
++
++    def test_executor_guard_failure_is_fail_closed_for_fork_child(self):
++        """A broken restriction helper must refuse, not silently enable blocked tools."""
++        from agent.tool_executor import _ToolCallRef, _pre_tool_block
++
++        child = self._fork_child()
++        with patch("tools.delegate_tool_fork.fork_child_block_message", side_effect=RuntimeError("boom")):
++            message, _ = _pre_tool_block(child, _ToolCallRef("memory", {}, "t", "c", []))
++        self.assertIsNotNone(message)
++        self.assertIn("restriction enforcement failed", json.loads(message)["error"].lower())
 +
 +    def test_depth_limit_refusal_for_fork(self):
 +        parent = _StubParent(depth=1)  # default max_spawn_depth == 1
