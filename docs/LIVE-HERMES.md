@@ -41,3 +41,10 @@ Told "work until 18:00", Hermes ended its turn after ~1.5 h ("no way to keep goi
 not a floor. The patch adds `set_work_deadline(until, goal)` / `finish_work(reason)` tools: before the deadline a
 final answer is turned into a short continuation message; stopping early needs an explicit reason; the existing run
 budget / max turns still win; three idle continuations end the turn. 125 tests pass; not yet run live.
+
+## 2026-10-01: delegation works live; ask_document
+- With the `delegation` toolset enabled, a child ran and its result reached the parent (169 s) after the deadlock fix
+  (patch 0004). Before it, the parent waited forever: the child's worker thread blocked in a process-wide
+  `nemo_relay` subscriber flush that needed the parent's (blocked) event loop.
+- `ask_document` on a 26K-token directory: 1st question read the document (root captured, persisted), 2nd question
+  `resume from root at 26411, suffix 53` -> 165 s vs 43 s for the whole Hermes turn; both answers correct.

@@ -36,6 +36,7 @@ one line is the right trade-off. With 128 GB host RAM and an agent harness, seve
 | Hermes | fixed prefix discipline: git workspace snapshot moved to the volatile tail (`HERMES_WORKSPACE_LATE=1`), title generated after the turn (`HERMES_TITLE_AFTER_TURN=1`) | `patches/hermes-agent/0001` |
 | Hermes | `delegate_task` **fork mode**: a child starts from the parent's exact prompt (+ its tool call + a tool result carrying the task), so the engine resumes it from the parent's saved state; blocked tools and depth limit are refused at call time instead of being removed from `tools[]` | `patches/hermes-agent/0002` |
 | Hermes | **work deadline** tools (`set_work_deadline` / `finish_work`): "work until 18:00" keeps the agent going until the deadline; run budget stays the ceiling | `patches/hermes-agent/0003` (experimental) |
+| Hermes | fix a delegation **deadlock** (a finished child blocked in a process-wide telemetry flush while the parent waited for it); **`ask_document`** tool = cache-augmented reading: the document is a byte-stable system prefix, so the engine keeps it as a root on disk and the 2nd question on the same document skips re-reading it (live: 165 s -> 43 s end to end, 26K-token document) | `patches/hermes-agent/0004` |
 
 Design: [docs/DESIGN.md](docs/DESIGN.md). How the fixes were found: [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 Acceptance ledger: [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Live Hermes runs and what they exposed: [docs/LIVE-HERMES.md](docs/LIVE-HERMES.md).

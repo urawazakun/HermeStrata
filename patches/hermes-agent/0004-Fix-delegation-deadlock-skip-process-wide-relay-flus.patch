@@ -1,0 +1,1165 @@
+From 5fae8263b17b71512893793366659a90b00e8708 Mon Sep 17 00:00:00 2001
+From: urawa <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 05:01:38 +0900
+Subject: [PATCH] Fix delegation deadlock (skip process-wide relay flush inside
+ delegated child / managed callback); add ask_document tool (cache-augmented
+ reading)
+
+Origin: user; plan: Claude; implemented: Muse x2; reviewed: Sol (low); 221 tests pass (Claude, prod venv).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/relay_runtime.py                        |  17 +
+ .../observability/relay_shared_metrics.py     |  46 +++
+ model_tools.py                                |   5 +
+ ..._relay_shared_metrics_delegate_deadlock.py |  78 ++++
+ tests/tools/test_ask_document.py              | 317 +++++++++++++++
+ .../test_delegate_child_run_flush_deferral.py | 197 ++++++++++
+ tools/ask_document_tool.py                    | 369 ++++++++++++++++++
+ tools/delegate_tool_child_run.py              |   5 +
+ toolsets.py                                   |   2 +
+ 9 files changed, 1036 insertions(+)
+ create mode 100644 tests/hermes_cli/test_relay_shared_metrics_delegate_deadlock.py
+ create mode 100644 tests/tools/test_ask_document.py
+ create mode 100644 tests/tools/test_delegate_child_run_flush_deferral.py
+ create mode 100644 tools/ask_document_tool.py
+
+diff --git a/agent/relay_runtime.py b/agent/relay_runtime.py
+index a204ec5b..fe6ef8b3 100644
+--- a/agent/relay_runtime.py
++++ b/agent/relay_runtime.py
+@@ -847,6 +847,23 @@ def managed_callback_guard():
+         _MANAGED_CALLBACK_DEPTH.reset(token)
+ 
+ 
++def in_managed_callback() -> bool:
++    """True while the current context runs inside a managed Relay callback.
++
++    Telemetry uses this to avoid process-wide ``subscribers.flush()`` there: the
++    native pipeline binds its Futures to the outer call's loop, which is blocked
++    inside the synchronous callback, so a flush that waits on queued callbacks
++    can deadlock (delegation: the parent waits in ``await_child`` while the
++    callback is still on the stack, and the child already skipped its flush).
++    Queued events are drained by the parent task finish / teardown after the
++    callback returns instead.
++    """
++    try:
++        return _MANAGED_CALLBACK_DEPTH.get() > 0
++    except Exception:
++        return False
++
++
+ def _warn_on_error(what: str, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+     """Run fail-open telemetry work: log ``Hermes Relay <what> failed`` and return None on error."""
+     try:
+diff --git a/hermes_cli/observability/relay_shared_metrics.py b/hermes_cli/observability/relay_shared_metrics.py
+index 61cfe685..4dc9e8ae 100644
+--- a/hermes_cli/observability/relay_shared_metrics.py
++++ b/hermes_cli/observability/relay_shared_metrics.py
+@@ -452,6 +452,15 @@ class _Runtime:
+             session, {**event, **_ABORTED, "completed": False, "interrupted": False}
+         ):
+             return
++        if _defer_flush():
++            # Same deadlock guard as _flush_and_export. This also covers the
++            # parent-thread ``subagent_stop`` close of the child session, which
++            # runs inside the managed tool callback while ``await_child`` (or
++            # its aftermath) is still on the stack: abort + forget now, drain
++            # the queued events at the parent task finish / teardown.
++            with self._sessions_lock:
++                _forget(self._sessions, session.session_id, session)
++            return
+         try:
+             self.relay.subscribers.flush()
+         except Exception as exc:
+@@ -551,6 +560,16 @@ class _Runtime:
+ 
+     def _flush_and_export(self, failure_message: str) -> None:
+         """Flush the Relay subscriber, then export; a failed flush skips the export."""
++        if _defer_flush():
++            # Delegation deadlock guard: ``subscribers.flush()`` is process-wide
++            # and can wait on callbacks bound to a loop that is blocked inside the
++            # current synchronous callback. That covers the child worker (its
++            # parent waits in ``await_child``) AND the parent itself while its
++            # tool call is still on the stack in ``await_child`` or the
++            # ``subagent_stop`` close that follows it. Queued events are drained
++            # by the parent task finish / session teardown after the callback
++            # returns, so skipping here loses no metrics.
++            return
+         try:
+             self.relay.subscribers.flush()
+         except Exception:
+@@ -844,6 +863,33 @@ def _reconcile_store_consent(store: SharedMetricsStore, send_enabled: bool) -> N
+             reconcile_send_consent(connection, send_enabled)
+ 
+ 
++def _defer_flush() -> bool:
++    """True while a process-wide subscriber flush could deadlock.
++
++    Two cases, same wait cycle: (a) a delegate_task child worker whose parent
++    waits in ``await_child``; (b) ANY thread inside a managed Relay callback
++    (``agent.relay_runtime.in_managed_callback``) — the native pipeline binds
++    its Futures to the outer call's loop, blocked inside the synchronous
++    callback, so a flush waiting on queued callbacks waits on the callback
++    itself. Case (b) covers the parent thread while ``await_child`` or the
++    parent-thread ``subagent_stop`` child-session close is still on the stack.
++    Lazy imports: this module is reached from lifecycle-hook paths where eager
++    agent imports would be a needless cycle risk. Fail-closed (no deferral) so
++    a broken probe can never silently stop metrics.
++    """
++    try:
++        from agent.delegation_context import is_delegated_child_context
++        if is_delegated_child_context():
++            return True
++    except Exception:
++        pass
++    try:
++        from agent.relay_runtime import in_managed_callback
++        return bool(in_managed_callback())
++    except Exception:
++        return False
++
++
+ def enabled() -> bool:
+     """Return the shared-metrics policy for the active Hermes profile."""
+     profile_key = relay_runtime.current_profile_key()
+diff --git a/model_tools.py b/model_tools.py
+index b827fbb2..769a83b5 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -331,6 +331,11 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
+     # disabled toolset are strictly stripped out. See issue #17309.
+     if disabled_toolsets:
+         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
++    if _is_delegated_child_context():
++        # ask_document is parent-side document QA (children use read_file);
++        # discarded here — never in check_fn, whose verdicts are TTL-cached
++        # process-wide and must not answer per-session surface.
++        tools.discard("ask_document")
+     return tools
+ 
+ 
+diff --git a/tests/hermes_cli/test_relay_shared_metrics_delegate_deadlock.py b/tests/hermes_cli/test_relay_shared_metrics_delegate_deadlock.py
+new file mode 100644
+index 00000000..fb16c3b8
+--- /dev/null
++++ b/tests/hermes_cli/test_relay_shared_metrics_delegate_deadlock.py
+@@ -0,0 +1,78 @@
++"""Delegation-deadlock guard: no process-wide subscriber flush while a managed
++Relay callback is on the stack or on a delegated child worker.
++
++``subscribers.flush()`` waits on ALL queued callbacks process-wide, which can
++need the loop blocked inside the current synchronous callback: the child
++worker (parent waits in ``await_child``) and the parent thread itself (still
++inside the tool callback in ``await_child`` / the ``subagent_stop`` close).
++Skipped flushes lose nothing: events stay queued and drain at the parent task
++finish / teardown after the callback returns.
++"""
++
++from __future__ import annotations
++
++import threading
++from types import SimpleNamespace
++
++from agent.delegation_context import delegated_child_context
++from agent.relay_runtime import in_managed_callback, managed_callback_guard
++from hermes_cli.observability.relay_shared_metrics import _Runtime, _defer_flush
++
++
++def _bare_runtime(monkeypatch, flush, on_export):
++    """A _Runtime without __init__ (no disk, no atexit, no real Relay)."""
++    runtime = object.__new__(_Runtime)
++    runtime.relay = SimpleNamespace(subscribers=SimpleNamespace(flush=flush))
++    monkeypatch.setattr(runtime, "_export", on_export)
++    return runtime
++
++
++def test_no_deferral_on_healthy_path():
++    assert in_managed_callback() is False
++    assert _defer_flush() is False
++
++
++def test_child_worker_defers_flush(monkeypatch):
++    calls: list[str] = []
++    runtime = _bare_runtime(
++        monkeypatch, lambda: calls.append("flush"), lambda: calls.append("export")
++    )
++    with delegated_child_context("child-sess"):
++        assert _defer_flush() is True
++        runtime._flush_and_export("task flush failed")
++    assert calls == []
++
++
++def test_in_callback_defers_flush_and_close_still_forgets(monkeypatch):
++    from hermes_cli.observability.relay_shared_metrics import _MetricsSession
++
++    calls: list[str] = []
++    runtime = _bare_runtime(
++        monkeypatch, lambda: calls.append("flush"), lambda: calls.append("export")
++    )
++    runtime._sessions_lock = threading.RLock()
++    session = _MetricsSession(
++        session_id="child-sess",
++        relay_session=SimpleNamespace(handle=None, context=None),
++    )
++    runtime._sessions = {"child-sess": session}
++
++    with managed_callback_guard():
++        assert _defer_flush() is True
++        runtime._flush_and_export("task flush failed")
++        # Parent-thread ``subagent_stop`` close of the child session: abort +
++        # forget now, drain later.
++        runtime.close_session({"session_id": "child-sess"})
++
++    assert calls == []
++    assert runtime._sessions == {}
++    assert session.closing is True
++
++
++def test_outside_callback_flush_and_export_proceed(monkeypatch):
++    calls: list[str] = []
++    runtime = _bare_runtime(
++        monkeypatch, lambda: calls.append("flush"), lambda: calls.append("export")
++    )
++    runtime._flush_and_export("task flush failed")
++    assert calls == ["flush", "export"]
+diff --git a/tests/tools/test_ask_document.py b/tests/tools/test_ask_document.py
+new file mode 100644
+index 00000000..11cf7444
+--- /dev/null
++++ b/tests/tools/test_ask_document.py
+@@ -0,0 +1,317 @@
++"""Tests for the ask_document tool (Goal 2, CELL-A).
++
++All LLM traffic uses a fake OpenAI-shaped client on a turn-bound agent double
++(``bind_subagent_parent``) — no network, no credentials, no fallback client.
++File loading, registration, config gating and child exclusion are exercised
++through the real registry/toolset code paths.
++"""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++import tools.ask_document_tool as ad
++from tools.registry import registry
++
++
++class _FakeCompletions:
++    def __init__(self, owner):
++        self._owner = owner
++
++    def create(self, **kwargs):
++        self._owner.calls.append(kwargs)
++        return self._owner.response
++
++
++class _FakeChat:
++    def __init__(self, owner):
++        self.completions = _FakeCompletions(owner)
++
++
++class FakeClient:
++    """OpenAI-shaped fake: records create() kwargs, returns a canned response."""
++
++    def __init__(self, answer="the answer", cached_tokens=None):
++        self.calls = []
++        self.chat = _FakeChat(self)
++        message = SimpleNamespace(content=answer)
++        usage = None
++        if cached_tokens is not None:
++            usage = SimpleNamespace(
++                prompt_tokens=100, completion_tokens=10, total_tokens=110,
++                prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens))
++        self.response = SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
++
++
++@pytest.fixture
++def bound_client():
++    """Fake client on a bound chat_completions agent (the production path)."""
++    from agent.subagent_lifecycle import bind_subagent_parent
++    client = FakeClient()
++    agent = SimpleNamespace(api_mode="chat_completions", model="test-model", client=client)
++    with bind_subagent_parent(agent):
++        yield client
++
++
++@pytest.fixture
++def doc_file(tmp_path):
++    target = tmp_path / "notes.md"
++    target.write_text("# Notes\n\nThe sky cipher is BLUE.\n", encoding="utf-8")
++    return target
++
++
++def _payload(raw):
++    data = json.loads(raw)
++    assert isinstance(data, dict)
++    return data
++
++
++def _system_of(client):
++    assert len(client.calls) == 1
++    return client.calls[0]["messages"][0]["content"]
++
++
++class TestReaderCall:
++    def test_answer_returned(self, bound_client, doc_file):
++        data = _payload(ad.ask_document(str(doc_file), "What is the cipher?"))
++        assert data["success"] is True
++        assert data["answer"] == "the answer"
++        assert data["model"] == "test-model"
++        assert data["truncated"] is False
++        assert "cached_tokens" not in data
++
++    def test_cached_tokens_surfaced(self, bound_client, tmp_path):
++        bound_client.response = FakeClient(cached_tokens=1234).response
++        target = tmp_path / "d.md"
++        target.write_text("content here", encoding="utf-8")
++        data = _payload(ad.ask_document(str(target), "q?"))
++        assert data["cached_tokens"] == 1234
++
++    def test_plain_completion_shape(self, bound_client, doc_file):
++        ad.ask_document(str(doc_file), "Q?")
++        assert len(bound_client.calls) == 1
++        kwargs = bound_client.calls[0]
++        assert kwargs["model"] == "test-model"
++        assert set(kwargs) == {"model", "messages", "max_tokens"}
++        messages = kwargs["messages"]
++        assert [m["role"] for m in messages] == ["system", "user"]
++        assert messages[1]["content"] == "Q?"
++        assert "<document path=" in messages[0]["content"]
++        assert "The sky cipher is BLUE." in messages[0]["content"]
++        assert "</document>" in messages[0]["content"]
++
++    def test_system_bytes_identical_across_questions(self, bound_client, doc_file):
++        ad.ask_document(str(doc_file), "First question?")
++        ad.ask_document(str(doc_file), "Second question?")
++        first, second = bound_client.calls
++        assert first["messages"][0]["content"] == second["messages"][0]["content"]
++        assert isinstance(first["messages"][0]["content"], str)
++        assert first["messages"][1]["content"] != second["messages"][1]["content"]
++
++    def test_resolve_uses_bound_client_and_model(self, bound_client):
++        resolved = ad._resolve_chat_client()
++        assert resolved is not None
++        assert resolved[0] is bound_client
++        assert resolved[1] == "test-model"
++
++    def test_empty_question_is_error(self, bound_client, doc_file):
++        data = _payload(ad.ask_document(str(doc_file), "   "))
++        assert "error" in data
++        assert bound_client.calls == []
++
++    def test_missing_path_is_error(self, bound_client, tmp_path):
++        data = _payload(ad.ask_document(str(tmp_path / "nope.md"), "Q?"))
++        assert "error" in data
++        assert bound_client.calls == []
++
++
++class TestClientRequirement:
++    def test_unbound_context_refused_without_network(self, doc_file):
++        assert ad._resolve_chat_client() is None
++        data = _payload(ad.ask_document(str(doc_file), "Q?"))
++        assert "error" in data
++        assert "no bound agent chat client" in data["error"]
++
++    def test_non_chat_mode_refused_no_fallback(self, doc_file):
++        from agent.subagent_lifecycle import bind_subagent_parent
++        decoy = FakeClient()
++        agent = SimpleNamespace(api_mode="codex_responses", model="codex-model", client=decoy)
++        with bind_subagent_parent(agent):
++            assert ad._resolve_chat_client() is None
++            data = _payload(ad.ask_document(str(doc_file), "Q?"))
++        assert "error" in data
++        assert decoy.calls == []
++
++    def test_registry_dispatch_uses_bound_client(self, doc_file):
++        from agent.subagent_lifecycle import bind_subagent_parent
++        client = FakeClient()
++        agent = SimpleNamespace(api_mode="chat_completions", model="bound-model", client=client)
++        with bind_subagent_parent(agent):
++            data = _payload(registry.dispatch(
++                "ask_document", {"path": str(doc_file), "question": "Q?"},
++                task_id="default"))
++        assert data["success"] is True
++        assert data["model"] == "bound-model"
++        assert len(client.calls) == 1
++
++
++class TestDocumentLoading:
++    def test_directory_global_sorted_order(self, bound_client, tmp_path):
++        root = tmp_path / "docs"
++        (root / "sub").mkdir(parents=True)
++        (root / "b.txt").write_text("B-body", encoding="utf-8")
++        (root / "sub" / "c.txt").write_text("C-body", encoding="utf-8")
++        (root / "a" / "z.txt").parent.mkdir(parents=True)
++        (root / "a" / "z.txt").write_text("Z-body", encoding="utf-8")
++        data = _payload(ad.ask_document(str(root), "Q?"))
++        assert data["success"] is True
++        system = _system_of(bound_client)
++        ia, ib, ic = (system.index("### a/z.txt"), system.index("### b.txt"),
++                      system.index("### sub/c.txt"))
++        assert ia < ib < ic
++
++    def test_binary_files_skipped(self, bound_client, tmp_path):
++        root = tmp_path / "docs"
++        root.mkdir()
++        (root / "good.txt").write_text("good-body", encoding="utf-8")
++        (root / "evil.txt").write_bytes(b"abc\x00def")
++        (root / "img.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
++        data = _payload(ad.ask_document(str(root), "Q?"))
++        assert data["success"] is True
++        system = _system_of(bound_client)
++        assert "good-body" in system
++        assert "img.png" not in system
++        assert "evil.txt" not in system
++
++    def test_non_utf8_bytes_are_binary(self, bound_client, tmp_path):
++        target = tmp_path / "random.bin.txt"
++        target.write_bytes(bytes(range(128, 256)) * 4)
++        data = _payload(ad.ask_document(str(target), "Q?"))
++        assert "error" in data
++        assert bound_client.calls == []
++
++    def test_single_binary_refused(self, bound_client, tmp_path):
++        target = tmp_path / "img.png"
++        target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
++        data = _payload(ad.ask_document(str(target), "Q?"))
++        assert "error" in data
++        assert bound_client.calls == []
++
++    def test_size_cap_covers_headers(self, bound_client, tmp_path, monkeypatch):
++        monkeypatch.setattr(ad, "_ask_document_max_chars", lambda: 60)
++        root = tmp_path / "docs"
++        root.mkdir()
++        (root / "a.txt").write_text("A" * 50, encoding="utf-8")
++        (root / "b.txt").write_text("B" * 50, encoding="utf-8")
++        data = _payload(ad.ask_document(str(root), "Q?"))
++        assert data["success"] is True
++        assert data["truncated"] is True
++        system = _system_of(bound_client)
++        doc = system.split("<document path=", 1)[1].split(">\n", 1)[1].rsplit("\n</document>", 1)[0]
++        assert len(doc) == 60
++        assert "truncated to max_chars" not in system
++
++    def test_large_file_bounded_and_truncated(self, bound_client, tmp_path, monkeypatch):
++        monkeypatch.setattr(ad, "_ask_document_max_chars", lambda: 100)
++        target = tmp_path / "big.txt"
++        target.write_text("x" * 5000, encoding="utf-8")
++        data = _payload(ad.ask_document(str(target), "Q?"))
++        assert data["success"] is True
++        assert data["truncated"] is True
++        system = _system_of(bound_client)
++        doc = system.split("<document path=", 1)[1].split(">\n", 1)[1].rsplit("\n</document>", 1)[0]
++        assert doc == "x" * 100
++
++    def test_capped_nul_rejected(self, bound_client, tmp_path, monkeypatch):
++        monkeypatch.setattr(ad, "_ask_document_max_chars", lambda: 100)
++        target = tmp_path / "bin.txt"
++        target.write_bytes(b"A" * 50 + b"\x00" + b"B" * 5000)
++        data = _payload(ad.ask_document(str(target), "Q?"))
++        assert "error" in data
++        assert bound_client.calls == []
++
++    def test_partial_4byte_boundary_dropped(self, tmp_path):
++        target = tmp_path / "emoji.txt"
++        target.write_bytes(b"B" * 401 + "😀".encode("utf-8") + b"D" * 100)
++        text, limit_hit = ad._read_text_file(target, 404)
++        assert limit_hit is True
++        assert text == "B" * 401
++
++    def test_invalid_bytes_near_boundary_rejected(self, bound_client, tmp_path):
++        target = tmp_path / "bad.txt"
++        target.write_bytes(b"B" * 400 + b"\xff" + b"D" * 100)
++        assert ad._read_text_file(target, 404)[0] is None
++        data = _payload(ad.ask_document(str(target), "Q?"))
++        assert "error" in data
++        assert bound_client.calls == []
++
++    def test_empty_directory_is_error(self, bound_client, tmp_path):
++        root = tmp_path / "empty"
++        root.mkdir()
++        data = _payload(ad.ask_document(str(root), "Q?"))
++        assert "error" in data
++        assert bound_client.calls == []
++
++
++class TestRegistrationAndGating:
++    def test_registered_in_own_toolset(self):
++        assert registry.get_toolset_for_tool("ask_document") == "ask_document"
++
++    def test_exposed_in_core_bundle(self):
++        from toolsets import _HERMES_CORE_TOOLS, resolve_toolset
++        assert "ask_document" in _HERMES_CORE_TOOLS
++        assert "ask_document" in resolve_toolset("hermes-cli")
++
++    def test_schema_excluded_for_delegated_child(self):
++        from agent.delegation_context import delegated_child_context
++        from model_tools import get_tool_definitions
++
++        def names():
++            return [t["function"]["name"] for t in get_tool_definitions(
++                enabled_toolsets=["ask_document"], quiet_mode=True)]
++
++        assert "ask_document" in names()
++        with delegated_child_context("child-session"):
++            assert "ask_document" not in names()
++        assert "ask_document" in names()
++
++    def test_child_dispatch_refused(self, tmp_path):
++        from agent.delegation_context import delegated_child_context
++        from agent.subagent_lifecycle import bind_subagent_parent
++        target = tmp_path / "d.md"
++        target.write_text("content here", encoding="utf-8")
++        client = FakeClient()
++        agent = SimpleNamespace(api_mode="chat_completions", model="m", client=client)
++        with bind_subagent_parent(agent), delegated_child_context("child-session"):
++            data = _payload(registry.dispatch(
++                "ask_document", {"path": str(target), "question": "Q?"},
++                task_id="default"))
++        assert "error" in data
++        assert "delegated children" in data["error"]
++        assert client.calls == []
++
++    def test_check_fn_defaults_enabled(self, monkeypatch):
++        monkeypatch.setattr(ad, "_ask_document_section", lambda: {})
++        assert ad.check_ask_document_requirements() is True
++
++    def test_check_fn_respects_disabled(self, monkeypatch):
++        monkeypatch.setattr(ad, "_ask_document_section", lambda: {"enabled": False})
++        assert ad.check_ask_document_requirements() is False
++
++    def test_handler_enforces_disabled(self, tmp_path, monkeypatch):
++        from agent.subagent_lifecycle import bind_subagent_parent
++        monkeypatch.setattr(ad, "_ask_document_section", lambda: {"enabled": False})
++        target = tmp_path / "d.md"
++        target.write_text("content here", encoding="utf-8")
++        client = FakeClient()
++        agent = SimpleNamespace(api_mode="chat_completions", model="m", client=client)
++        with bind_subagent_parent(agent):
++            data = _payload(ad.ask_document(str(target), "Q?"))
++        assert "error" in data
++        assert "disabled" in data["error"]
++        assert client.calls == []
++
++    def test_max_chars_config_respected(self, monkeypatch):
++        monkeypatch.setattr(ad, "_ask_document_section", lambda: {"max_chars": 123})
++        assert ad._ask_document_max_chars() == 123
+diff --git a/tests/tools/test_delegate_child_run_flush_deferral.py b/tests/tools/test_delegate_child_run_flush_deferral.py
+new file mode 100644
+index 00000000..80a684a4
+--- /dev/null
++++ b/tests/tools/test_delegate_child_run_flush_deferral.py
+@@ -0,0 +1,197 @@
++"""Delegation deadlock end-to-end: real ``_ChildRun.await_child`` driven inside a
++blocked asyncio callback, with a fake subscriber queue that needs the callback
++to return.
++
++The loop thread runs the tool callback synchronously (as the native Relay
++pipeline does in ``relay_tools.invoke``); the child worker emits its task
++finish there. ``flush()`` schedules a no-op on the loop and waits for it, so
++any synchronous flush before the callback returns wedges: on regression the
++fake raises instead of hanging the suite. After the callback returns, the
++parent task finish drains the queued events.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextvars
++import threading
++import time
++from types import SimpleNamespace
++
++from agent.relay_runtime import managed_callback_guard
++from hermes_cli.observability.relay_shared_metrics import (
++    _MetricsSession,
++    _Runtime,
++    _TaskRun,
++)
++from tools import delegate_tool, delegate_tool_child_run
++
++
++def _fake_relay(order: list[str], loop: asyncio.AbstractEventLoop):
++    relay = SimpleNamespace()
++
++    def needs_loop_flush() -> None:
++        # Models _native_flush waiting on a callback bound to the loop that is
++        # blocked inside the synchronous tool callback: it cannot proceed
++        # until the callback returns.
++        order.append("flush_entered")
++        done = threading.Event()
++        loop.call_soon_threadsafe(done.set)
++        assert done.wait(timeout=10), (
++            "subscriber flush waited on the loop blocked in the tool callback: deadlock"
++        )
++        order.append("flushed")
++
++    relay.subscribers = SimpleNamespace(flush=needs_loop_flush)
++    relay.get_scope_stack = lambda: order.append("scope_sync")
++    relay.scope = SimpleNamespace(
++        push=lambda *a, **k: order.append("scope_push"),
++        pop=lambda handle, **kwargs: order.append("scope_pop"),
++    )
++    return relay
++
++
++def _bare_runtime(relay, on_export) -> _Runtime:
++    runtime = object.__new__(_Runtime)
++    runtime.relay = relay
++    runtime.host = SimpleNamespace(runtime_id="deadlock-test")
++    runtime._export = on_export
++    runtime._sessions_lock = threading.RLock()
++    runtime._task_sessions_lock = threading.RLock()
++    runtime._sessions = {}
++    runtime._task_sessions = {}
++    runtime._turn_sessions = {}
++    return runtime
++
++
++def _register_task(runtime: _Runtime, session_id: str, task_id: str) -> None:
++    relay_session = SimpleNamespace(handle=(session_id, "scope"), context=contextvars.copy_context())
++    session = _MetricsSession(session_id=session_id, relay_session=relay_session)
++    session.tasks[task_id] = _TaskRun(
++        task_id=task_id,
++        handle=(session_id, task_id),
++        context=contextvars.copy_context(),
++        started_ns=time.monotonic_ns(),
++        start_fields={},
++    )
++    runtime._sessions[session_id] = session
++    runtime._task_sessions[(session_id, task_id)] = session
++
++
++class _DelegatingChild:
++    """Child whose turn finish emits the real metrics task hook on the worker."""
++
++    def __init__(self, runtime: _Runtime) -> None:
++        self._runtime = runtime
++        self.session_id = "child-sess"
++        self._fork_conversation_history = None
++
++    def run_conversation(self, **_kwargs):
++        self._runtime.finish_task(
++            {
++                "session_id": "child-sess",
++                "task_id": "child-task",
++                "platform": "cli",
++                "completed": True,
++            }
++        )
++        return {"final_response": "done", "completed": True, "api_calls": 1, "messages": []}
++
++
++def test_await_child_inside_blocked_callback_defers_flush(monkeypatch):
++    order: list[str] = []
++    loop = asyncio.new_event_loop()
++    relay = _fake_relay(order, loop)
++    runtime = _bare_runtime(relay, lambda: order.append("exported"))
++    _register_task(runtime, "child-sess", "child-task")
++    _register_task(runtime, "parent-sess", "parent-task")
++
++    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: None)
++    monkeypatch.setattr(delegate_tool, "_get_subagent_approval_callback", lambda: None)
++    monkeypatch.setattr(delegate_tool, "_set_subagent_approval_cb", lambda _cb: None)
++    run = delegate_tool_child_run._ChildRun(
++        child=_DelegatingChild(runtime),
++        parent_agent=SimpleNamespace(session_id="parent-sess", _current_task_id=None),
++        task_index=0,
++        goal="return quickly",
++        subagent_id=None,
++        child_progress_cb=None,
++    )
++    run.child_task_id = "child-task"
++
++    async def tool_callback():
++        # Synchronous tool execution on the loop thread, as relay_tools.invoke
++        # dispatches it: the loop cannot run anything else until this returns.
++        with managed_callback_guard():
++            result = run.await_child()
++            order.append("await_returned")
++            # Parent-thread ``subagent_stop`` close of the child session, still
++            # inside the callback: must abort + forget without flushing.
++            runtime.close_session({"session_id": "child-sess"})
++            order.append("stop_close_done")
++            return result
++
++    try:
++        result, error_entry, close_deferred = loop.run_until_complete(tool_callback())
++    finally:
++        loop.close()
++    order.append("callback_exited")
++
++    assert error_entry is None and close_deferred is False
++    assert result is not None and result["final_response"] == "done"
++    assert "flush_entered" not in order, (
++        "no synchronous flush may run before the tool callback returns"
++    )
++    assert runtime._sessions.get("child-sess") is None, "child session must be forgotten"
++    assert order.index("await_returned") < order.index("callback_exited")
++
++    # After the callback returns the loop is free: the parent task finish
++    # drains everything the child left queued.
++    relay.subscribers.flush = lambda: order.append("flushed")
++    runtime.finish_task(
++        {
++            "session_id": "parent-sess",
++            "task_id": "parent-task",
++            "platform": "cli",
++            "completed": True,
++        }
++    )
++    assert order.index("callback_exited") < order.index("flushed")
++    assert order.index("flushed") < order.index("exported")
++
++
++def test_await_child_survives_metrics_hook_failure(monkeypatch):
++    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: None)
++    monkeypatch.setattr(delegate_tool, "_get_subagent_approval_callback", lambda: None)
++    monkeypatch.setattr(delegate_tool, "_set_subagent_approval_cb", lambda _cb: None)
++
++    class _QuickChild:
++        session_id = "child-flush-test"
++        _fork_conversation_history = None
++
++        def run_conversation(self, **_kwargs):
++            raise RuntimeError("metrics hook exploded")
++
++    run = delegate_tool_child_run._ChildRun(
++        child=_QuickChild(),
++        parent_agent=SimpleNamespace(session_id="parent-sess", _current_task_id=None),
++        task_index=0,
++        goal="return quickly",
++        subagent_id=None,
++        child_progress_cb=None,
++    )
++    run.child_task_id = "child-task"
++
++    loop = asyncio.new_event_loop()
++    try:
++        _result, error_entry, _ = loop.run_until_complete(
++            _await_in_callback(run),
++        )
++    finally:
++        loop.close()
++    assert error_entry is not None and error_entry["status"] == "error"
++
++
++async def _await_in_callback(run) -> tuple:
++    with managed_callback_guard():
++        return run.await_child()
+diff --git a/tools/ask_document_tool.py b/tools/ask_document_tool.py
+new file mode 100644
+index 00000000..d6eb23cb
+--- /dev/null
++++ b/tools/ask_document_tool.py
+@@ -0,0 +1,369 @@
++"""Ask-document tool (cache-augmented generation over a local file or directory).
++
++``ask_document(path, question, max_tokens=800)`` reads a UTF-8 text file — or a
++directory, concatenated in global sorted order of relative paths with
++``### <relpath>`` headers, skipping binaries — and sends ONE plain chat
++completion (no tools, no response_format) on the calling agent's own chat
++client, then returns the answer text.
++
++Client reuse (no edits to the agent runtime): inside an agent turn,
++``agent.subagent_lifecycle.get_active_subagent_parent()`` is the live ``AIAgent``
++(bound by ``agent/turn_facade.py`` for every turn), so the tool calls
++``agent.client.chat.completions.create`` directly — the same client, model,
++endpoint and headers as the turn loop, and never the auxiliary route
++(``agent/auxiliary_client.call_llm`` is deliberately NOT used, so the call is
++not classified as an aux request and carries no auxiliary task config). There
++is intentionally NO fallback client: outside a bound ``chat_completions`` turn
++the tool refuses with a clear error rather than silently changing
++endpoint/profile/model.
++
++Cache behavior is by construction: the system message is a FIXED reader
++instruction plus the document bytes, byte-identical for the same file content,
++so the serving engine can pin the system prefix as a cache root and a second
++question on the same document may resume from the cached prefix.
++
++Not offered to delegated children: ``model_tools._select_tool_names``
++discards ``ask_document`` in a delegated-child context (the session-toolset
++filter — a ``check_fn`` gate would be wrong here: check_fn verdicts are
++TTL-cached process-wide in ``tools/registry.py`` and must never answer
++per-session surface), and the handler itself refuses in that context so
++explicit or forked calls fail closed too.
++"""
++
++from __future__ import annotations
++
++import codecs
++import json
++import logging
++import os
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++ASK_DOCUMENT_TOOLSET = "ask_document"
++
++# Fixed reader instruction (English, constant): identical bytes for identical
++# documents, so the engine can pin the system prefix as a cache root.
++READER_SYSTEM_PREFIX = (
++    "You are a precise document reader. Answer the user's question using ONLY "
++    "the document below. Quote briefly when helpful. If the answer is not in "
++    "the document, say so plainly."
++)
++
++DEFAULT_MAX_CHARS = 800_000
++DEFAULT_MAX_TOKENS = 800
++_MAX_TOKENS_HARD_CAP = 16_000
++# Byte reads are bounded by remaining char budget * worst-case UTF-8 expansion.
++_UTF8_MAX_BYTES_PER_CHAR = 4
++
++
++def _ask_document_section() -> Dict[str, Any]:
++    """``ask_document`` config section ({} when absent/unreadable); never raises."""
++    try:
++        from hermes_cli.config import load_config_readonly
++        section = load_config_readonly().get("ask_document")
++    except Exception:
++        return {}
++    return section if isinstance(section, dict) else {}
++
++
++def _ask_document_enabled() -> bool:
++    """Config ``ask_document.enabled`` (default True); never raises."""
++    try:
++        from utils import is_truthy_value
++        return bool(is_truthy_value(_ask_document_section().get("enabled", True), default=True))
++    except Exception:
++        return True
++
++
++def _ask_document_max_chars() -> int:
++    """Config ``ask_document.max_chars`` (default 800000); never raises."""
++    try:
++        value = int(_ask_document_section().get("max_chars", DEFAULT_MAX_CHARS))
++    except Exception:
++        return DEFAULT_MAX_CHARS
++    return value if value > 0 else DEFAULT_MAX_CHARS
++
++
++def _is_child_context() -> bool:
++    """True while running for a delegate_task child."""
++    from agent.delegation_context import is_delegated_child_context
++    return bool(is_delegated_child_context())
++
++
++def check_ask_document_requirements() -> bool:
++    """Available unless ``ask_document.enabled`` is false (config-wide, cache-safe).
++
++    Child exclusion is NOT handled here: check_fn verdicts are TTL-cached
++    process-wide, so per-session surface goes through
++    ``model_tools._select_tool_names`` plus the handler's own refusal.
++    """
++    return _ask_document_enabled()
++
++
++def _ok(**payload: Any) -> str:
++    return json.dumps({"success": True, **payload}, ensure_ascii=False)
++
++
++def _fail(message: str) -> str:
++    from tools.registry import tool_error
++    return tool_error(message)
++
++
++def _resolve_doc_path(path: str, task_id: str = "default") -> Path:
++    """Task-aware absolute path (same anchor as read_file)."""
++    from tools.file_tools_paths import _resolve_path_for_task
++    return Path(str(_resolve_path_for_task(path, task_id)))
++
++
++def _has_binary_suffix(path: Path) -> bool:
++    from tools.binary_extensions import has_binary_extension
++    return bool(has_binary_extension(str(path)))
++
++
++def _read_text_file(path: Path, max_bytes: Optional[int] = None) -> Tuple[Optional[str], bool]:
++    """(text, limit_hit); None when binary, non-UTF-8, or unreadable.
++
++    A null byte anywhere in the examined bytes means binary and is rejected
++    before any decoding. Capped reads decode the prefix with an incremental
++    strict UTF-8 decoder, which drops a trailing incomplete sequence of any
++    length; invalid bytes always reject the file.
++    """
++    try:
++        with open(path, "rb") as f:
++            raw = f.read() if max_bytes is None else f.read(max_bytes + 1)
++    except (OSError, ValueError):
++        return None, False
++    is_eof = max_bytes is None or len(raw) <= max_bytes
++    if not is_eof:
++        raw = raw[:max_bytes]
++    if b"\x00" in raw:
++        return None, False
++    try:
++        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
++        return decoder.decode(raw, final=is_eof), not is_eof
++    except UnicodeDecodeError:
++        return None, False
++
++
++def _byte_budget(remaining_chars: int) -> int:
++    return max(64, remaining_chars * _UTF8_MAX_BYTES_PER_CHAR + _UTF8_MAX_BYTES_PER_CHAR)
++
++
++def _load_document_text(resolved: Path, max_chars: int) -> Tuple[Optional[str], Dict[str, Any]]:
++    """(text, meta) for a file or directory; (None, meta with error) on failure.
++
++    The char cap covers the concatenated document INCLUDING ``###`` headers.
++    """
++    if not resolved.exists():
++        return None, {"error": f"ask_document: path does not exist: {resolved}"}
++    if resolved.is_file():
++        if _has_binary_suffix(resolved):
++            return None, {"error": f"ask_document: refusing binary file: {resolved}"}
++        text, _ = _read_text_file(resolved, _byte_budget(max_chars))
++        if text is None:
++            return None, {"error": f"ask_document: cannot read as text (binary or unreadable): {resolved}"}
++        truncated = len(text) > max_chars
++        if truncated:
++            text = text[:max_chars]
++        return text, {"label": str(resolved), "truncated": truncated}
++    if resolved.is_dir():
++        entries: List[Tuple[str, Path]] = []
++        for root, dirs, files in os.walk(resolved, followlinks=False):
++            for name in files:
++                full = Path(root) / name
++                entries.append((full.relative_to(resolved).as_posix(), full))
++        entries.sort(key=lambda item: item[0])
++        parts: List[str] = []
++        truncated = False
++        budget = max_chars
++        for rel, full in entries:
++            if budget <= 0:
++                truncated = True
++                break
++            if _has_binary_suffix(full):
++                continue
++            text, _ = _read_text_file(full, _byte_budget(budget))
++            if text is None:
++                continue
++            chunk = f"### {rel}\n{text}\n"
++            if len(chunk) > budget:
++                chunk = chunk[:budget]
++                truncated = True
++            parts.append(chunk)
++            budget -= len(chunk)
++            if truncated:
++                break
++        if not parts:
++            return None, {"error": f"ask_document: no readable text files under: {resolved}"}
++        return "".join(parts), {"label": str(resolved), "truncated": truncated}
++    return None, {"error": f"ask_document: not a file or directory: {resolved}"}
++
++
++def build_reader_system(document_label: str, document_text: str) -> str:
++    """Byte-identical system message for identical (label, text)."""
++    return f"{READER_SYSTEM_PREFIX}\n\n<document path={document_label}>\n{document_text}\n</document>"
++
++
++def _resolve_chat_client() -> Optional[Tuple[Any, str]]:
++    """(client, model) from the live turn-bound agent, else None (no fallback).
++
++    Only for ``chat_completions`` agents whose client exposes the OpenAI
++    ``chat.completions.create`` shape; every other mode (or no bound turn)
++    resolves to None and the handler refuses rather than silently switching
++    endpoint/profile/model.
++    """
++    from agent.subagent_lifecycle import get_active_subagent_parent
++    agent = get_active_subagent_parent()
++    if agent is None:
++        return None
++    if str(getattr(agent, "api_mode", "chat_completions") or "chat_completions") != "chat_completions":
++        return None
++    client = getattr(agent, "client", None)
++    create = getattr(getattr(getattr(client, "chat", None), "completions", None), "create", None)
++    if not callable(create):
++        return None
++    model = str(getattr(agent, "model", "") or "").strip()
++    if not model:
++        return None
++    return client, model
++
++
++def _content_to_text(content: Any) -> str:
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts = []
++        for part in content:
++            if isinstance(part, str):
++                parts.append(part)
++            elif isinstance(part, dict) and isinstance(part.get("text"), str):
++                parts.append(part["text"])
++            else:
++                text = getattr(part, "text", None)
++                if isinstance(text, str):
++                    parts.append(text)
++        return "".join(parts)
++    return str(content) if content is not None else ""
++
++
++def _extract_cached_tokens(response: Any) -> Optional[int]:
++    try:
++        usage = getattr(response, "usage", None)
++        if usage is None:
++            return None
++        details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else getattr(usage, "prompt_tokens_details", None)
++        if details is None:
++            return None
++        value = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
++        return int(value) if isinstance(value, (int, float)) and value is not None else None
++    except Exception:
++        return None
++
++
++def ask_document(path: str, question: str, max_tokens: int = DEFAULT_MAX_TOKENS,
++                 task_id: str = "default") -> str:
++    """Ask *question* about the file or directory at *path*; JSON string result."""
++    if _is_child_context():
++        return _fail("ask_document: not available to delegated children (use read_file)")
++    if not _ask_document_enabled():
++        return _fail("ask_document: disabled by configuration (ask_document.enabled=false)")
++    question = str(question or "").strip()
++    if not question:
++        return _fail("ask_document: 'question' is required")
++    if not str(path or "").strip():
++        return _fail("ask_document: 'path' is required")
++    try:
++        tokens = int(max_tokens)
++    except Exception:
++        tokens = DEFAULT_MAX_TOKENS
++    tokens = max(1, min(tokens, _MAX_TOKENS_HARD_CAP))
++
++    max_chars = _ask_document_max_chars()
++    try:
++        resolved = _resolve_doc_path(str(path).strip(), task_id)
++    except Exception as exc:
++        return _fail(f"ask_document: cannot resolve path: {exc}")
++    document_text, meta = _load_document_text(resolved, max_chars)
++    if document_text is None:
++        return _fail(str(meta.get("error") or "ask_document: cannot load document"))
++
++    resolved_client = _resolve_chat_client()
++    if resolved_client is None:
++        return _fail("ask_document: requires a chat_completions agent turn (no bound agent chat client)")
++    client, model = resolved_client
++    system = build_reader_system(str(meta["label"]), document_text)
++    try:
++        response = client.chat.completions.create(
++            model=model,
++            messages=[
++                {"role": "system", "content": system},
++                {"role": "user", "content": question},
++            ],
++            max_tokens=tokens,
++        )
++    except Exception as exc:
++        logger.warning("ask_document chat completion failed: %s", exc)
++        return _fail(f"ask_document: completion failed: {exc}")
++
++    try:
++        answer = _content_to_text(response.choices[0].message.content).strip()
++    except Exception:
++        return _fail("ask_document: malformed completion response")
++    if not answer:
++        return _fail("ask_document: empty answer from model")
++    payload: Dict[str, Any] = {"answer": answer, "model": model, "truncated": bool(meta.get("truncated", False))}
++    cached = _extract_cached_tokens(response)
++    if cached is not None:
++        payload["cached_tokens"] = cached
++    return _ok(**payload)
++
++
++ASK_DOCUMENT_SCHEMA = {
++    "name": "ask_document",
++    "description": (
++        "Ask a question about a local text file (or a directory of text files). "
++        "Reads the file as UTF-8 — a directory is concatenated in sorted order "
++        "with '### <relpath>' headers, binaries skipped, capped at the "
++        "ask_document.max_chars config — and answers from that content only via "
++        "a single same-model completion. The document prefix may stay cached "
++        "server-side, so follow-up questions on the same path can be cheap. "
++        "Use when a file is too large for the context or you need one focused "
++        "answer instead of the full text. Directory reads never include binary "
++        "files. Parent turn only: unavailable to delegated children."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "path": {
++                "type": "string",
++                "description": "File or directory to ask about (absolute, or relative to the session cwd).",
++            },
++            "question": {
++                "type": "string",
++                "description": "The question to answer from the document content.",
++            },
++            "max_tokens": {
++                "type": "integer",
++                "description": "Max answer tokens (default 800).",
++                "default": DEFAULT_MAX_TOKENS,
++            },
++        },
++        "required": ["path", "question"],
++    },
++}
++
++
++from tools.registry import registry  # noqa: E402  (registration at import time)
++
++registry.register(
++    name="ask_document",
++    toolset=ASK_DOCUMENT_TOOLSET,
++    schema=ASK_DOCUMENT_SCHEMA,
++    handler=lambda args, **kw: ask_document(
++        path=args.get("path", ""), question=args.get("question", ""),
++        max_tokens=args.get("max_tokens", DEFAULT_MAX_TOKENS),
++        task_id=kw.get("task_id") or "default"),
++    check_fn=check_ask_document_requirements,
++    emoji="📄")
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index 691e6a06..dd97f9ab 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -672,6 +672,11 @@ class _ChildRun:
+ 
+         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+         try:
++            # No synchronous metrics flush here on success: this thread is still
++            # inside the managed Relay tool callback, whose loop the process-wide
++            # flush can wait on (same deadlock the child worker avoids by
++            # skipping its flush). The queued child events drain at the parent
++            # task finish / session teardown after the callback returns.
+             return future.result(timeout=child_timeout), None, False
+         except Exception as wait_exc:
+             exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block
+diff --git a/toolsets.py b/toolsets.py
+index 0c1764bf..0f07df7b 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -23,6 +23,7 @@ _HERMES_CORE_TOOLS = [
+     "text_to_speech",
+     "todo_list", "memory",
+     "session_search",
++    "ask_document",
+     "clarify",
+     "execute_code", "delegate_task",
+     "set_work_deadline", "finish_work",
+@@ -134,6 +135,7 @@ TOOLSETS = {
+     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+     "context_engine": _ts("Runtime tools exposed by the active context engine"),
+     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
++    "ask_document": _ts("Ask a question about a local file or directory (same-model document QA)", ["ask_document"]),
+     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
+     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
+     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
+-- 
+2.54.0.windows.1
+
