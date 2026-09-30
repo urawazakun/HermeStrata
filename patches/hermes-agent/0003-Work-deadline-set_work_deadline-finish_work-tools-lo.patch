@@ -1,0 +1,2237 @@
+From 1ba76cb4c34564c938870b017ca73ce12bbd3b2d Mon Sep 17 00:00:00 2001
+From: urawa <30615262+urawazakun@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 18:29:19 +0900
+Subject: [PATCH] Work deadline: set_work_deadline / finish_work tools, loop
+ continues until the deadline (floor; run budget stays the ceiling)
+
+Origin: user; design: Claude; implemented: Muse; reviewed: Sol. 125 tests pass (deadline 67, fork 12, loop/budget suites).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/agent_init.py               |   27 +
+ agent/inline_tool_executors.py    |   12 +
+ agent/prompt_builder.py           |    9 +
+ agent/session_persistence.py      |    3 +
+ agent/system_prompt.py            |   11 +-
+ agent/turn_context.py             |   10 +
+ agent/turn_final_response.py      |    3 +
+ agent/turn_iteration_prep.py      |   22 +-
+ agent/turn_stop_gates.py          |   88 ++-
+ agent/turn_tool_round.py          |    4 +
+ agent/work_deadline.py            |  468 ++++++++++++
+ hermes_cli/config_defaults.py     |    7 +
+ model_tools.py                    |    5 +-
+ tests/agent/test_work_deadline.py | 1145 +++++++++++++++++++++++++++++
+ tools/delegate_tool_fork.py       |    2 +
+ tools/delegate_tool_toolsets.py   |    2 +
+ tools/work_deadline_tool.py       |   91 +++
+ toolsets.py                       |    7 +
+ 18 files changed, 1909 insertions(+), 7 deletions(-)
+ create mode 100644 agent/work_deadline.py
+ create mode 100644 tests/agent/test_work_deadline.py
+ create mode 100644 tools/work_deadline_tool.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 88b67fd4..00ea8068 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -318,6 +318,16 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
+ 
+ 
+ 
++def _deadline_flag(raw: Any) -> bool:
++    """``agent.deadline_enabled``: bools verbatim, strings via truthiness, default true."""
++    if isinstance(raw, bool):
++        return raw
++    try:
++        return bool(is_truthy_value(raw, default=True))
++    except Exception:
++        return True
++
++
+ def _refuse_checkpoint_required_on_codex_app_server(
+     checkpoint_required: bool, api_mode: Optional[str]
+ ) -> None:
+@@ -544,6 +554,11 @@ _TURN_STATE: Dict[str, Any] = {
+     "_budget_grace_call": False,
+     "_run_budget_started_at": None,  # set by turn_context.prepare_turn when a budget is active
+     "_run_budget_wrapup_injected": False,  # one-shot latch for the 80% wrap-up notice
++    # Work-deadline per-turn markers (agent/work_deadline.py): finish flag + idle streak.
++    # Reset every turn in agent/turn_context.py; the session deadline itself is kept.
++    "_work_deadline_finish_called": False,
++    "_work_deadline_finish_reason": None,
++    "_work_deadline_idle_continuations": 0,
+     # Activity tracking (API call / tool / stream chunk) for the gateway timeout handler and
+     # "still working" notifications. Named provenances are stamped only by compression writers.
+     "_last_activity_ts": lambda: time.time(),
+@@ -602,6 +617,11 @@ _SESSION_STATE: Dict[str, Any] = {
+     # delegate_task fork children, refreshed every tool round; None until the
+     # first tool round of the session.
+     "_fork_prefix_snapshot": None,
++    # Self-managed work deadline (agent/work_deadline.py): session-scoped until/goal
++    # (persisted in the session row, survives resume); per-turn markers reset in
++    # agent/turn_context.py without touching the session deadline.
++    "_work_deadline_until": None,
++    "_work_deadline_goal": None,
+ }
+ 
+ # Streaming delivery state.
+@@ -1327,6 +1347,13 @@ def _apply_agent_section(agent, _agent_cfg):
+             _agent_section.get("run_budget_seconds")
+         )
+ 
++    # Self-managed work deadline (agent/work_deadline.py): enabled by default; the idle
++    # cap counts consecutive tool-less continuations before the turn ends with a note.
++    agent._deadline_enabled = _deadline_flag(_agent_section.get("deadline_enabled", True))
++    agent._deadline_max_idle_continuations = max(
++        0, _parse_config_int(_agent_section.get("deadline_max_idle_continuations", 3), 3)
++    )
++
+     # Empty-response guard: a malformed section falls back to schema defaults (on, $0.25).
+     from agent.empty_response_guard import resolve_guard_settings
+     (
+diff --git a/agent/inline_tool_executors.py b/agent/inline_tool_executors.py
+index e1d5d1ad..b8a49ecf 100644
+--- a/agent/inline_tool_executors.py
++++ b/agent/inline_tool_executors.py
+@@ -139,6 +139,16 @@ _read_preview = _callback_tool(
+ )
+ 
+ 
++def _work_deadline(agent, args: dict, ctx: InlineToolContext) -> Any:
++    from agent import work_deadline as _wd
++    return _wd.set_work_deadline(agent, args)
++
++
++def _finish_work(agent, args: dict, ctx: InlineToolContext) -> Any:
++    from agent import work_deadline as _wd
++    return _wd.finish_work(agent, args)
++
++
+ def _desktop_preview(agent, args: dict, ctx: InlineToolContext) -> Any:
+     # action=read needs the GUI callback (agent-level); open/close go through the
+     # registry handler like any other tool.
+@@ -163,6 +173,8 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
+     ),
+     "session_search": _session_search,
+     "memory": _memory,
++    "set_work_deadline": _work_deadline,
++    "finish_work": _finish_work,
+     "clarify": _tool(
+         "tools.clarify_tool", "clarify_tool",
+         ("question", "question", ""), ("choices", "choices"), ("multi_select", "multi_select", False),
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 77db1c34..8503954f 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -386,6 +386,15 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
+     "read a file before you can patch it). When in doubt and the calls are independent, batch them."
+ )
+ 
++# Work-deadline guidance (stable tier, no time-dependent text): when to use
++# set_work_deadline. Ships only when the tools are in the session (gated in
++# agent/system_prompt.py) so the model never hears unavailable tool names.
++WORK_DEADLINE_GUIDANCE = (
++    "When the user asks you to keep working until a time of day, call set_work_deadline with that time "
++    "and goal, keep working through deadline continuations without asking the user, and call finish_work "
++    "with a reason to stop before the deadline."
++)
++
+ # Execution-discipline guidance for models that abandon partial results, skip prerequisite lookups, answer
+ # from memory, or declare "done" unverified. Body is family-agnostic (OPENAI_ prefix reflects origin).
+ # Injection gate: system_prompt.py via config.yaml ``agent.execution_guidance`` (auto/true/false/list).
+diff --git a/agent/session_persistence.py b/agent/session_persistence.py
+index 7a5977ac..b2375457 100644
+--- a/agent/session_persistence.py
++++ b/agent/session_persistence.py
+@@ -27,6 +27,9 @@ logger = logging.getLogger("run_agent")  # origin module's name: log records / c
+ 
+ # Flags marking ephemeral recovery scaffolding the loop pops before appending the real response.
+ # Persistence must skip them or a resumed session replays synthetic turns / breaks prefix-cache reuse.
++# Work-deadline continuations are DELIBERATELY absent: the assistant interim + user nudge stay
++# append-only and durable (the nudge carries display_kind="hidden" + a synthetic marker instead),
++# so resume keeps the request prefix instead of adjacent assistant rows.
+ _EPHEMERAL_SCAFFOLDING_FLAGS = (
+     "_empty_recovery_synthetic",
+     "_empty_terminal_sentinel",
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index 22398a4c..d84a828f 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -22,7 +22,8 @@ from agent.prompt_builder import (
+     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
+     PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
+     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
+-    TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
++    TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, WORK_DEADLINE_GUIDANCE,
++    drain_truncation_warnings,
+ )
+ from agent import prompt_builder as _pb
+ from agent.runtime_cwd import resolve_context_cwd
+@@ -505,6 +506,14 @@ def _guidance_parts(agent: Any) -> List[str]:
+             ) if getattr(agent, flag, True)
+         ]
+     parts.append(_tool_guidance_block(agent))  # None/empty entries are dropped by _join_tier
++    # Work deadline: one static sentence naming set_work_deadline, only when the tools
++    # are in this session (else the model would hear unavailable tool names). Nothing
++    # time-dependent — the stable tier stays byte-identical across sessions.
++    try:
++        if "set_work_deadline" in (agent.valid_tool_names or set()):
++            parts.append(WORK_DEADLINE_GUIDANCE)
++    except Exception:
++        pass
+     if not agent.valid_tool_names:
+         return parts
+     # Steering only lands inside tool results, so only reachable with tools.
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 8ff90485..11c9db47 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -495,6 +495,9 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
+     ("_iteration_budget_warning_injected", False),
+     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
+     ("_pre_verify_nudges", 0),
++    # Work-deadline per-turn markers only: the session deadline (until/goal) survives.
++    ("_work_deadline_finish_called", False), ("_work_deadline_finish_reason", None),
++    ("_work_deadline_idle_continuations", 0),
+ )
+ 
+ 
+@@ -922,6 +925,13 @@ def build_turn_context(
+         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
+     )
+     _hydrate_from_history(agent, conversation_history)
++    # Session work deadline (set_work_deadline): restore from the session row so resumed
++    # CLI sessions and fresh gateway agents keep it; per-turn markers above stay reset.
++    try:
++        from agent.work_deadline import hydrate_work_deadline
++        hydrate_work_deadline(agent)
++    except Exception:
++        logger.debug("work deadline hydrate skipped", exc_info=True)
+     # Every estimator this turn prices images at the cost learned from this model's real usage.
+     bind_image_token_cost(agent)
+     # Append the user message now that close persistence is safe.
+diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
+index 4907d6b0..902b1635 100644
+--- a/agent/turn_final_response.py
++++ b/agent/turn_final_response.py
+@@ -222,6 +222,9 @@ def finish_text_response(
+     if _sg.continue_turn:
+         final_response = None
+         return _verdict("continue")
++    # Terminal stop gates (deadline reached/finished/idle/budget) carry their note in
++    # the returned response: adopt it so finalization delivers and persists the note.
++    final_response = _sg.final_response
+ 
+     append_message(messages, final_msg)
+     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index 9d7daee1..bf6cb20d 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -18,6 +18,7 @@ from typing import Any, Dict
+ 
+ from agent.display import KawaiiSpinner
+ from agent.turn_context_compaction import _reanchor
++from agent.work_deadline import phase_boundary_stop
+ 
+ logger = logging.getLogger("agent.conversation_loop")
+ 
+@@ -288,18 +289,20 @@ def announce_api_call(
+ @dataclass
+ class IterationStart:
+     """``action``: ``"fallthrough"`` (run the iteration) or ``"break"`` (turn ends: interrupt,
+-    review input budget or iteration budget exhausted — ``_turn_exit_reason`` set)."""
++    review input budget, iteration budget, work deadline, or run budget exhausted —
++    ``_turn_exit_reason`` set, ``final_response`` carrying the stop note when one applies)."""
+ 
+     action: str
+     original_user_message: Any
+     api_call_count: Any
+     interrupted: Any
++    final_response: Any
+     _turn_exit_reason: Any
+ 
+ 
+ def begin_iteration(
+     agent: Any, *, messages: Any, conversation_history: Any, original_user_message: Any,
+-    api_call_count: Any, interrupted: Any, _turn_exit_reason: Any,
++    api_call_count: Any, interrupted: Any, final_response: Any, _turn_exit_reason: Any,
+ ) -> IterationStart:
+     """Iteration entry in the original order: apply a pending redirect, reset the checkpoint
+     dedup, then the interrupt / review-budget / iteration-budget exits. ``api_call_count`` is
+@@ -312,7 +315,7 @@ def begin_iteration(
+         return IterationStart(
+             action=action, original_user_message=original_user_message,
+             api_call_count=api_call_count, interrupted=interrupted,
+-            _turn_exit_reason=_turn_exit_reason,
++            final_response=final_response, _turn_exit_reason=_turn_exit_reason,
+         )
+ 
+     _redirect_text = agent._drain_pending_redirect()
+@@ -346,6 +349,19 @@ def begin_iteration(
+             )
+         return _verdict("break")
+ 
++    # Work deadline / run-budget phase boundary: the previous model call finished and
++    # its tool round is recorded, so stopping here keeps every tool-call/result pair
++    # complete. Interrupts and the ceilings above already won; the iteration budget
++    # below still enforces its own break (and the grace call plays out untouched).
++    _deadline_stop = phase_boundary_stop(agent)
++    if _deadline_stop is not None:
++        _turn_exit_reason, _stop_note = _deadline_stop
++        final_response = _stop_note if not final_response else f"{final_response.rstrip()}\n\n{_stop_note}"
++        logger.info("turn stopping before next model request: %s", _turn_exit_reason)
++        if not agent.quiet_mode:
++            agent._safe_print(f"\n⏹️  {_stop_note}")
++        return _verdict("break")
++
+     api_call_count += 1
+     agent._api_call_count = api_call_count
+     agent._touch_activity(f"starting API call #{api_call_count}")
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index 35aefe53..41532025 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -90,6 +90,48 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
+         return None
+ 
+ 
++def _work_deadline_outcome(agent) -> Optional[tuple]:
++    """Evaluate the self-managed work deadline at a text-only final answer.
++
++    Returns ``(action, text)`` with action one of ``"finished"`` (finish_work was
++    called this turn — footer carrying the reason), ``"budget"`` (run budget elapsed —
++    one-line note, no further request), ``"reached"`` (deadline passed — one-line note,
++    deadline consumed), ``"idle"`` (too many tool-less continuations — one-line note),
++    or ``"continue"`` (user-role nudge); None when no deadline applies or the
++    run-budget wrap-up owns the ending. Never raises: a broken clock must end the
++    turn, not trap it.
++    """
++    try:
++        from agent import work_deadline as _wd
++        if getattr(agent, "_delegate_depth", 0) not in (0, None):
++            return None
++        if not _wd.deadline_enabled(agent):
++            return None
++        if getattr(agent, "_work_deadline_finish_called", False):
++            reason = getattr(agent, "_work_deadline_finish_reason", "") or "done"
++            return ("finished", _wd.finished_early_note(str(reason)))
++        current = _wd.active_deadline(agent)
++        if current is None:
++            return None
++        until, goal = current
++        if _wd.run_budget_expired(agent):
++            return ("budget", _wd.run_budget_exhausted_note())
++        if _wd.is_reached(until):
++            return ("reached", _wd.deadline_reached_note(until))
++        if _wd.wrapup_injected(agent):
++            # The 80% wrap-up notice told the model to produce its final deliverable;
++            # a "keep improving" continuation would contradict it.
++            return None
++        streak = _wd.coerce_count(getattr(agent, "_work_deadline_idle_continuations", 0))
++        limit = _wd.max_idle_continuations(agent)
++        if streak >= limit:
++            return ("idle", _wd.idle_guard_note(limit))
++        return ("continue", _wd.build_continuation_nudge(until, goal))
++    except Exception:
++        logger.debug("work deadline gate check failed", exc_info=True)
++        return None
++
++
+ def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
+     """Real content: persist and emit as interim so the user sees the attempted answer;
+     only the nudge is flagged synthetic (#65919)."""
+@@ -111,9 +153,14 @@ def apply_stop_gates(
+     holds. Hook lookups are imported lazily from their origin modules (tests patch them
+     there)."""
+ 
+-    def _continue(nudge: str, flag: str) -> StopGateVerdict:
++    def _continue(nudge: str, flag: str, display_kind: Optional[str] = None) -> StopGateVerdict:
+         """Append the synthetic nudge row and hand the turn back to the loop."""
+-        append_message(messages, {"role": "user", "content": nudge, flag: True})
++        _row: Dict[str, Any] = {"role": "user", "content": nudge, flag: True}
++        if display_kind is not None:
++            # Display-only timeline metadata (stripped per request): the row stays
++            # durable and replayed, but renders as internal traffic, not user input.
++            _row["display_kind"] = display_kind
++        append_message(messages, _row)
+         agent._session_messages = messages
+         # Keep the answer only as a budget-exhaustion fallback; clear ``final_response`` so
+         # the finalizer can tell this gate from error exits. Mark previewed only if the
+@@ -167,6 +214,43 @@ def apply_stop_gates(
+             "kanban_complete/kanban_block — nudging to finish"
+         )
+         return verdict
++    _deadline_outcome = _work_deadline_outcome(agent)
++    if _deadline_outcome is not None:
++        _action, _text = _deadline_outcome
++        if _action == "continue":
++            from agent import work_deadline as _wd_streak
++            agent._work_deadline_idle_continuations = (
++                _wd_streak.coerce_count(getattr(agent, "_work_deadline_idle_continuations", 0)) + 1
++            )
++            final_msg["finish_reason"] = "work_deadline_continue"
++            _append_interim_answer(
++                agent, final_msg, messages, conversation_history,
++                "work-deadline interim flush failed",
++            )
++            verdict = _continue(_text, _wd_streak.CONTINUATION_FLAG, display_kind="hidden")
++            logger.info(
++                "work deadline continuation %d issued (%s)",
++                agent._work_deadline_idle_continuations, _text[:48],
++            )
++            return verdict
++        # Terminal: finished early (reason footer), run budget exhausted, deadline
++        # reached, or idle guard. The note rides the delivered answer so the reason
++        # is visible.
++        if isinstance(final_response, str) and _text:
++            final_response = (final_response.rstrip() + "\n\n" + _text) if final_response else _text
++        if isinstance(final_msg.get("content"), str) and _text:
++            final_msg["content"] = (
++                (final_msg["content"].rstrip() + "\n\n" + _text) if final_msg["content"] else _text
++            )
++        if _action == "reached":
++            try:
++                from agent import work_deadline as _wd_clear
++                agent._work_deadline_until = None
++                agent._work_deadline_goal = None
++                _wd_clear._persist(agent)
++            except Exception:
++                logger.debug("work deadline reached-clear persist failed", exc_info=True)
++        logger.info("work deadline stop (%s) — ending the turn", _action)
+     return StopGateVerdict(
+         continue_turn=False, final_response=final_response,
+         pending_verification_response=pending_verification_response,
+diff --git a/agent/turn_tool_round.py b/agent/turn_tool_round.py
+index a3468504..70a5151f 100644
+--- a/agent/turn_tool_round.py
++++ b/agent/turn_tool_round.py
+@@ -16,6 +16,7 @@ from agent.message_metadata import append_message
+ from agent.message_sanitization import coalesce_tool_call_id
+ from agent.turn_preflight import compress_after_tool_results
+ from agent.turn_tool_validation import validate_tool_calls
++from agent.work_deadline import note_tool_activity
+ 
+ logger = logging.getLogger("agent.conversation_loop")
+ 
+@@ -66,6 +67,9 @@ def run_tool_round(
+     if not agent.quiet_mode:
+         agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
+ 
++    # Any tool round is forward progress under a work deadline: restart the idle streak.
++    note_tool_activity(agent)
++
+     if agent.verbose_logging:
+         for tc in assistant_message.tool_calls:
+             raw_args = tc.function.arguments
+diff --git a/agent/work_deadline.py b/agent/work_deadline.py
+new file mode 100644
+index 00000000..a2116900
+--- /dev/null
++++ b/agent/work_deadline.py
+@@ -0,0 +1,468 @@
++"""Self-managed work deadline ("work until 18:00"): tools, state, and turn-loop wiring.
++
++The model calls ``set_work_deadline`` when the user asks it to keep working until a
++wall-clock time; the turn loop then keeps a text-only final answer from ending the
++turn and re-prompts with a short byte-stable continuation instead. ``finish_work``
++is the only early exit while a deadline is active. The wall-clock run budget stays
++the ceiling; the deadline is a floor.
++
++State: ``agent._work_deadline_until`` (epoch seconds) + ``agent._work_deadline_goal``
++are session-scoped (persisted in the session's ``model_config`` so ``--resume``,
++CLI, and gateway turns all see them); ``_work_deadline_finish_called`` /
++``_work_deadline_finish_reason`` / ``_work_deadline_idle_continuations`` are
++per-turn markers reset at turn start (``agent/turn_context.py``).
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import math
++import re
++import time
++from datetime import datetime, timedelta
++from typing import Any, Dict, Optional, Tuple
++
++from agent.delegation_context import is_delegated_child_context
++from utils import is_truthy_value
++
++logger = logging.getLogger(__name__)
++
++SET_WORK_DEADLINE_NAME = "set_work_deadline"
++FINISH_WORK_NAME = "finish_work"
++WORK_DEADLINE_TOOLSET = "work_deadline"
++
++# Session model_config key holding {"until": epoch, "goal": str}; absent = no deadline.
++_MODEL_CONFIG_KEY = "work_deadline"
++
++# Marker on deadline continuation rows: display_kind="hidden" keeps them out of
++# rendered user input while persistence stays append-only (durable + replayed).
++CONTINUATION_FLAG = "_work_deadline_synthetic"
++
++_MAX_GOAL_CHARS = 1000
++
++_HHMM_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
++
++_PARSE_HINT = (
++    'Use local wall-clock "HH:MM" (e.g. "18:00"; already past today means tomorrow), '
++    'an ISO datetime (e.g. "2026-09-30T18:00:00"), or "none" to clear.'
++)
++
++
++def is_clear_request(until: Any) -> bool:
++    """True when ``until`` asks to clear the deadline."""
++    return str(until or "").strip().lower() == "none"
++
++
++def parse_work_deadline(until: Any, now: Optional[datetime] = None) -> Optional[Tuple[float, str]]:
++    """Parse ``until`` to ``(epoch_seconds, "HH:MM")``; ``"none"`` returns None (clear).
++
++    "HH:MM" is today, or tomorrow when already past. ISO datetimes are taken as
++    given (even when past — the next final answer then ends the turn with the
++    deadline-reached note). Raises ValueError when unparseable.
++    """
++    text = str(until or "").strip()
++    if text.lower() == "none":
++        return None
++    now_dt = now if isinstance(now, datetime) else datetime.now()
++    match = _HHMM_RE.match(text)
++    if match:
++        hour, minute = int(match.group(1)), int(match.group(2))
++        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
++            raise ValueError(f'invalid time "{text}": hour 0-23, minute 00-59. {_PARSE_HINT}')
++        target = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
++        if target <= now_dt:
++            target += timedelta(days=1)
++        return target.timestamp(), target.strftime("%H:%M")
++    try:
++        parsed = datetime.fromisoformat(text)
++    except (TypeError, ValueError):
++        raise ValueError(f'could not parse "{text}" as a deadline. {_PARSE_HINT}')
++    if parsed.tzinfo is not None:
++        parsed = parsed.astimezone().replace(tzinfo=None)
++    return parsed.timestamp(), parsed.strftime("%H:%M")
++
++
++def minutes_left(until_epoch: float, now: Optional[float] = None) -> int:
++    """Whole minutes until the deadline, floored at 0."""
++    now_t = time.time() if now is None else now
++    return max(0, int((until_epoch - now_t) // 60))
++
++
++def is_reached(until_epoch: float, now: Optional[float] = None) -> bool:
++    """True when the deadline has passed."""
++    now_t = time.time() if now is None else now
++    return now_t >= until_epoch
++
++
++def deadline_hhmm(until_epoch: float) -> str:
++    """Local wall-clock "HH:MM" of the deadline (the only varying text besides minutes)."""
++    return datetime.fromtimestamp(until_epoch).strftime("%H:%M")
++
++
++def build_continuation_nudge(until_epoch: float, goal: str, now: Optional[float] = None) -> str:
++    """User-role continuation: byte-stable apart from the two numbers."""
++    return (
++        f"[deadline {deadline_hhmm(until_epoch)}, {minutes_left(until_epoch, now)} min left] "
++        f'Record progress where your task expects it, then choose the next most valuable '
++        f'improvement toward "{goal}" yourself and continue. Do not ask the user. '
++        f"To stop before the deadline, call finish_work(reason)."
++    )
++
++
++def deadline_reached_note(until_epoch: float) -> str:
++    """One-line note ending a turn whose deadline passed."""
++    return f"Work deadline reached ({deadline_hhmm(until_epoch)}) — ending the turn."
++
++
++def finished_early_note(reason: str) -> str:
++    """One-line footer carrying the finish_work reason into the final output."""
++    return f"[work deadline: finished early — {reason}]"
++
++
++def idle_guard_note(limit: int) -> str:
++    """One-line note ending a turn stuck on tool-less continuations."""
++    return (
++        f"Ending the turn: {limit} consecutive deadline continuations "
++        f"produced no tool calls."
++    )
++
++
++def active_deadline(agent: Any) -> Optional[Tuple[float, str]]:
++    """``(until_epoch, goal)`` when a deadline is set, else None.
++
++    Non-finite epochs (NaN/Inf from a corrupt row) never count as active — they
++    would neither elapse nor sort, spinning the continuation.
++    """
++    until = getattr(agent, "_work_deadline_until", None)
++    goal = getattr(agent, "_work_deadline_goal", None)
++    if not isinstance(until, (int, float)) or isinstance(until, bool):
++        return None
++    if not math.isfinite(float(until)):
++        return None
++    if not isinstance(goal, str) or not goal:
++        return None
++    return float(until), goal
++
++
++def coerce_count(raw: Any) -> int:
++    """Non-negative int for streak counters; garbage maps to 0."""
++    if isinstance(raw, bool):
++        return 0
++    try:
++        return max(0, int(raw))
++    except (TypeError, ValueError):
++        return 0
++
++
++def _is_child_agent(agent: Any) -> Optional[str]:
++    """Refusal reason when ``agent`` is a delegated child, else None.
++
++    Children (including fork children with inherited schemas) must never set,
++    finish, or inherit the parent's deadline. Fork children share the parent's
++    session id with persistence disabled, so they are refused here rather than
++    by schema filtering alone.
++    """
++    if getattr(agent, "_is_fork_child", False) is True:
++        return "not available to a forked child: the parent owns the work deadline"
++    if getattr(agent, "_persist_disabled", False) is True:
++        return "not available to a persistence-isolated agent: the parent owns the work deadline"
++    depth = getattr(agent, "_delegate_depth", 0)
++    if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
++        return "not available to a delegated child: the parent owns the work deadline"
++    if is_delegated_child_context():
++        return "not available to a delegated child: the parent owns the work deadline"
++    return None
++
++
++def deadline_enabled(agent: Any) -> bool:
++    """``agent.deadline_enabled`` (default true); falls back to config.yaml."""
++    raw = getattr(agent, "_deadline_enabled", None)
++    if raw is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++            section = load_config_readonly().get("agent") or {}
++            raw = section.get("deadline_enabled", True)
++        except Exception:
++            return True
++    if isinstance(raw, bool):
++        return raw
++    return bool(is_truthy_value(raw, default=True))
++
++
++def max_idle_continuations(agent: Any) -> int:
++    """``agent.deadline_max_idle_continuations`` (default 3), floored at 0."""
++    raw = getattr(agent, "_deadline_max_idle_continuations", 3)
++    if raw is None or isinstance(raw, bool):
++        return 3
++    try:
++        return max(0, int(raw))
++    except (TypeError, ValueError):
++        return 3
++
++
++def _sync_init_config(agent: Any) -> None:
++    """Mirror the in-memory deadline into the session-init model_config dict.
++
++    Rotated compression sessions are published with ``agent._session_init_model_config``
++    as the new row's model_config, and initial row creation reads it too — without
++    this mirror a rotation (or a later first row) would drop the deadline on resume.
++    Derives solely from in-memory state; never writes the DB. Children own fresh
++    dicts (plus only their own ``_delegate_from``), so nothing inherits.
++    """
++    init_config = getattr(agent, "_session_init_model_config", None)
++    if not isinstance(init_config, dict):
++        return
++    current = active_deadline(agent)
++    if current is None:
++        init_config.pop(_MODEL_CONFIG_KEY, None)
++    else:
++        init_config[_MODEL_CONFIG_KEY] = {"until": current[0], "goal": current[1]}
++
++
++def _persist(agent: Any) -> None:
++    """Write the in-memory deadline to the session row (source of truth for resume).
++
++    The session-init mirror is updated only after a successful write — never before
++    a failing one — except when there is no durable row yet, where the mirror is
++    the only carrier for later initial row creation.
++    """
++    db = getattr(agent, "_session_db", None)
++    session_id = getattr(agent, "session_id", None)
++    if db is None or not session_id:
++        _sync_init_config(agent)
++        return
++    current = active_deadline(agent)
++    payload = {"until": current[0], "goal": current[1]} if current else None
++    db.patch_session_model_config(session_id, {_MODEL_CONFIG_KEY: payload})
++    _sync_init_config(agent)
++
++
++def hydrate_work_deadline(agent: Any) -> None:
++    """Restore the session deadline from the session row (CLI resume, gateway turns).
++
++    The DB is authoritative: a stored deadline is adopted, a missing one clears
++    the in-memory state. Never runs for children or persistence-isolated agents
++    (fork children share the parent's session id).
++    """
++    if _is_child_agent(agent) is not None:
++        return
++    db = getattr(agent, "_session_db", None)
++    session_id = getattr(agent, "session_id", None)
++    if db is None or not session_id:
++        return
++    try:
++        stored = db.get_session_model_config_value(session_id, _MODEL_CONFIG_KEY)
++    except Exception as exc:
++        logger.debug("work deadline hydrate skipped (session=%s): %s", session_id, exc)
++        return
++    if not isinstance(stored, dict):
++        if stored is None:
++            agent._work_deadline_until = None
++            agent._work_deadline_goal = None
++            _sync_init_config(agent)
++        return
++    until, goal = stored.get("until"), stored.get("goal")
++    if isinstance(until, (int, float)) and not isinstance(until, bool) and math.isfinite(float(until)) \
++            and isinstance(goal, str) and goal:
++        agent._work_deadline_until = float(until)
++        agent._work_deadline_goal = goal
++    else:
++        agent._work_deadline_until = None
++        agent._work_deadline_goal = None
++    _sync_init_config(agent)
++
++
++def _cap_goal(goal: str) -> str:
++    if len(goal) > _MAX_GOAL_CHARS:
++        return goal[:_MAX_GOAL_CHARS] + "… [truncated]"
++    return goal
++
++
++def set_work_deadline(agent: Any, args: Dict[str, Any]) -> str:
++    """Inline executor for ``set_work_deadline`` (see ``agent/inline_tool_executors.py``)."""
++    args = args if isinstance(args, dict) else {}
++    refusal = _is_child_agent(agent)
++    if refusal is not None:
++        return json.dumps({"success": False, "error": refusal}, ensure_ascii=False)
++    if not deadline_enabled(agent):
++        return json.dumps(
++            {"success": False, "error": "work deadlines are disabled (agent.deadline_enabled=false)"},
++            ensure_ascii=False,
++        )
++    replaced = active_deadline(agent) is not None
++    if is_clear_request(args.get("until", "")):
++        previous = active_deadline(agent)
++        agent._work_deadline_until = None
++        agent._work_deadline_goal = None
++        try:
++            _persist(agent)
++        except Exception as exc:
++            # Clearing failed: the row still holds the deadline and resume would
++            # reactivate it, so restore the snapshot and report failure.
++            if previous is None:
++                agent._work_deadline_until = None
++                agent._work_deadline_goal = None
++            else:
++                agent._work_deadline_until, agent._work_deadline_goal = previous
++            logger.warning("work deadline clear persist failed: %s", exc)
++            return json.dumps(
++                {"success": False, "error": f"deadline could not be cleared (persist failed): {exc}"},
++                ensure_ascii=False,
++            )
++        logger.info("work deadline cleared (session=%s)", getattr(agent, "session_id", None) or "none")
++        agent._work_deadline_finish_called = False
++        agent._work_deadline_finish_reason = None
++        agent._work_deadline_idle_continuations = 0
++        return json.dumps({"success": True, "cleared": True, "replaced": replaced}, ensure_ascii=False)
++    goal = str(args.get("goal") or "").strip()
++    if not goal:
++        return json.dumps({"success": False, "error": "goal is required"}, ensure_ascii=False)
++    try:
++        until_epoch, hhmm = parse_work_deadline(args.get("until", ""))
++    except ValueError as exc:
++        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
++    previous = active_deadline(agent)
++    agent._work_deadline_until = until_epoch
++    agent._work_deadline_goal = _cap_goal(goal)
++    try:
++        _persist(agent)
++    except Exception as exc:
++        if previous is None:
++            agent._work_deadline_until = None
++            agent._work_deadline_goal = None
++        else:
++            agent._work_deadline_until, agent._work_deadline_goal = previous
++        logger.warning("work deadline persist failed: %s", exc)
++        return json.dumps(
++            {"success": False, "error": f"deadline could not be persisted: {exc}"},
++            ensure_ascii=False,
++        )
++    # A successful (re)placement owns the turn: drop any finish latch and idle streak
++    # so the new deadline actually operates.
++    agent._work_deadline_finish_called = False
++    agent._work_deadline_finish_reason = None
++    agent._work_deadline_idle_continuations = 0
++    left = minutes_left(until_epoch)
++    logger.info(
++        "work deadline set until %s (%d min left), goal=%r (session=%s)",
++        hhmm, left, agent._work_deadline_goal,
++        getattr(agent, "session_id", None) or "none",
++    )
++    return json.dumps({
++        "success": True, "until": datetime.fromtimestamp(until_epoch).isoformat(timespec="minutes"),
++        "hhmm": hhmm, "minutes_left": left, "goal": agent._work_deadline_goal,
++        "replaced": replaced,
++    }, ensure_ascii=False)
++
++
++def finish_work(agent: Any, args: Dict[str, Any]) -> str:
++    """Inline executor for ``finish_work``: the only early exit under a deadline."""
++    args = args if isinstance(args, dict) else {}
++    refusal = _is_child_agent(agent)
++    if refusal is not None:
++        return json.dumps({"success": False, "error": refusal}, ensure_ascii=False)
++    if not deadline_enabled(agent):
++        return json.dumps(
++            {"success": False, "error": "work deadlines are disabled (agent.deadline_enabled=false)"},
++            ensure_ascii=False,
++        )
++    reason = str(args.get("reason") or "").strip()
++    if not reason:
++        return json.dumps({"success": False, "error": "reason is required"}, ensure_ascii=False)
++    current = active_deadline(agent)
++    if current is None:
++        return json.dumps(
++            {"success": False, "error": "no work deadline is active; nothing to finish"},
++            ensure_ascii=False,
++        )
++    left = minutes_left(current[0])
++    previous = current
++    agent._work_deadline_until = None
++    agent._work_deadline_goal = None
++    try:
++        _persist(agent)
++    except Exception as exc:
++        # Clearing failed: the row still holds the deadline and resume would reactivate
++        # it, so neither claim success nor latch the finish.
++        agent._work_deadline_until, agent._work_deadline_goal = previous
++        logger.warning("finish_work persist failed: %s", exc)
++        return json.dumps(
++            {"success": False, "error": f"could not end the deadline (persist failed): {exc}"},
++            ensure_ascii=False,
++        )
++    agent._work_deadline_finish_called = True
++    agent._work_deadline_finish_reason = reason
++    logger.info(
++        "finish_work called with %d min left (session=%s): %s",
++        left, getattr(agent, "session_id", None) or "none", reason,
++    )
++    return json.dumps({
++        "success": True, "finished": True, "reason": reason, "minutes_left": left,
++    }, ensure_ascii=False)
++
++
++def note_tool_activity(agent: Any) -> None:
++    """A tool round ran, so the deadline idle streak restarts."""
++    agent._work_deadline_idle_continuations = 0
++
++
++def run_budget_expired(agent: Any, now: Optional[float] = None) -> bool:
++    """True when a configured wall-clock run budget has fully elapsed."""
++    budget = getattr(agent, "run_budget_seconds", None)
++    started = getattr(agent, "_run_budget_started_at", None)
++    if isinstance(budget, bool) or not isinstance(started, (int, float)) or isinstance(started, bool):
++        return False
++    try:
++        limit = float(budget)
++    except (TypeError, ValueError):
++        return False
++    if not math.isfinite(limit) or limit <= 0:
++        return False
++    now_t = time.time() if now is None else now
++    return (now_t - float(started)) >= limit
++
++
++def run_budget_exhausted_note() -> str:
++    """One-line note ending a deadline turn whose run budget elapsed."""
++    return "Run time budget exhausted — ending the turn."
++
++
++def wrapup_injected(agent: Any) -> bool:
++    """True once the 80% run-budget wrap-up notice fired: it owns the ending."""
++    return getattr(agent, "_run_budget_wrapup_injected", False) is True
++
++
++def phase_boundary_stop(agent: Any) -> Optional[Tuple[str, str]]:
++    """``(exit_reason, note)`` to stop before another model request, else None.
++
++    Covers the tool-loop case the text-answer gate never sees: the in-flight model
++    call already finished and its tool round is recorded, so breaking here keeps
++    every tool-call/result pair complete. Interrupts and iteration ceilings are
++    checked earlier in ``begin_iteration`` and always win; the iteration-budget
++    grace call plays out untouched.
++    """
++    if _is_child_agent(agent) is not None:
++        return None
++    if getattr(agent, "_budget_grace_call", False):
++        return None
++    if not deadline_enabled(agent):
++        return None
++    finish_latched = getattr(agent, "_work_deadline_finish_called", False) is True
++    if active_deadline(agent) is None and not finish_latched:
++        return None
++    if run_budget_expired(agent):
++        return ("run_budget_exhausted", run_budget_exhausted_note())
++    if finish_latched:
++        reason = getattr(agent, "_work_deadline_finish_reason", "") or "done"
++        return ("work_deadline_finished", finished_early_note(str(reason)))
++    current = active_deadline(agent)
++    if current is not None and is_reached(current[0]):
++        agent._work_deadline_until = None
++        agent._work_deadline_goal = None
++        try:
++            _persist(agent)
++        except Exception as exc:
++            logger.warning("work deadline reached-clear persist failed: %s", exc)
++        return ("work_deadline_reached", deadline_reached_note(current[0]))
++    return None
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 10e58918..6484c998 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -57,6 +57,13 @@ DEFAULT_CONFIG = {
+         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
+         # `hermes chat --run-budget N`.
+         "run_budget_seconds": None,
++        # Self-managed work deadline ("work until 18:00"): the model calls set_work_deadline
++        # to keep working past its first final answer; finish_work is the only early exit.
++        # False hides both tools and disables the continuation.
++        "deadline_enabled": True,
++        # Max consecutive deadline continuations with no tool calls before the turn ends
++        # with a note. 0 ends at the first tool-less final answer under a deadline.
++        "deadline_max_idle_continuations": 3,
+         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
+         # while calling tools or receiving API responses. 0 = unlimited.
+         "gateway_timeout": 1800,
+diff --git a/model_tools.py b/model_tools.py
+index 4f2f697f..b827fbb2 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -590,7 +590,10 @@ def _resolve_active_context_length() -> int:
+ # =============================================================================
+ 
+ # Intercepted by the agent loop (need agent-level state); dispatch returns a stub error.
+-_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task"}
++_AGENT_LOOP_TOOLS = {
++    "todo_list", "memory", "session_search", "delegate_task",
++    "set_work_deadline", "finish_work",
++}
+ 
+ # Legacy tool-name aliases accepted at every dispatch seam (old sessions/saved
+ # prompts keep working); schemas advertise only new names.
+diff --git a/tests/agent/test_work_deadline.py b/tests/agent/test_work_deadline.py
+new file mode 100644
+index 00000000..dda70589
+--- /dev/null
++++ b/tests/agent/test_work_deadline.py
+@@ -0,0 +1,1145 @@
++"""Tests for the self-managed work deadline ("work until 18:00").
++
++Behavior contracts for ``agent/work_deadline.py`` and its turn-loop wiring
++(``agent/turn_stop_gates.py`` text-answer gate, ``agent/work_deadline.py::
++phase_boundary_stop`` tool-loop gate, ``agent/turn_iteration_prep.py::
++begin_iteration`` priorities), exercised with stub agents and a real
++``SessionDB`` — mock model responses only, no network.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++import time
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent import work_deadline as wd
++from agent.turn_final_response import finish_text_response
++from agent.turn_stop_gates import apply_stop_gates
++from agent.work_deadline import phase_boundary_stop
++
++
++# ── stub agents ──────────────────────────────────────────────────────────────
++
++class _GateAgent:
++    """Minimal agent for the text-answer stop gate."""
++
++    def __init__(self):
++        self._delegate_depth = 0
++        self._is_fork_child = False
++        self._persist_disabled = False
++        self._deadline_enabled = True
++        self._deadline_max_idle_continuations = 3
++        self._work_deadline_until = None
++        self._work_deadline_goal = None
++        self._work_deadline_finish_called = False
++        self._work_deadline_finish_reason = None
++        self._work_deadline_idle_continuations = 0
++        self._verification_stop_nudges = 0
++        self._pre_verify_nudges = 0
++        self._kanban_stop_nudges = 0
++        self._turn_file_mutation_paths = set()
++        self._session_db = None
++        self.session_id = "wd-test-session"
++        self._session_messages = []
++        self.run_budget_seconds = None
++        self._run_budget_started_at = None
++        self._run_budget_wrapup_injected = False
++        self.interim = []
++        self.flushed = []
++        self.statuses = []
++
++    def _emit_interim_assistant_message(self, msg):
++        self.interim.append(dict(msg))
++
++    def _flush_messages_to_session_db(self, messages, conversation_history=None):
++        self.flushed.append([dict(m) for m in messages])
++        return True
++
++    def _interim_content_was_streamed(self, content):
++        return False
++
++    def _emit_status(self, msg):
++        self.statuses.append(msg)
++
++
++class _PhaseAgent(_GateAgent):
++    """Stub for the tool-loop phase boundary + begin_iteration."""
++
++    def __init__(self):
++        super().__init__()
++        self._budget_grace_call = False
++        self._interrupt_requested = False
++        self.quiet_mode = True
++        self._api_call_count = 0
++        self.max_iterations = 50
++        self._checkpoint_mgr = SimpleNamespace(new_turn=lambda: None)
++        from agent.iteration_budget import IterationBudget
++        self.iteration_budget = IterationBudget(50)
++        self.prints = []
++
++    def _drain_pending_redirect(self):
++        return None
++
++    def _touch_activity(self, _msg):
++        pass
++
++    def _persist_session(self, _messages, _history):
++        pass
++
++    def _safe_print(self, msg):
++        self.prints.append(msg)
++
++
++def _future_iso(seconds_ahead=7200):
++    return datetime.fromtimestamp(time.time() + seconds_ahead).isoformat(timespec="minutes")
++
++
++def _past_iso(seconds_behind=120):
++    return datetime.fromtimestamp(time.time() - seconds_behind).isoformat(timespec="minutes")
++
++
++def _set_deadline(agent, until=None, goal="ship the feature"):
++    raw = wd.set_work_deadline(agent, {"until": until or _future_iso(), "goal": goal})
++    return json.loads(raw)
++
++
++def _gate_call(agent, messages, text="draft done"):
++    final_msg = {"role": "assistant", "content": text}
++    return apply_stop_gates(
++        agent, final_msg,
++        final_response=text, messages=messages, conversation_history=[],
++        pending_verification_response=None,
++        pending_verification_response_previewed=False,
++    ), final_msg
++
++
++def _stub_conversation_loop(monkeypatch):
++    """Seed ``sys.modules`` so ``begin_iteration``'s lazy ``conversation_loop`` import works.
++
++    The deadline venv lacks ``concurrent_log_handler`` (pulled in by the real
++    ``agent.conversation_loop`` via ``hermes_logging``), so the full loop module
++    cannot import here. The two helpers ``begin_iteration`` needs are unrelated
++    to deadline ordering — the stub gives them their inert values (no redirect,
++    review budget not exhausted) so the real priority logic is exercised.
++    """
++    import sys
++    import types
++    stub = types.ModuleType("agent.conversation_loop")
++    stub._apply_active_turn_redirect = lambda agent, messages, text: None
++    stub._review_input_budget_exhausted = lambda agent: False
++    # Nudge constants lazily imported by agent.context_compressor
++    # (_is_synthetic_compression_user_turn) on the SessionDB write path.
++    # Sentinels match nothing real, so classification of the rows under test
++    # is identical to production; only the missing third-party import
++    # (concurrent_log_handler via hermes_logging) is avoided.
++    for _name in (
++        "_CODEX_ACK_CONTINUATION_NUDGE", "_CODEX_INCOMPLETE_NUDGE",
++        "_DROPPED_TOOLCALL_NUDGE_CONTENT", "_EMPTY_TOOL_RESPONSE_NUDGE",
++        "_LENGTH_CONTINUATION_NETWORK_STUB", "_LENGTH_CONTINUATION_OUTPUT_LIMIT",
++        "_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX",
++    ):
++        setattr(stub, _name, f"<stub-{_name}>")
++    # finish_text_response lazily imports the truncation joiner; only the name
++    # must exist (unused on paths without truncated fragments).
++    stub._join_truncated_parts = lambda parts: "".join(
++        p if isinstance(p, str) else "" for p in parts)
++    monkeypatch.setitem(sys.modules, "agent.conversation_loop", stub)
++    return stub
++
++
++# ── time parsing ─────────────────────────────────────────────────────────────
++
++def test_parse_hhmm_future_is_today():
++    now = datetime(2026, 9, 30, 10, 0, 0)
++    epoch, hhmm = wd.parse_work_deadline("18:00", now=now)
++    assert hhmm == "18:00"
++    assert datetime.fromtimestamp(epoch) == datetime(2026, 9, 30, 18, 0)
++
++
++def test_parse_hhmm_past_rolls_to_tomorrow():
++    now = datetime(2026, 9, 30, 19, 0, 0)
++    epoch, hhmm = wd.parse_work_deadline("18:00", now=now)
++    assert hhmm == "18:00"
++    assert datetime.fromtimestamp(epoch) == datetime(2026, 10, 1, 18, 0)
++
++
++def test_parse_hhmm_exact_now_rolls_to_tomorrow():
++    now = datetime(2026, 9, 30, 18, 0, 0)
++    epoch, _hhmm = wd.parse_work_deadline("18:00", now=now)
++    assert datetime.fromtimestamp(epoch) == datetime(2026, 10, 1, 18, 0)
++
++
++def test_parse_naive_iso_taken_as_local_wall_clock():
++    epoch, hhmm = wd.parse_work_deadline("2026-09-30T18:00:00")
++    assert hhmm == "18:00"
++    assert epoch == datetime(2026, 9, 30, 18, 0, 0).timestamp()
++
++
++def test_parse_tz_aware_iso_is_absolute_instant():
++    text = "2026-09-30T18:00:00+02:00"
++    epoch, hhmm = wd.parse_work_deadline(text)
++    expected = datetime.fromisoformat(text).astimezone().replace(tzinfo=None)
++    assert epoch == pytest.approx(expected.timestamp())
++    assert hhmm == expected.strftime("%H:%M")
++
++
++def test_parse_none_clears():
++    assert wd.parse_work_deadline("none") is None
++    assert wd.parse_work_deadline("  NONE  ") is None
++    assert wd.is_clear_request("none") and wd.is_clear_request("None")
++    assert not wd.is_clear_request("18:00")
++
++
++@pytest.mark.parametrize("bad", ["25:00", "18:60", "tonight", "", "18", "18:0", "{}"])
++def test_parse_invalid_raises_with_hint(bad):
++    with pytest.raises(ValueError, match="HH:MM"):
++        wd.parse_work_deadline(bad, now=datetime(2026, 9, 30, 10, 0))
++
++
++def test_minutes_left_and_is_reached_use_explicit_now():
++    assert wd.minutes_left(1000.0, now=1000.0 - 90 * 60) == 90
++    assert wd.minutes_left(1000.0, now=1000.0) == 0
++    assert wd.minutes_left(1000.0, now=9999.0) == 0  # floored, never negative
++    assert not wd.is_reached(1000.0, now=999.0)
++    assert wd.is_reached(1000.0, now=1000.0)
++
++
++# ── set / replace / clear ────────────────────────────────────────────────────
++
++def test_set_returns_parsed_deadline_and_minutes_left():
++    agent = _GateAgent()
++    before = time.time()
++    payload = _set_deadline(agent)
++    assert payload["success"] is True
++    assert payload["replaced"] is False
++    assert payload["hhmm"] == wd.deadline_hhmm(agent._work_deadline_until)
++    assert agent._work_deadline_until >= before
++    assert payload["minutes_left"] == wd.minutes_left(agent._work_deadline_until)
++    assert payload["goal"] == "ship the feature"
++    assert agent._work_deadline_goal == "ship the feature"
++
++
++def test_set_requires_goal():
++    agent = _GateAgent()
++    payload = json.loads(wd.set_work_deadline(agent, {"until": _future_iso()}))
++    assert payload["success"] is False
++    assert "goal" in payload["error"]
++    assert wd.active_deadline(agent) is None
++
++
++def test_set_replaces_and_reports_replaced():
++    agent = _GateAgent()
++    assert _set_deadline(agent, goal="first")["replaced"] is False
++    payload = _set_deadline(agent, goal="second")
++    assert payload["replaced"] is True
++    assert agent._work_deadline_goal == "second"
++
++
++def test_clear_via_none():
++    agent = _GateAgent()
++    _set_deadline(agent)
++    payload = json.loads(wd.set_work_deadline(agent, {"until": "none"}))
++    assert payload == {"success": True, "cleared": True, "replaced": True}
++    assert wd.active_deadline(agent) is None
++
++
++def test_clear_when_absent_reports_not_replaced():
++    agent = _GateAgent()
++    payload = json.loads(wd.set_work_deadline(agent, {"until": "none"}))
++    assert payload["success"] is True and payload["replaced"] is False
++
++
++def test_set_after_finish_resets_markers():
++    agent = _GateAgent()
++    _set_deadline(agent)
++    assert json.loads(wd.finish_work(agent, {"reason": "done enough"}))["success"] is True
++    assert agent._work_deadline_finish_called is True
++    payload = _set_deadline(agent, goal="next phase")
++    assert payload["success"] is True
++    assert agent._work_deadline_finish_called is False
++    assert agent._work_deadline_finish_reason is None
++    assert agent._work_deadline_idle_continuations == 0
++    assert wd.active_deadline(agent) is not None
++
++
++def test_config_disabled_refuses_both_tools():
++    agent = _GateAgent()
++    agent._deadline_enabled = False
++    set_payload = json.loads(wd.set_work_deadline(agent, {"until": _future_iso(), "goal": "x"}))
++    assert set_payload["success"] is False
++    assert "disabled" in set_payload["error"]
++    assert wd.active_deadline(agent) is None
++    agent._deadline_enabled = True
++    _set_deadline(agent)
++    agent._deadline_enabled = False
++    fin_payload = json.loads(wd.finish_work(agent, {"reason": "x"}))
++    assert fin_payload["success"] is False
++    assert "disabled" in fin_payload["error"]
++
++
++def test_storage_failure_on_set_rolls_back_to_previous():
++    agent = _GateAgent()
++
++    class _FailingDB:
++        def patch_session_model_config(self, _sid, _patch):
++            raise RuntimeError("disk gone")
++
++    agent._session_db = _FailingDB()
++    payload = json.loads(wd.set_work_deadline(agent, {"until": _future_iso(), "goal": "x"}))
++    assert payload["success"] is False
++    assert "persist" in payload["error"]
++    assert wd.active_deadline(agent) is None
++
++    # With a previous deadline, the previous values are restored, not cleared.
++    agent._session_db = None
++    _set_deadline(agent, goal="keep me")
++    previous = wd.active_deadline(agent)
++    agent._session_db = _FailingDB()
++    payload = json.loads(wd.set_work_deadline(agent, {"until": _future_iso(), "goal": "other"}))
++    assert payload["success"] is False
++    assert wd.active_deadline(agent) == previous
++
++
++def test_storage_failure_on_finish_keeps_deadline_and_latch_off():
++    agent = _GateAgent()
++    _set_deadline(agent)
++    before = wd.active_deadline(agent)
++
++    class _FailingDB:
++        def patch_session_model_config(self, _sid, _patch):
++            raise RuntimeError("disk gone")
++
++    agent._session_db = _FailingDB()
++    payload = json.loads(wd.finish_work(agent, {"reason": "trying"}))
++    assert payload["success"] is False
++    assert wd.active_deadline(agent) == before
++    assert agent._work_deadline_finish_called is False
++
++
++# ── continuation: exact rows, byte-stable, alternation ───────────────────────
++
++def _pinned_nudge(agent):
++    """The exact nudge text the gate must inject, pinned per the byte-stability contract."""
++    until, goal = wd.active_deadline(agent)
++    hhmm = wd.deadline_hhmm(until)
++    left = wd.minutes_left(until)
++    return (
++        f"[deadline {hhmm}, {left} min left] "
++        f'Record progress where your task expects it, then choose the next most valuable '
++        f'improvement toward "{goal}" yourself and continue. Do not ask the user. '
++        f"To stop before the deadline, call finish_work(reason)."
++    )
++
++
++def test_final_before_deadline_injects_exact_rows_and_preserves_prefix():
++    agent = _GateAgent()
++    _set_deadline(agent, goal="harden the sync")
++    messages = [
++        {"role": "user", "content": "work until late", "timestamp": 1.0},
++        {"role": "assistant", "content": "on it", "timestamp": 2.0},
++        {"role": "tool", "tool_call_id": "c1", "content": "ok", "timestamp": 3.0},
++    ]
++    snapshot = copy.deepcopy(messages)
++    expected_nudge = _pinned_nudge(agent)
++
++    verdict, final_msg = _gate_call(agent, messages)
++
++    assert verdict.continue_turn is True
++    assert verdict.final_response is None
++    # Prefix rows byte-identical; exactly two rows appended.
++    assert messages[:len(snapshot)] == snapshot
++    assert len(messages) == len(snapshot) + 2
++    assistant_row, nudge_row = messages[-2], messages[-1]
++    assert assistant_row["role"] == "assistant"
++    assert assistant_row["content"] == "draft done"
++    assert final_msg.get("finish_reason") == "work_deadline_continue"
++    assert nudge_row["role"] == "user"
++    assert nudge_row["content"] == expected_nudge
++    assert nudge_row.get(wd.CONTINUATION_FLAG) is True
++    assert nudge_row.get("display_kind") == "hidden"
++    # Strict alternation holds across the seam.
++    roles = [m["role"] for m in messages]
++    assert roles[-2:] == ["assistant", "user"]
++    assert all(a != b for a, b in zip(roles, roles[1:]))
++    # Interim delivery surfaced the attempted answer; the nudge stays out of it.
++    assert agent.interim and agent.interim[0]["content"] == "draft done"
++    assert agent._work_deadline_idle_continuations == 1
++
++
++def test_nudge_byte_stable_apart_from_numbers():
++    agent = _GateAgent()
++    _set_deadline(agent, goal="same goal")
++    assert _pinned_nudge(agent) == _pinned_nudge(agent)
++    assert _pinned_nudge(agent) == wd.build_continuation_nudge(
++        agent._work_deadline_until, agent._work_deadline_goal)
++
++
++def test_no_deadline_ends_turn_untouched():
++    agent = _GateAgent()
++    messages = [{"role": "user", "content": "hi"}]
++    snapshot = copy.deepcopy(messages)
++    verdict, _final = _gate_call(agent, messages, text="hello")
++    assert verdict.continue_turn is False
++    assert verdict.final_response == "hello"
++    assert messages == snapshot
++
++
++def test_disabled_config_never_nudges():
++    agent = _GateAgent()
++    _set_deadline(agent)
++    agent._deadline_enabled = False
++    messages = [{"role": "user", "content": "hi"}]
++    verdict, _final = _gate_call(agent, messages)
++    assert verdict.continue_turn is False
++
++
++# ── terminal stops at a text answer ──────────────────────────────────────────
++
++def test_after_deadline_turn_ends_with_reached_note_and_clears():
++    agent = _GateAgent()
++    _set_deadline(agent, until=_past_iso())
++    messages = [{"role": "user", "content": "work late"}]
++    verdict, _final = _gate_call(agent, messages, text="almost done")
++    assert verdict.continue_turn is False
++    assert wd.deadline_reached_note(agent._work_deadline_until if agent._work_deadline_until else 0) \
++        in verdict.final_response or "deadline reached" in verdict.final_response
++    assert "almost done" in verdict.final_response  # reason rides the delivered answer
++    assert wd.active_deadline(agent) is None  # consumed
++
++
++def test_finish_work_ends_early_with_visible_logged_reason():
++    agent = _GateAgent()
++    _set_deadline(agent)
++    payload = json.loads(wd.finish_work(agent, {"reason": "blocked on human decision"}))
++    assert payload == {
++        "success": True, "finished": True,
++        "reason": "blocked on human decision", "minutes_left": payload["minutes_left"],
++    }
++    messages = [{"role": "user", "content": "work late"}]
++    verdict, _final = _gate_call(agent, messages, text="stuck")
++    assert verdict.continue_turn is False
++    assert "blocked on human decision" in verdict.final_response
++    assert "stuck" in verdict.final_response
++
++
++def test_finish_work_requires_reason_and_active_deadline():
++    agent = _GateAgent()
++    assert json.loads(wd.finish_work(agent, {"reason": ""}))["success"] is False
++    assert json.loads(wd.finish_work(agent, {"reason": "x"}))["success"] is False
++
++
++def test_idle_guard_ends_tool_less_spin_and_tool_activity_resets():
++    agent = _GateAgent()
++    agent._deadline_max_idle_continuations = 3
++    _set_deadline(agent)
++    messages = [{"role": "user", "content": "go"}]
++    for _ in range(3):
++        verdict, _final = _gate_call(agent, messages, text="still thinking")
++        assert verdict.continue_turn is True
++    verdict, _final = _gate_call(agent, messages, text="still thinking")
++    assert verdict.continue_turn is False
++    assert "3 consecutive deadline continuations" in verdict.final_response
++
++    # One real tool round restarts the streak: continuation resumes.
++    wd.note_tool_activity(agent)
++    assert agent._work_deadline_idle_continuations == 0
++    verdict, _final = _gate_call(agent, messages, text="new idea")
++    assert verdict.continue_turn is True
++
++
++def test_run_budget_ceiling_beats_deadline_floor():
++    agent = _GateAgent()
++    _set_deadline(agent)
++    agent.run_budget_seconds = 900.0
++    agent._run_budget_started_at = time.time() - 901
++    messages = [{"role": "user", "content": "go"}]
++    verdict, _final = _gate_call(agent, messages, text="working")
++    assert verdict.continue_turn is False
++    assert "budget" in verdict.final_response.lower()
++
++
++def test_wrapup_notice_owns_the_ending():
++    agent = _GateAgent()
++    _set_deadline(agent)
++    agent.run_budget_seconds = 900.0
++    agent._run_budget_started_at = time.time() - 730  # past 80%, wrap-up fired
++    agent._run_budget_wrapup_injected = True
++    messages = [{"role": "user", "content": "go"}]
++    verdict, _final = _gate_call(agent, messages, text="final deliverable")
++    assert verdict.continue_turn is False
++    assert verdict.final_response == "final deliverable"
++
++
++# ── tool-loop phase boundary ─────────────────────────────────────────────────
++
++def test_phase_boundary_reached_stops_even_with_tool_activity():
++    agent = _PhaseAgent()
++    _set_deadline(agent, until=_past_iso())
++    wd.note_tool_activity(agent)  # tools ran; the wall clock still wins
++    reason, note = phase_boundary_stop(agent)
++    assert reason == "work_deadline_reached"
++    assert "deadline reached" in note
++    assert wd.active_deadline(agent) is None
++
++
++def test_phase_boundary_finish_latch_stops_with_reason():
++    agent = _PhaseAgent()
++    _set_deadline(agent)
++    wd.finish_work(agent, {"reason": "goal met"})
++    reason, note = phase_boundary_stop(agent)
++    assert reason == "work_deadline_finished"
++    assert "goal met" in note
++
++
++def test_phase_boundary_run_budget_beats_active_deadline():
++    agent = _PhaseAgent()
++    _set_deadline(agent)
++    agent.run_budget_seconds = 60.0
++    agent._run_budget_started_at = time.time() - 61
++    reason, _note = phase_boundary_stop(agent)
++    assert reason == "run_budget_exhausted"
++
++
++def test_phase_boundary_none_without_deadline_or_when_disabled():
++    assert phase_boundary_stop(_PhaseAgent()) is None
++    agent = _PhaseAgent()
++    _set_deadline(agent)
++    agent._deadline_enabled = False
++    assert phase_boundary_stop(agent) is None
++
++
++def test_phase_boundary_grace_call_plays_out_untouched():
++    agent = _PhaseAgent()
++    _set_deadline(agent, until=_past_iso())
++    agent._budget_grace_call = True
++    assert phase_boundary_stop(agent) is None
++
++
++def test_begin_iteration_interrupt_wins_over_deadline(monkeypatch):
++    from agent.turn_iteration_prep import begin_iteration
++    _stub_conversation_loop(monkeypatch)
++    agent = _PhaseAgent()
++    _set_deadline(agent)
++    agent._interrupt_requested = True
++    verdict = begin_iteration(
++        agent, messages=[{"role": "user", "content": "go"}], conversation_history=[],
++        original_user_message="go", api_call_count=1, interrupted=False,
++        final_response=None, _turn_exit_reason=None,
++    )
++    assert verdict.action == "break"
++    assert verdict._turn_exit_reason == "interrupted_by_user"
++
++
++def test_begin_iteration_deadline_reached_breaks_tool_loop(monkeypatch):
++    from agent.turn_iteration_prep import begin_iteration
++    _stub_conversation_loop(monkeypatch)
++    agent = _PhaseAgent()
++    _set_deadline(agent, until=_past_iso())
++    verdict = begin_iteration(
++        agent, messages=[{"role": "user", "content": "go"}], conversation_history=[],
++        original_user_message="go", api_call_count=3, interrupted=False,
++        final_response=None, _turn_exit_reason=None,
++    )
++    assert verdict.action == "break"
++    assert verdict._turn_exit_reason == "work_deadline_reached"
++    assert "deadline reached" in verdict.final_response
++
++
++def test_begin_iteration_iteration_budget_still_caps_deadline_turn(monkeypatch):
++    from agent.turn_iteration_prep import begin_iteration
++    _stub_conversation_loop(monkeypatch)
++    from agent.iteration_budget import IterationBudget
++    agent = _PhaseAgent()
++    _set_deadline(agent)  # future deadline: the floor wants to continue
++    agent.iteration_budget = IterationBudget(1)
++    assert agent.iteration_budget.consume() is True  # exhaust the ceiling
++    verdict = begin_iteration(
++        agent, messages=[{"role": "user", "content": "go"}], conversation_history=[],
++        original_user_message="go", api_call_count=1, interrupted=False,
++        final_response=None, _turn_exit_reason=None,
++    )
++    assert verdict.action == "break"
++    assert verdict._turn_exit_reason == "budget_exhausted"
++
++
++# ── children: no inherit, no tools, fork schemas ─────────────────────────────
++
++def test_delegate_blocked_tools_cover_deadline_pair():
++    from tools.delegate_tool_toolsets import DELEGATE_BLOCKED_TOOLS
++    assert "set_work_deadline" in DELEGATE_BLOCKED_TOOLS
++    assert "finish_work" in DELEGATE_BLOCKED_TOOLS
++
++
++def test_child_toolsets_grant_no_deadline_toolset_either_role():
++    from tools.delegate_tool_toolsets import _resolve_child_toolsets
++    parent = SimpleNamespace(
++        enabled_toolsets=["terminal", "file", "web", "work_deadline", "memory", "clarify"],
++        disabled_toolsets=[],
++        valid_tool_names={"terminal", "set_work_deadline", "finish_work"},
++    )
++    for role in ("leaf", "orchestrator"):
++        enabled, disabled = _resolve_child_toolsets(parent, None, role)
++        assert "work_deadline" not in enabled
++        assert "work_deadline" in disabled
++
++
++def test_fork_schema_marks_deadline_tools_call_time_blocked():
++    from tools.delegate_tool_fork import _FORK_BLOCKED_TOOL_REASONS
++    assert "set_work_deadline" in _FORK_BLOCKED_TOOL_REASONS
++    assert "finish_work" in _FORK_BLOCKED_TOOL_REASONS
++
++
++@pytest.mark.parametrize("attr", ["_is_fork_child", "_persist_disabled"])
++def test_isolated_child_cannot_call_deadline_tools(attr):
++    agent = _GateAgent()
++    setattr(agent, attr, True)
++    set_payload = json.loads(wd.set_work_deadline(agent, {"until": _future_iso(), "goal": "x"}))
++    assert set_payload["success"] is False
++    assert "parent owns" in set_payload["error"]
++    assert wd.active_deadline(agent) is None
++    fin_payload = json.loads(wd.finish_work(agent, {"reason": "x"}))
++    assert fin_payload["success"] is False
++    assert "parent owns" in fin_payload["error"]
++
++
++def test_delegated_child_depth_cannot_call_deadline_tools():
++    agent = _GateAgent()
++    agent._delegate_depth = 1
++    assert json.loads(wd.set_work_deadline(agent, {"until": _future_iso(), "goal": "x"}))["success"] is False
++    assert json.loads(wd.finish_work(agent, {"reason": "x"}))["success"] is False
++    assert wd.active_deadline(agent) is None
++
++
++def test_children_neither_stop_nor_continue_on_parent_deadline():
++    agent = _GateAgent()
++    agent._delegate_depth = 1
++    agent._work_deadline_until = time.time() + 3600
++    agent._work_deadline_goal = "parent goal"
++    messages = [{"role": "user", "content": "subtask"}]
++    verdict, _final = _gate_call(agent, messages, text="child done")
++    assert verdict.continue_turn is False
++    assert verdict.final_response == "child done"
++    assert phase_boundary_stop(agent) is None
++
++
++def test_hydrate_skips_fork_children_sharing_session_id():
++    from hermes_state import SessionDB
++
++    import tempfile
++    from pathlib import Path
++    with tempfile.TemporaryDirectory(prefix="hermes_wd_") as tmp:
++        db = SessionDB(db_path=Path(tmp) / "s.db")
++        try:
++            db.ensure_session("shared-sess", source="cli")
++            owner = _GateAgent()
++            owner.session_id = "shared-sess"
++            owner._session_db = db
++            _set_deadline(owner, goal="parent goal")
++            child = _GateAgent()
++            child.session_id = "shared-sess"
++            child._session_db = db
++            child._is_fork_child = True
++            wd.hydrate_work_deadline(child)
++            assert wd.active_deadline(child) is None
++        finally:
++            db.close()
++
++
++# ── persistence: resume across CLI and gateway ───────────────────────────────
++
++def _db_agent(db, session_id, platform="cli"):
++    agent = _GateAgent()
++    agent.session_id = session_id
++    agent._session_db = db
++    agent.platform = platform
++    return agent
++
++
++@pytest.mark.parametrize("platform", ["cli", "telegram"])
++def test_deadline_survives_db_and_fresh_agent_resume(tmp_path, platform):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / "resume.db")
++    try:
++        db.ensure_session("sess-resume", source=platform)
++        owner = _db_agent(db, "sess-resume", platform=platform)
++        payload = _set_deadline(owner, goal="overnight hardening")
++        assert payload["success"] is True
++
++        stored = db.get_session_model_config_value("sess-resume", "work_deadline")
++        assert stored["goal"] == "overnight hardening"
++        assert stored["until"] == pytest.approx(owner._work_deadline_until)
++
++        fresh = _db_agent(db, "sess-resume", platform=platform)
++        assert wd.active_deadline(fresh) is None
++        wd.hydrate_work_deadline(fresh)
++        assert wd.active_deadline(fresh) == wd.active_deadline(owner)
++    finally:
++        db.close()
++
++
++def test_cleared_deadline_stays_cleared_on_resume(tmp_path):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / "clear.db")
++    try:
++        db.ensure_session("sess-clear", source="cli")
++        owner = _db_agent(db, "sess-clear")
++        _set_deadline(owner)
++        assert json.loads(wd.set_work_deadline(owner, {"until": "none"}))["success"] is True
++        fresh = _db_agent(db, "sess-clear")
++        wd.hydrate_work_deadline(fresh)
++        assert wd.active_deadline(fresh) is None
++    finally:
++        db.close()
++
++
++def test_durable_continuation_replays_in_alternation(tmp_path, monkeypatch):
++    """The injected assistant + user rows persist and reload strictly alternating."""
++    _stub_conversation_loop(monkeypatch)
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / "replay.db")
++    try:
++        db.ensure_session("sess-replay", source="cli")
++        agent = _db_agent(db, "sess-replay")
++        _set_deadline(agent, goal="replay check")
++        messages = [{"role": "user", "content": "keep going"}]
++        verdict, _final = _gate_call(agent, messages)
++        assert verdict.continue_turn is True
++
++        # Persist the live transcript the way the loop flush does, then replay.
++        # (Via _db_flush_collect + a direct batch write: _db_flush_write's marker
++        # sync lazily pulls agent.conversation_loop, which the deadline venv
++        # cannot import — missing concurrent_log_handler. Row construction and
++        # the DB round-trip are the real paths under test here.)
++        from agent.session_persistence import _db_flush_collect
++        agent._session_db_created = True
++        agent._flushed_db_message_ids = set()
++        agent._db_flush_scan_prefix = None
++        agent._persist_user_message_idx = None
++        agent._pending_cli_user_message = None
++        rows, _msgs = _db_flush_collect(agent, messages, [])
++        assert len(rows) == 3
++        db.append_messages_batch(session_id="sess-replay", messages=rows)
++
++        replayed = db.get_messages("sess-replay")
++        roles = [row["role"] for row in replayed]
++        assert roles == ["user", "assistant", "user"]
++        assert replayed[-1]["content"] == messages[-1]["content"]
++        assert "finish_work(reason)" in replayed[-1]["content"]
++    finally:
++        db.close()
++
++
++def test_reached_deadline_clear_propagates_to_db(tmp_path):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / "reached.db")
++    try:
++        db.ensure_session("sess-reached", source="cli")
++        agent = _db_agent(db, "sess-reached")
++        _set_deadline(agent, until=_past_iso())
++        assert db.get_session_model_config_value("sess-reached", "work_deadline") is not None
++        verdict, _final = _gate_call(agent, [{"role": "user", "content": "go"}], text="done")
++        assert verdict.continue_turn is False
++        assert db.get_session_model_config_value("sess-reached", "work_deadline") is None
++    finally:
++        db.close()
++
++
++# ── availability, registry, prompt ───────────────────────────────────────────
++
++def test_deadline_tools_in_core_and_work_deadline_toolset():
++    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
++    assert "set_work_deadline" in _HERMES_CORE_TOOLS
++    assert "finish_work" in _HERMES_CORE_TOOLS
++    assert {"set_work_deadline", "finish_work"} <= set(TOOLSETS["work_deadline"]["tools"])
++
++
++def test_deadline_tools_registered_with_config_gate():
++    import tools.work_deadline_tool  # noqa: F401 — registers schemas on import
++    from tools.registry import registry
++    for name in ("set_work_deadline", "finish_work"):
++        schema = registry.get_schema(name)
++        assert schema["name"] == name
++        assert schema["parameters"]["type"] == "object"
++    from tools.work_deadline_tool import check_work_deadline_requirements
++    assert check_work_deadline_requirements() is True  # default config: enabled
++
++
++def test_inline_executors_route_both_tools_without_network():
++    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext
++    agent = _GateAgent()
++    ctx = InlineToolContext(effective_task_id="t")
++    set_raw = INLINE_TOOL_EXECUTORS["set_work_deadline"](
++        agent, {"until": _future_iso(), "goal": "via loop"}, ctx)
++    assert json.loads(set_raw)["success"] is True
++    fin_raw = INLINE_TOOL_EXECUTORS["finish_work"](agent, {"reason": "all green"}, ctx)
++    assert json.loads(fin_raw)["success"] is True
++
++
++def test_stable_prompt_sentence_present_only_with_tools():
++    from agent.system_prompt import WORK_DEADLINE_GUIDANCE
++    assert "set_work_deadline" in WORK_DEADLINE_GUIDANCE
++    # No time-dependent text may live in the stable tier.
++    assert not any(ch.isdigit() for ch in WORK_DEADLINE_GUIDANCE.split("set_work_deadline")[0])
++    with_tools = SimpleNamespace(
++        valid_tool_names={"set_work_deadline", "terminal"}, model="",
++        _tool_use_enforcement=False, _execution_guidance=False,
++    )
++    without_tools = SimpleNamespace(
++        valid_tool_names=set(), model="", _tool_use_enforcement=False,
++        _execution_guidance=False,
++    )
++    from agent.system_prompt import _guidance_parts
++    live_parts = [part or "" for part in _guidance_parts(with_tools)]
++    assert any("set_work_deadline" in part for part in live_parts)
++    dark_parts = [part or "" for part in _guidance_parts(without_tools)]
++    assert not any("set_work_deadline" in part for part in dark_parts)
++
++
++# ── clear-failure invariant: previous deadline + markers survive ─────────────
++
++def test_clear_persist_failure_restores_previous_deadline_and_markers():
++    """A failed ``until="none"`` clear must leave the session exactly as it was.
++
++    The DB row still holds the deadline, so resume would reactivate it — the
++    in-memory state must match the row (previous until/goal restored) and the
++    per-turn markers must be untouched (only a successful clear resets them).
++    """
++    agent = _GateAgent()
++    _set_deadline(agent, goal="keep me")
++    agent._work_deadline_finish_called = True
++    agent._work_deadline_finish_reason = "almost done"
++    agent._work_deadline_idle_continuations = 2
++    previous = wd.active_deadline(agent)
++    assert previous is not None
++
++    class _FailingDB:
++        def patch_session_model_config(self, _sid, _patch):
++            raise RuntimeError("disk gone")
++
++    agent._session_db = _FailingDB()
++    payload = json.loads(wd.set_work_deadline(agent, {"until": "none"}))
++    assert payload["success"] is False
++    assert "persist" in payload["error"]
++    assert wd.active_deadline(agent) == previous
++    assert agent._work_deadline_finish_called is True
++    assert agent._work_deadline_finish_reason == "almost done"
++    assert agent._work_deadline_idle_continuations == 2
++
++
++# ── mock-model loop integration (real AIAgent.run_conversation) ──────────────
++#
++# Pattern reused from tests/run_agent/test_81641_text_turn_incremental_persistence.py
++# (real agent, MagicMock provider client, SimpleNamespace responses) and
++# tests/run_agent/test_conversation_fallback_state.py (minimal tool defs +
++# valid_tool_names). The deadline tools execute through the REAL inline path
++# (agent/tool_executor.py → INLINE_TOOL_EXECUTORS); nothing is stubbed except
++# the provider client. Zero network.
++#
++# The deadline venv cannot import the full loop (concurrent_log_handler is
++# missing), so these cases skip there via importorskip and run in a complete
++# dev venv. No sys.modules stubbing of agent.conversation_loop here.
++
++_LOOP_SKIP_REASON = (
++    "full loop needs concurrent_log_handler, missing from the deadline venv"
++)
++
++
++def _wd_tool_defs():
++    return [
++        {
++            "type": "function", "function": {
++                "name": name, "description": f"{name} tool",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++        for name in ("set_work_deadline", "finish_work")
++    ]
++
++
++def _mock_text(content):
++    message = SimpleNamespace(content=content, tool_calls=None)
++    choice = SimpleNamespace(message=message, finish_reason="stop")
++    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
++
++
++def _mock_tool(name, args, call_id):
++    call = SimpleNamespace(
++        id=call_id, type="function",
++        function=SimpleNamespace(name=name, arguments=json.dumps(args)),
++    )
++    message = SimpleNamespace(content="", tool_calls=[call])
++    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
++    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
++
++
++@pytest.fixture()
++def loop_factory():
++    """Build a real AIAgent with a mock provider client and deadline tools."""
++    pytest.importorskip("concurrent_log_handler", reason=_LOOP_SKIP_REASON)
++    from unittest.mock import MagicMock
++
++    from run_agent import AIAgent
++
++    def _make(**kwargs):
++        params = dict(
++            api_key="test-key-1234567890",
++            base_url="https://openrouter.ai/api/v1",
++            quiet_mode=True, skip_context_files=True, skip_memory=True,
++        )
++        params.update(kwargs)
++        with (
++            patch("model_tools.get_tool_definitions", return_value=_wd_tool_defs()),
++            patch("model_tools.check_toolset_requirements", return_value={}),
++            patch("agent.process_bootstrap.OpenAI"),
++        ):
++            agent = AIAgent(**params)
++        agent.client = MagicMock()
++        agent._cached_system_prompt = "You are helpful."
++        agent._use_prompt_caching = False
++        agent.tool_delay = 0
++        agent.compression_enabled = False
++        agent.save_trajectories = False
++        agent.tools = _wd_tool_defs()
++        agent.valid_tool_names = {"set_work_deadline", "finish_work"}
++        return agent
++
++    return _make
++
++
++def _run_loop(agent, script):
++    """Run one turn against the scripted mock responses.
++
++    Turn-boundary persistence hooks (``_persist_session``, trajectories,
++    task cleanup) are mocked; the SessionDB message flush stays real, as does
++    all deadline state handling. The only model stand-in is the scripted
++    provider client.
++    """
++    agent.client.chat.completions.create.side_effect = script
++    with (
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        return agent.run_conversation("work until late")
++
++
++def _request_kwargs(agent, index):
++    return agent.client.chat.completions.create.call_args_list[index].kwargs
++
++
++def _assert_complete_pairs(messages):
++    tc_ids = [
++        tc["id"] for m in messages
++        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
++        for tc in m["tool_calls"]
++    ]
++    res_ids = [
++        m.get("tool_call_id") for m in messages
++        if isinstance(m, dict) and m.get("role") == "tool"
++    ]
++    assert tc_ids, "expected at least one tool_call/result pair"
++    assert sorted(tc_ids) == sorted(res_ids)
++
++
++def test_loop_set_continue_finish_arc(loop_factory):
++    """Full arc through the real loop: set → continue → finish_work stops the turn.
++
++    The finish_work tool round latches the finish, so the phase boundary ends
++    the turn before any further provider request: exactly 3 calls.
++    """
++    agent = loop_factory()
++    result = _run_loop(agent, [
++        _mock_tool("set_work_deadline",
++                   {"until": _future_iso(7200), "goal": "harden sync"}, "call_1"),
++        _mock_text("progress update"),
++        _mock_tool("finish_work", {"reason": "blocked on human decision"}, "call_2"),
++    ])
++    assert agent.client.chat.completions.create.call_count == 3
++    assert "blocked on human decision" in result["final_response"]
++    assert agent._work_deadline_finish_called is True
++    assert wd.active_deadline(agent) is None
++    _assert_complete_pairs(result["messages"])
++    # Later requests extend earlier ones byte-identically (prompt-cache prefix),
++    # with the same system prompt and tool schemas: request 2 adds the
++    # tool-call/result pair, request 3 adds the assistant answer + user nudge.
++    first, second, third = (_request_kwargs(agent, i) for i in range(3))
++    assert second["messages"][:len(first["messages"])] == first["messages"]
++    assert len(second["messages"]) == len(first["messages"]) + 2
++    assert [m["role"] for m in second["messages"][-2:]] == ["assistant", "tool"]
++    assert third["messages"][:len(second["messages"])] == second["messages"]
++    assert len(third["messages"]) == len(second["messages"]) + 2
++    assert [m["role"] for m in third["messages"][-2:]] == ["assistant", "user"]
++    assert third["messages"][-1]["content"].startswith("[deadline ")
++    assert second["tools"] == first["tools"]
++    assert third["tools"] == first["tools"]
++
++
++@pytest.mark.parametrize("case", ["reached", "idle", "finished"])
++def test_loop_terminal_notes_reach_final_response(loop_factory, case):
++    """Stop-gate notes must land in result["final_response"], not get lost."""
++    agent = loop_factory()
++    if case == "reached":
++        script = [_mock_tool("set_work_deadline",
++                             {"until": _past_iso(), "goal": "race the clock"}, "call_1")]
++        expected_calls, expected_note = 1, "deadline reached"
++    elif case == "idle":
++        script = [_mock_tool("set_work_deadline",
++                             {"until": _future_iso(), "goal": "tinker"}, "call_1")]
++        script += [_mock_text("still thinking") for _ in range(4)]
++        expected_calls, expected_note = 5, "consecutive deadline continuations"
++    else:
++        script = [
++            _mock_tool("set_work_deadline",
++                       {"until": _future_iso(), "goal": "wrap it"}, "call_1"),
++            _mock_text("first pass"),
++            _mock_tool("finish_work", {"reason": "goal fully met"}, "call_2"),
++        ]
++        expected_calls, expected_note = 3, "goal fully met"
++    result = _run_loop(agent, script)
++    assert agent.client.chat.completions.create.call_count == expected_calls
++    assert expected_note in result["final_response"]
++    _assert_complete_pairs(result["messages"])
++
++
++def test_loop_max_iterations_ceiling_beats_deadline_floor(loop_factory):
++    """The floor must not buy extra iterations, and the kept answer survives."""
++    agent = loop_factory(max_iterations=2)
++    result = _run_loop(agent, [
++        _mock_tool("set_work_deadline",
++                   {"until": _future_iso(), "goal": "keep polishing"}, "call_1"),
++        _mock_text("first and only"),
++    ])
++    assert agent.client.chat.completions.create.call_count == 2
++    assert result["final_response"] == "first and only"
++
++
++def test_loop_run_budget_ceiling_beats_deadline_floor(loop_factory, monkeypatch):
++    """An elapsed run budget ends the turn at the next boundary: the set tool
++    round is followed by no further model call, and the note (not a nudge) wins."""
++    agent = loop_factory(run_budget_seconds=3600)
++    real_now = time.time()
++    monkeypatch.setattr(
++        wd, "time", SimpleNamespace(time=lambda: real_now + 10_000))
++    result = _run_loop(agent, [
++        _mock_tool("set_work_deadline",
++                   {"until": _future_iso(), "goal": "long haul"}, "call_1"),
++    ])
++    assert agent.client.chat.completions.create.call_count == 1
++    assert "budget" in result["final_response"].lower()
++    assert "finish_work(reason)" not in result["final_response"]
++
++
++def test_finish_text_response_propagates_terminal_stop_note(monkeypatch):
++    """Real ``finish_text_response`` must deliver a terminal StopGateVerdict note.
++
++    Regression for a dropped ``_sg.final_response``: the stop gate carries the
++    reason in the verdict, and this exact handoff (line ``final_response =
++    _sg.final_response``) is what puts it in front of the user and into the
++    durable transcript. Runs without the full loop (phase-unit doubles only).
++    """
++    _stub_conversation_loop(monkeypatch)
++    agent = _GateAgent()
++    agent.api_mode = "chat_completions"
++    agent.quiet_mode = True
++    agent.valid_tool_names = set()
++    agent._mute_post_response = True
++    agent._has_content_after_think_block = lambda _text: True
++    agent._strip_think_blocks = lambda text: text
++    agent._emit_pending_fallback_notice = lambda: None
++    agent._clear_status_buffer = lambda: None
++    agent._build_assistant_message = lambda _msg, _reason: {
++        "role": "assistant", "content": "stuck here"}
++    _set_deadline(agent, goal="unblock the release")
++    assert json.loads(
++        wd.finish_work(agent, {"reason": "waiting on human review"}))["success"] is True
++
++    verdict = finish_text_response(
++        agent, assistant_message=SimpleNamespace(content="stuck here", tool_calls=None),
++        response=None, finish_reason="stop",
++        messages=[{"role": "user", "content": "go"}],
++        api_messages=[], conversation_history=[], api_call_count=2,
++        user_message="go", active_system_prompt="sys", final_response=None,
++        _turn_exit_reason=None, _preflight_compression_blocked=False,
++        codex_ack_continuations=0, truncated_response_parts=[],
++        length_continue_retries=0, _pending_verification_response=None,
++        _pending_verification_response_previewed=False,
++    )
++    assert verdict.action == "break"
++    assert "waiting on human review" in verdict.final_response
++    assert "stuck here" in verdict.final_response
++    assert agent.flushed, "terminal answer must be flushed before leaving the loop"
++    assert agent.flushed[0][-1]["role"] == "assistant"
++    assert "waiting on human review" in agent.flushed[0][-1]["content"]
++
++
++def test_deadline_survives_compression_child_publish(tmp_path, monkeypatch):
++    """A compression rotation must carry the deadline via the init-config mirror.
++
++    The child row is published with ``agent._session_init_model_config`` as its
++    model_config, so ``hydrate`` on a fresh agent must adopt the same deadline
++    and re-mirror it into the fresh agent's init dict. A successful clear
++    removes the mirror; a failed clear leaves memory, row, and mirror intact.
++
++    The ``conversation_loop`` sys.modules seed covers only nudge constants
++    lazily imported by the message-write path (missing third-party logging dep
++    in this venv); SessionDB publish/hydrate and all deadline code are real.
++    """
++    _stub_conversation_loop(monkeypatch)
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / "compress.db")
++    try:
++        db.ensure_session("sess-rot-parent", source="cli")
++        owner = _db_agent(db, "sess-rot-parent")
++        owner._session_init_model_config = {}
++        assert _set_deadline(owner, goal="survive rotation")["success"] is True
++        assert owner._session_init_model_config["work_deadline"] == {
++            "until": owner._work_deadline_until, "goal": "survive rotation"}
++
++        db.publish_compression_child(
++            parent_session_id="sess-rot-parent", child_session_id="sess-rot-child",
++            source="cli", messages=[{"role": "user", "content": "hi", "timestamp": 1.0}],
++            model_config=owner._session_init_model_config,
++            require_compression_lease=False)
++
++        fresh = _db_agent(db, "sess-rot-child")
++        fresh._session_init_model_config = {}
++        assert wd.active_deadline(fresh) is None
++        wd.hydrate_work_deadline(fresh)
++        assert wd.active_deadline(fresh) == wd.active_deadline(owner)
++        assert fresh._session_init_model_config["work_deadline"] == \
++            owner._session_init_model_config["work_deadline"]
++
++        # Successful clear removes the row key and the mirror.
++        assert json.loads(
++            wd.set_work_deadline(owner, {"until": "none"}))["success"] is True
++        assert "work_deadline" not in owner._session_init_model_config
++        assert db.get_session_model_config_value(
++            "sess-rot-parent", "work_deadline") is None
++
++        # Failed clear restores memory and leaves row and mirror unchanged.
++        assert _set_deadline(owner, goal="second wind")["success"] is True
++        mirrored = dict(owner._session_init_model_config["work_deadline"])
++
++        class _FailingDB:
++            def patch_session_model_config(self, _sid, _patch):
++                raise RuntimeError("disk gone")
++
++        real_db = owner._session_db
++        owner._session_db = _FailingDB()
++        try:
++            payload = json.loads(wd.set_work_deadline(owner, {"until": "none"}))
++        finally:
++            owner._session_db = real_db
++        assert payload["success"] is False
++        assert wd.active_deadline(owner) is not None
++        assert owner._session_init_model_config["work_deadline"] == mirrored
++        assert db.get_session_model_config_value(
++            "sess-rot-parent", "work_deadline") is not None
++    finally:
++        db.close()
+diff --git a/tools/delegate_tool_fork.py b/tools/delegate_tool_fork.py
+index 075dc8c8..ef935396 100644
+--- a/tools/delegate_tool_fork.py
++++ b/tools/delegate_tool_fork.py
+@@ -55,6 +55,8 @@ _FORK_BLOCKED_TOOL_REASONS = {
+     "memory": "no writes to shared MEMORY.md from a forked child",
+     "send_message": "no cross-platform side effects from a forked child",
+     "cronjob_manage": "no scheduling more work in the parent's name from a forked child",
++    "set_work_deadline": "the parent owns the work deadline",
++    "finish_work": "the parent owns the work deadline",
+ }
+ 
+ _SCHEMA_JSON_CAP = 4000
+diff --git a/tools/delegate_tool_toolsets.py b/tools/delegate_tool_toolsets.py
+index be75cf95..f55cc239 100644
+--- a/tools/delegate_tool_toolsets.py
++++ b/tools/delegate_tool_toolsets.py
+@@ -18,6 +18,8 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
+         "memory",  # no writes to shared MEMORY.md
+         "send_message",  # no cross-platform side effects
+         "cronjob_manage",  # no scheduling more work in the parent's name
++        "set_work_deadline",  # the parent owns the work deadline
++        "finish_work",  # the parent owns the work deadline
+     ]
+ )
+ DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+diff --git a/tools/work_deadline_tool.py b/tools/work_deadline_tool.py
+new file mode 100644
+index 00000000..e5b497e5
+--- /dev/null
++++ b/tools/work_deadline_tool.py
+@@ -0,0 +1,91 @@
++"""Work-deadline tool schemas (``set_work_deadline`` / ``finish_work``).
++
++Schemas live in the registry under the ``work_deadline`` toolset so discovery,
++toolsets, and session filtering see them; execution is agent-level (live agent
++state + session persistence) via ``agent/inline_tool_executors.py`` and is
++refused here, the same split ``todo_list``/``memory`` use.
++"""
++
++from __future__ import annotations
++
++from agent.work_deadline import FINISH_WORK_NAME, SET_WORK_DEADLINE_NAME, WORK_DEADLINE_TOOLSET
++from utils import is_truthy_value
++
++SET_WORK_DEADLINE_SCHEMA = {
++    "name": SET_WORK_DEADLINE_NAME,
++    "description": (
++        "Set a self-managed work deadline: keep working toward the goal until the given "
++        "local time instead of ending the turn at the first final answer. Call this when "
++        "the user asks you to keep working until a time (e.g. 'work until 18:00'). Calling "
++        "again replaces the deadline; pass until=\"none\" to clear it. "
++        "To stop before the deadline, call finish_work with a reason."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "until": {
++                "type": "string",
++                "description": (
++                    'Local wall-clock "HH:MM" (today, or tomorrow if already past), '
++                    'an ISO datetime, or "none" to clear the deadline.'
++                ),
++            },
++            "goal": {
++                "type": "string",
++                "description": (
++                    "What to keep working toward (required, unless until is \"none\")."
++                ),
++            },
++        },
++        "required": ["until"],
++    },
++}
++
++FINISH_WORK_SCHEMA = {
++    "name": FINISH_WORK_NAME,
++    "description": (
++        "End a work deadline early. The ONLY way to stop before the deadline: call with "
++        "the reason (blocked on a human decision, environment broken, goal fully met with "
++        "nothing sensible left). The reason is logged and shown to the user."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "reason": {
++                "type": "string",
++                "description": "Why the work stops before the deadline.",
++            },
++        },
++        "required": ["reason"],
++    },
++}
++
++
++def check_work_deadline_requirements() -> bool:
++    """Available unless ``agent.deadline_enabled`` is false (config-wide, cache-safe)."""
++    try:
++        from hermes_cli.config import load_config_readonly
++        section = load_config_readonly().get("agent") or {}
++        raw = section.get("deadline_enabled", True)
++    except Exception:
++        return True
++    if isinstance(raw, bool):
++        return raw
++    return bool(is_truthy_value(raw, default=True))
++
++
++from tools.registry import registry, tool_error
++
++registry.register(
++    name=SET_WORK_DEADLINE_NAME, toolset=WORK_DEADLINE_TOOLSET, schema=SET_WORK_DEADLINE_SCHEMA,
++    check_fn=check_work_deadline_requirements,
++    handler=lambda args, **kw: tool_error(
++        f"{SET_WORK_DEADLINE_NAME} must be handled by the agent loop"),
++    emoji="⏳")
++
++registry.register(
++    name=FINISH_WORK_NAME, toolset=WORK_DEADLINE_TOOLSET, schema=FINISH_WORK_SCHEMA,
++    check_fn=check_work_deadline_requirements,
++    handler=lambda args, **kw: tool_error(
++        f"{FINISH_WORK_NAME} must be handled by the agent loop"),
++    emoji="🏁")
+diff --git a/toolsets.py b/toolsets.py
+index 26ff03da..0c1764bf 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -25,6 +25,7 @@ _HERMES_CORE_TOOLS = [
+     "session_search",
+     "clarify",
+     "execute_code", "delegate_task",
++    "set_work_deadline", "finish_work",
+     "cronjob_manage",
+     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+     "kanban_show", "kanban_list",
+@@ -124,6 +125,12 @@ TOOLSETS = {
+     ),
+     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
+     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
++    "work_deadline": _ts(
++        "Self-managed work deadline — keep working toward a goal until a wall-clock "
++        "time (set_work_deadline) with finish_work as the only early exit. The parent "
++        "owns the deadline; never offered to delegated children.",
++        ["set_work_deadline", "finish_work"],
++    ),
+     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+     "context_engine": _ts("Runtime tools exposed by the active context engine"),
+     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
+-- 
+2.54.0.windows.1
+

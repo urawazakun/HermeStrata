@@ -1,0 +1,1494 @@
+From 5e18098412af3e34a9683dba6d7cff4084f61aab Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 19:53:03 +0900
+Subject: [PATCH] feat(serve): add opt-in prefix keeper for stable chat history
+
+---
+ serve/server.py      | 591 +++++++++++++++++++++++++++++++-
+ serve/test_server.py | 777 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 1364 insertions(+), 4 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 2634b52..cf90d4d 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -13,6 +13,8 @@ embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (ag
+ converted to PNG first with Pillow.
+ Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
+ An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
++--prefix-keeper (default off) remembers the last forwarded chat requests and repairs pruned history and volatile
++system lines append-only, so the engine's conversation cache keeps resuming its tip.
+ 
+ The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
+ `StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
+@@ -22,6 +24,8 @@ from __future__ import annotations
+ 
+ import argparse
+ import collections
++import copy
++import difflib
+ import base64
+ import hashlib
+ import json
+@@ -43,6 +47,7 @@ sys.path.insert(0, str(ROOT / "tools"))
+ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                             images_of, openai_to_messages)
++from serve.frontend import _has_image  # noqa: E402  (keeper id wrapper mirrors anthropic_to_messages' image path)
+ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+ 
+ IM_END = "<|im_end|>"
+@@ -802,10 +807,543 @@ def validate_cache_inventory(begin: dict, memory: list, disk_items: list) -> Non
+         raise ValueError("cache tip bytes exceed the budget")
+ 
+ 
++def _keeper_openai_request(req: dict) -> tuple:
++    """openai_to_messages + id annotation (server-only; the template ignores the extra keys). Assistant tool
++    calls keep their `id`, tool messages keep `tool_call_id`. Mapping is 1:1 with the raw messages."""
++    messages, tools, kw = openai_to_messages(req)
++    try:
++        for norm, raw in zip(messages, req.get("messages", [])):
++            if not isinstance(raw, dict):
++                continue
++            tcs, rtcs = norm.get("tool_calls"), raw.get("tool_calls")
++            if tcs and isinstance(rtcs, list):
++                for tc, rtc in zip(tcs, rtcs):
++                    if isinstance(rtc, dict) and rtc.get("id") is not None:
++                        tc["id"] = rtc["id"]
++            if norm.get("role") == "tool" and raw.get("tool_call_id") is not None:
++                norm["tool_call_id"] = raw["tool_call_id"]
++    except Exception:
++        pass
++    for m in messages:
++        if isinstance(m, dict):
++            m.pop("_keeper_injected", None)   # clients can never mint keeper provenance
++    return messages, tools, kw
++
++
++def _keeper_anthropic_request(req: dict) -> tuple:
++    """anthropic_to_messages + id annotation (server-only). tool_use blocks keep `id` on their call, tool_result
++    blocks keep `tool_use_id` on their message. The cursor mirrors anthropic_to_messages' block splitting."""
++    messages, tools, kw = anthropic_to_messages(req)
++    try:
++        cur = 1 if req.get("system") else 0
++        for raw in req.get("messages", []):
++            content = raw.get("content") if isinstance(raw, dict) else None
++            if isinstance(content, str) or (raw.get("role") == "user" and _has_image(content) and not any(
++                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content)):
++                cur += 1
++                continue
++            blocks = content if isinstance(content, list) else []
++            for b in blocks:
++                if isinstance(b, dict) and b.get("type") == "tool_result" and cur < len(messages):
++                    tid = b.get("tool_use_id") or b.get("id")
++                    if tid:
++                        messages[cur]["tool_call_id"] = tid
++                    cur += 1
++            uses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
++            text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
++            think = "".join(b.get("thinking", "") for b in blocks
++                            if isinstance(b, dict) and b.get("type") == "thinking")
++            if (text or uses or think) and cur < len(messages):
++                for tc, u in zip(messages[cur].get("tool_calls") or [], uses):
++                    if u.get("id"):
++                        tc["id"] = u["id"]
++                cur += 1
++    except Exception:
++        pass
++    for m in messages:
++        if isinstance(m, dict):
++            m.pop("_keeper_injected", None)   # clients can never mint keeper provenance
++    return messages, tools, kw
++
++
++# ------------------------------------------------------------------------------------------------ prefix keeper
++# `--prefix-keeper` (also STRATA_PREFIX_KEEPER=1), default OFF: keep every forwarded chat request append-only so
++# the engine's conversation cache keeps resuming its tip instead of restarting cold (`resume from none`).
++# Motivated by Hermes' volatile system tail (workspace git snapshot, breaks the root every session) and history
++# pruning (a forked child's return once shortened its parent 19521 -> 17603 tokens). The keeper stores the last
++# N forwarded requests (messages + tools + template kwargs, deep-copied, bounded LRU) and repairs each new
++# non-aux request on either endpoint, streaming or not, before `prepare` (aux bypasses entirely; repair runs
++# after the MCP merge against the actually forwarded tools):
++#   system: a stored system message under the same tools[], differing only in volatile lines (<= 8 changed
++#     lines AND <= 5% of its stored lines), is sent unchanged, with `- old` / `+ new` pairs appended to the END
++#     of the last message as `\n\n[context update]\n...` (full lines; also across sessions, prior conversation
++#     untouched). Bigger rewrites with related history are logged mutations, never silent.
++#   history: removed/shortened earlier messages (truncations, same-identity summaries) are re-inserted so the
++#     request is exactly stored + appended - but only when the repaired prompt, rendered with the server's own
++#     template and tokenizer, still fits max_context - 8192 tokens, else Hermes' version goes unchanged.
++# Anything else (reordered/changed messages or calls, changed tools) forwards unchanged and atomic (then even
++# the system is left alone), with a mutation logged. Every repair and detected non-append mutation logs one
++# stderr line (`strata serve: keeper <kind> msg=<i> ...`, CR/LF escaped) plus one JSON row in
++# `prefix-keeper.jsonl` next to the engine log (request id, kind, index, UTF-8 bytes before/after, bounded short
++# diff - never full prompts); both sinks serialize on one lock, and engines without a log file (mock) log to
++# stderr only. Repairs reuse stored-message bytes verbatim and never mutate the requester's objects, so the
++# forwarded prefix is exactly what the engine cached - including stale `[context update]` blocks mid-history,
++# which is what lets the NEXT turn align (Hermes never sees our blocks; each injected block carries
++# `_keeper_injected` provenance with its raw text, matched explicitly - client text resembling the tag is never
++# stripped, on either side). Multimodal (list-content) requests bypass the keeper entirely, so estimating a
++# repair never touches the vision encoder or GPU.
++KEEPER_CAPACITY = 32            # last forwarded requests kept (STRATA_PREFIX_KEEPER_CAPACITY / --prefix-keeper-capacity)
++KEEPER_RESERVE = 8192           # a repaired prompt must fit max_context - this many tokens
++KEEPER_MAX_SYS_LINES = 8        # a system message may differ by this many changed lines at most
++KEEPER_MAX_SYS_FRAC = 0.05      # ... and by this fraction of its stored lines at most
++KEEPER_TAG = "\n\n[context update]\n"
++KEEPER_DIFF_CHARS = 600         # bound on the diff text in both log sinks
++
++
++def _keeper_nometa(m: dict) -> dict:
++    """A message's non-content fields for comparison, excluding the keeper's private provenance field (client
++    metadata - role, reasoning, call structures and ids - must all match; the provenance field never does)."""
++    return {k: v for k, v in m.items() if k not in ("content", "_keeper_injected")}
++
++
++def _keeper_same_base(a: dict, b: dict) -> bool:
++    """Same message modulo keeper-injected continuity: `a` is the stored forwarded message, `b` the new one.
++    Exact content matches, or `a` carries `_keeper_injected` provenance (raw+suffix recorded when the keeper
++    appended the block) and `b` equals that raw text - Hermes never saw the block, so its echo lacks it. Client
++    text resembling the tag is compared literally and never stripped, on either side."""
++    if _keeper_nometa(a) != _keeper_nometa(b):
++        return False
++    ca, cb = a.get("content"), b.get("content")
++    if ca == cb:
++        return True
++    if not (isinstance(ca, str) and isinstance(cb, str)):
++        return False
++    f = a.get("_keeper_injected")
++    return isinstance(f, dict) and f.get("raw") == cb and ca == cb + (f.get("suffix") or "")
++
++
++def _keeper_bytes(messages: list) -> int:
++    """Approximate request size: UTF-8 bytes of text contents plus rendered tool calls."""
++    n = 0
++    for m in messages:
++        c = m.get("content")
++        if isinstance(c, str):
++            n += len(c.encode("utf-8"))
++        for tc in m.get("tool_calls") or []:
++            n += len(json.dumps(tc, ensure_ascii=False).encode("utf-8"))
++    return n
++
++
++def _keeper_system_delta(old: str, new: str) -> tuple:
++    """Volatile-line deltas as `- old` / `+ new` pairs, one pair per changed line (insertions/deletions unpaired),
++    with FULL lines for the model - only the logs are bounded. -> (deltas or None when too big, changed count).
++    Changed lines per hunk count as max(old lines, new lines); an empty stored system never fuzzy-matches."""
++    a, b = old.splitlines(), new.splitlines()
++    if a == b:
++        return [], 0
++    if not a:
++        return None, len(b)
++    changed, diff = 0, []
++    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
++        if tag == "equal":
++            continue
++        changed += max(i2 - i1, j2 - j1)
++        old_lines, new_lines = a[i1:i2], b[j1:j2]
++        for k in range(max(len(old_lines), len(new_lines))):
++            if k < len(old_lines):
++                diff.append("- " + old_lines[k])
++            if k < len(new_lines):
++                diff.append("+ " + new_lines[k])
++    if changed > KEEPER_MAX_SYS_LINES or changed > KEEPER_MAX_SYS_FRAC * len(a):
++        return None, changed
++    return diff, changed
++
++
++def _keeper_same(a: dict, b: dict) -> bool:
++    """Byte-identical normalized messages (roles, contents, assistant call structures)."""
++    return a == b
++
++
++def _keeper_identity(m: dict):
++    """A message's nonempty tool identity, or None: assistant call ids, or a tool message's tool_call_id."""
++    tcs = m.get("tool_calls") or []
++    if tcs:
++        ids = tuple(c.get("id") for c in tcs if isinstance(c, dict))
++        if len(ids) == len(tcs) and all(isinstance(x, str) and x for x in ids):
++            return ("calls", ids)
++        return None
++    tid = m.get("tool_call_id")
++    return ("tool", tid) if isinstance(tid, str) and tid else None
++
++
++def _keeper_shortened(s: dict, n: dict) -> bool:
++    """`n` is a shortened form of stored `s`: every non-content field (role, reasoning, call structures AND ids,
++    provenance excluded) must match exactly; then, against the stored text - the provenance raw when the keeper
++    injected a block, else the literal content - a strict non-empty truncation for anchored plain text, or any
++    shorter text only with the same nonempty tool identity (same-identity summary)."""
++    if _keeper_nometa(s) != _keeper_nometa(n):
++        return False
++    cs, cn = s.get("content"), n.get("content")
++    if not isinstance(cs, str) or not isinstance(cn, str) or not cn:
++        return False
++    f = s.get("_keeper_injected")
++    base = f.get("raw") if isinstance(f, dict) and isinstance(f.get("raw"), str) else cs
++    if cn == base or len(cn) >= len(base):
++        return False
++    sid, nid = _keeper_identity(s), _keeper_identity(n)
++    if sid is not None and sid == nid:
++        return True
++    return base.startswith(cn)
++
++
++def _keeper_describe(s: dict, n: dict) -> str:
++    """Short reason a message pair is a change, not a removal/shortening (bounded by the caller)."""
++    if s.get("role") != n.get("role"):
++        return f"role {s.get('role')!r}!={n.get('role')!r}"
++    if s.get("tool_call_id") != n.get("tool_call_id"):
++        return f"tool_call_id changed {s.get('tool_call_id')!r}!={n.get('tool_call_id')!r}"
++    if (s.get("tool_calls") or []) != (n.get("tool_calls") or []):
++        def sig(c):
++            fn = (c.get("function") or {}) if isinstance(c, dict) else {}
++            return (c.get("id") if isinstance(c, dict) else None, fn.get("name"),
++                    json.dumps(fn.get("arguments"), ensure_ascii=False, sort_keys=True)[:80])
++        sn = [sig(c) for c in (s.get("tool_calls") or [])]
++        nn = [sig(c) for c in (n.get("tool_calls") or [])]
++        if [x[1] for x in sn] != [x[1] for x in nn]:
++            return f"tool_calls changed {[x[1] for x in sn]!r}!={[x[1] for x in nn]!r}"
++        return f"tool_call ids/args changed {sn!r}!={nn!r}"
++    if s.get("reasoning_content") != n.get("reasoning_content"):
++        return "reasoning changed"
++    return "content changed"
++
++
++def _keeper_related(S: list, N: list) -> bool:
++    """Identity evidence linking new history to stored history: a shared nonempty tool identity (call ids or a
++    tool_call_id). Plain-text coincidence alone is not relation."""
++    ids = set()
++    for s in S:
++        sid = _keeper_identity(s)
++        if sid is not None:
++            ids.add(sid)
++    return any(_keeper_identity(m) in ids and _keeper_identity(m) is not None for m in N)
++
++
++def _keeper_align(S: list, N: list) -> tuple:
++    """Align stored history S with new history N (system already handled). -> (status, ops, j, note, at) where
++    ops is match/shorten/restore/append with stored/new indices, j the consumed new count, `at` the N index to
++    log. "ok" means N is stored minus removals/shortenings plus appends; "mutation" means a change, reorder
++    (including a stored message re-sent in the appended tail), ambiguity or identity-linked divergence after j
++    aligned pairs; "unrelated" means zero alignment and zero identity evidence (a fresh conversation)."""
++    ops, i, j = [], 0, 0
++    while i < len(S) and j < len(N):
++        s, n = S[i], N[j]
++        if _keeper_same(s, n) or _keeper_same_base(s, n):
++            ops.append(("match", i, j))
++            i, j = i + 1, j + 1
++            continue
++        if _keeper_shortened(s, n):
++            ops.append(("shorten", i, j))
++            i, j = i + 1, j + 1
++            continue
++        ks = [k for k in range(i + 1, len(S)) if _keeper_same(S[k], n) or _keeper_same_base(S[k], n)]
++        if len(ks) == 1:                        # earlier stored messages removed: re-insert them
++            for r in range(i, ks[0]):
++                ops.append(("restore", r))
++            i = ks[0]
++            continue
++        tail = [("append", a) for a in range(j, len(N))]   # divergence keeps the new tail (never dropped)
++        if len(ks) > 1:
++            # the same stored content twice: an ambiguous move, never a removal
++            return ("mutation", ops + tail, j, "ambiguous alignment", j)
++        if any(_keeper_same(S[i], m) or _keeper_same_base(S[i], m) for m in N[j + 1:]):
++            return ("mutation", ops + tail, j, "insertion/reorder", j)
++        if j or _keeper_related(S, N):          # first-divergence with identity evidence is a change, not fresh
++            return ("mutation", ops + tail, j, _keeper_describe(s, n), j)
++        return ("unrelated", ops + tail, j, "", j)
++    for r in range(i, len(S)):
++        ops.append(("restore", r))              # a truncated tail is restored too
++    for a in range(j, len(N)):
++        ops.append(("append", a))
++    if not sum(1 for o in ops if o[0] in ("match", "shorten")):
++        return ("mutation" if _keeper_related(S, N) else "unrelated", ops, j, "", j)
++    used = {o[1] for o in ops if o[0] in ("match", "shorten", "restore")}
++    for o in ops:
++        if o[0] == "append" and any(_keeper_same_base(S[k], N[o[1]]) for k in used):
++            return ("mutation", ops, j, "moved/reordered message", o[1])   # a stored message re-sent later
++    return ("ok", ops, j, "", j)
++
++
++def _keeper_exact_repeat(e: dict, plan: dict, messages: list) -> bool:
++    """A repeated logical request: no appends, and the stored last message's injected suffix is exactly the
++    current delta block over the incoming last message's raw text. Forwarding the stored bytes then repeats the
++    identical logical request instead of stacking another block; a genuinely new delta still fails safe."""
++    if not plan["deltas"] or any(o[0] == "append" for o in plan["ops"]):
++        return False
++    S, N = e["messages"], messages
++    if not S or not N:
++        return False
++    f = S[-1].get("_keeper_injected")
++    raw = N[-1].get("content")
++    return isinstance(f, dict) and isinstance(raw, str) and \
++        f.get("suffix") == KEEPER_TAG + "\n".join(plan["deltas"]) and f.get("raw") == raw and \
++        S[-1].get("content") == raw + f.get("suffix")
++
++
++def _keeper_plan(S: list, N: list) -> dict:
++    """Full repair plan for stored S vs new N: system deltas plus history alignment. "nomatch" = different world
++    (system appeared/vanished/rewritten, multimodal); history never resurrects on "unrelated"."""
++    s_sys = S[0] if S and S[0].get("role") == "system" else None
++    n_sys = N[0] if N and N[0].get("role") == "system" else None
++    if (s_sys is None) != (n_sys is None):
++        return {"verdict": "nomatch"}
++    deltas, sys_rewrite = [], None
++    if s_sys is not None:
++        if not _keeper_same(s_sys, n_sys):
++            cs, cn = s_sys.get("content"), n_sys.get("content")
++            if not isinstance(cs, str) or not isinstance(cn, str):
++                return {"verdict": "nomatch"}
++            deltas, changed = _keeper_system_delta(cs, cn)
++            if deltas is None:
++                sys_rewrite = changed     # decided below: mutation when the history is related, else silent
++    off = 1 if s_sys is not None else 0
++    S_hist, N_hist = S[off:], N[off:]
++    status, ops, j, note, at = _keeper_align(S_hist, N_hist)
++    if sys_rewrite is not None:           # a big system rewrite is a non-append mutation, not a new world...
++        if status in ("ok", "mutation"):  # ...when the same history relates; unrelated sessions stay silent
++            return {"verdict": "mutation", "deltas": [], "ops": ops, "j": j,
++                    "note": f"system rewritten ({sys_rewrite} changed lines)", "at": 0, "sys": True}
++        return {"verdict": "nomatch"}
++    if status == "ok":                    # a plain first-message shortening alone proves nothing: it needs an
++        for o in ops:                     # unchanged anchor elsewhere or a shared tool id, else it may be fresh
++            if o[0] == "shorten" and _keeper_identity(S_hist[o[1]]) is None and \
++                    not any(p[0] == "match" for p in ops) and not _keeper_related(S_hist, N_hist):
++                return {"verdict": "mutation", "deltas": [], "ops": ops, "j": j,
++                        "note": "unanchored shortened message", "at": off + o[2], "sys": s_sys is not None}
++    return {"verdict": status, "deltas": deltas, "ops": ops, "j": j, "note": note, "at": off + at,
++            "sys": s_sys is not None}
++
++class PrefixKeeper:
++    """Bounded in-memory LRU of forwarded chat requests with append-only repair (see the section comment). All
++    methods are fail-safe: any internal error forwards Hermes' version unchanged. Thread-safe via one lock with
++    short critical sections (rendering and logging happen outside it)."""
++
++    def __init__(self, capacity: int = KEEPER_CAPACITY, enabled: bool = True, log_path=None):
++        self.capacity = max(1, int(capacity or KEEPER_CAPACITY))
++        self.enabled = bool(enabled)
++        self.log_path = log_path                # explicit prefix-keeper.jsonl path (tests); else engine log sibling
++        self.lock = threading.Lock()
++        self.log_lock = threading.Lock()      # stderr + jsonl appends serialize here (one event, one line each)
++        self.entries: collections.OrderedDict = collections.OrderedDict()   # req id -> stored request
++
++    def repair(self, svc, messages: list, tools, kw: dict) -> tuple:
++        """-> (forward messages, forward tools): the repaired request, or the original objects untouched."""
++        if any(isinstance(m.get("content"), list) for m in messages):
++            return messages, tools               # multimodal: passthrough, never estimate (no vision/GPU touch)
++        req_id = uuid.uuid4().hex[:12]
++        before = _keeper_bytes(messages)
++        with self.lock:
++            cands = list(self.entries.items())[::-1]    # most recent first
++        best = None                 # strongest related candidate: (prefix, identity, rank, key, entry, plan)
++        sys_only = None             # most recent same-config system-only repair candidate
++        rank = -1
++        for key, e in cands:        # most recent first; rank 0 wins ties after identity evidence
++            rank += 1
++            if any(isinstance(m.get("content"), list) for m in e["messages"]):
++                continue
++            plan = _keeper_plan(e["messages"], messages)
++            if plan["verdict"] == "nomatch":
++                continue
++            if plan["verdict"] == "unrelated":
++                if plan["deltas"] and sys_only is None and e["tools"] == tools and e["kw"] == kw:
++                    sys_only = (key, e, plan)
++                continue
++            off = 1 if plan["sys"] else 0   # longest CONSECUTIVE common prefix, not subsequence count
++            prefix = 0
++            for o in plan["ops"]:
++                if o[0] not in ("match", "shorten"):
++                    break
++                prefix += 1
++            s_ids = {_keeper_identity(m) for m in e["messages"]}   # shared ids anywhere in BOTH histories:
++            s_ids.discard(None)                                    # a mutation stops before C, so aligned ops
++            n_ids = {_keeper_identity(m) for m in messages}        # alone would hide the relation; the full
++            n_ids.discard(None)                                    # intersection does not (roles/types in identity)
++            ident = len(s_ids & n_ids)
++            if best is None or (prefix, ident, -rank) > (best[0], best[1], -best[2]):
++                best = (prefix, ident, rank, key, e, plan)
++        try:
++            if best is not None:
++                # the related candidate first, then its verdict decides: a cfg mismatch or mutation in the
++                # strongest candidate is never overruled by an older repair
++                _, _, _, key, e, plan = best
++                off = 1 if plan["sys"] else 0
++                if e["tools"] != tools or e["kw"] != kw:
++                    what = "/".join(x for x, same in (("tools", e["tools"] == tools),
++                                                      ("options", e["kw"] == kw)) if not same)
++                    self._log(svc, "mutation-unrepaired", req_id, plan["at"],
++                              before, before, f"{what} changed")
++                    return messages, tools
++                if plan["verdict"] == "mutation":
++                    self._log(svc, "mutation-unrepaired", req_id, plan["at"],
++                              before, before, plan["note"])
++                    return messages, tools
++                hist = e["messages"][off:]
++                if not plan["deltas"] and all(o[0] in ("match", "append") for o in plan["ops"]) and \
++                        all(hist[o[1]] == messages[off + o[2]] for o in plan["ops"] if o[0] == "match"):
++                    with self.lock:              # already stored + appended, byte-identical: silent, no render
++                        if key in self.entries:
++                            self.entries.move_to_end(key)
++                    return messages, tools
++                if plan["deltas"] and not any(o[0] == "append" for o in plan["ops"]) and \
++                        not _keeper_exact_repeat(e, plan, messages):
++                    self._log(svc, "mutation-unrepaired", req_id, 0, before, before,
++                              "system delta unrepairable without touching the stored prefix")
++                    return messages, tools
++                repaired, first = self._build(e, plan, messages)
++                if not repaired:
++                    return messages, tools
++                after = _keeper_bytes(repaired)
++                if not self._budget_ok(svc, repaired, tools, kw, req_id, before, after):
++                    return messages, tools
++                with self.lock:
++                    if key in self.entries:
++                        self.entries.move_to_end(key)
++                if plan["deltas"]:
++                    self._log(svc, "system-delta", req_id, 0, before, after, "; ".join(plan["deltas"]))
++                if first >= 0:
++                    n_r = sum(1 for o in plan["ops"] if o[0] == "restore")
++                    n_s = sum(1 for o in plan["ops"] if o[0] == "shorten")
++                    n_a = sum(1 for o in plan["ops"] if o[0] == "append")
++                    self._log(svc, "history-restore", req_id, first, before, after,
++                              f"restored={n_r} shortened={n_s} appended={n_a}")
++                return repaired, tools
++            if sys_only is not None:
++                _, e, plan = sys_only
++                if plan["deltas"] and not any(o[0] == "append" for o in plan["ops"]) and \
++                        not _keeper_exact_repeat(e, plan, messages):
++                    self._log(svc, "mutation-unrepaired", req_id, 0, before, before,
++                              "system delta unrepairable without touching the stored prefix")
++                    return messages, tools
++                repaired, _ = self._build(e, plan, messages)
++                if not repaired:
++                    return messages, tools
++                after = _keeper_bytes(repaired)
++                if not self._budget_ok(svc, repaired, tools, kw, req_id, before, after):
++                    return messages, tools
++                self._log(svc, "system-delta", req_id, 0, before, after, "; ".join(plan["deltas"]))
++                return repaired, tools
++            return messages, tools
++        except Exception as e2:                  # the keeper never breaks a request
++            print(f"strata serve: keeper error req={req_id} ({e2}); forwarding unchanged", file=sys.stderr,
++                  flush=True)
++            return messages, tools
++
++    @staticmethod
++    def _build(e: dict, plan: dict, messages: list) -> tuple:
++        """Assemble the forwarded list: stored bytes verbatim for match/shorten/restore (exactly what the engine
++        cached, earlier injected blocks included - never reworded or dropped), the request's own messages for
++        appends. A fresh delta block goes ONLY on an actually appended last message (copied first, so the
++        requester's objects are never altered), with `_keeper_injected` provenance recording its raw+suffix; the
++        caller keeps repairs without an appended message out of here. -> (repaired, first restored index or -1).
++        Non-ok verdicts only ever append (never resurrect)."""
++        S = e["messages"]
++        off = 1 if plan["sys"] else 0
++        hist = S[off:]
++        out = []
++        if plan["sys"]:
++            out.append(copy.deepcopy(S[0]))
++        first = -1
++        for op in plan["ops"]:
++            kind = op[0]
++            if kind == "append":
++                msg = messages[off + op[1]]
++                out.append(msg if plan["verdict"] == "ok" else copy.deepcopy(msg))
++            elif plan["verdict"] == "ok":
++                if kind != "match" and first < 0:
++                    first = len(out)
++                elif kind == "match" and first < 0 and hist[op[1]] != messages[off + op[2]]:
++                    first = len(out)      # provenance-alias substitution restores injected text: a repair
++                out.append(copy.deepcopy(hist[op[1]]))
++            # else: an unrelated verdict never resurrects stored messages
++        if plan["deltas"] and out and plan["ops"] and plan["ops"][-1][0] == "append":
++            # A fresh delta block goes ONLY on an actually appended last message. An exact repeat (stored
++            # bytes already carry the identical delta) forwards unchanged - never a stacked second block.
++            last = copy.deepcopy(out[-1])
++            raw = last.get("content") if isinstance(last.get("content"), str) else ""
++            suffix = KEEPER_TAG + "\n".join(plan["deltas"])
++            last["content"] = raw + suffix
++            last["_keeper_injected"] = {"raw": raw, "suffix": suffix}
++            out[-1] = last
++        return out, first
++
++    def _budget_ok(self, svc, repaired: list, tools, kw: dict, req_id: str, before: int, after: int) -> bool:
++        """Budget gate for a repair, estimated with the server's own template+tokenizer (never vision: multimodal
++        never reaches here). True proceeds; False already logged (skip-budget when over, mutation-unrepaired
++        when estimation itself fails) and the caller forwards the original unchanged - never fail-open."""
++        try:
++            n = len(svc.tok.encode(svc.template.render(repaired, tools=tools, **kw), parse_special=True))
++        except Exception as e:
++            self._log(svc, "mutation-unrepaired", req_id, 0, before, after,
++                      f"budget estimate failed ({str(e)[:120]})")
++            return False
++        if n > svc.engine.max_context - KEEPER_RESERVE:
++            self._log(svc, "skip-budget", req_id, 0, before, after,
++                      f"prompt exceeds max_context-{KEEPER_RESERVE}")
++            return False
++        return True
++
++    def remember(self, messages: list, tools, kw: dict) -> None:
++        """Cache a successfully prepared/forwarded request (deep copy; failed validation never reaches here).
++        Multimodal requests are never cached."""
++        if any(isinstance(m.get("content"), list) for m in messages):
++            return
++        try:
++            entry = {"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools),
++                     "kw": copy.deepcopy(kw)}
++        except Exception:
++            return
++        with self.lock:
++            self.entries[uuid.uuid4().hex] = entry
++            while len(self.entries) > self.capacity:
++                self.entries.popitem(last=False)
++
++    def _log_file(self, svc):
++        """prefix-keeper.jsonl next to the engine log, or the explicit override, or None (e.g. the mock engine
++        has no log file: stderr only, by design)."""
++        if self.log_path:
++            return self.log_path
++        lp = getattr(getattr(svc, "engine", None), "log_path", None)
++        if not lp:
++            return None
++        try:
++            return str(Path(lp).parent / "prefix-keeper.jsonl")
++        except Exception:
++            return None
++
++    def _log(self, svc, kind: str, req_id: str, index: int, before: int, after: int, diff: str) -> None:
++        """One stderr line plus one JSONL row per event (index: system-delta 0, history-restore first restored
++        forwarded index, mutation-unrepaired divergence index in the received request, skip-budget 0). The diff
++        is bounded; CR/LF are escaped so one event is always one stderr line."""
++        diff = (diff or "")[:KEEPER_DIFF_CHARS]
++        line = (f"strata serve: keeper {kind} msg={index} req={req_id} bytes={before}->{after} {diff}"
++                .replace("\r", "\\r").replace("\n", "\\n"))
++        with self.log_lock:
++            print(line, file=sys.stderr, flush=True)
++            path = self._log_file(svc)
++            if path is None:
++                return
++            try:
++                with open(path, "a", encoding="utf-8") as f:
++                    f.write(json.dumps({"req": req_id, "kind": kind, "index": index, "before_bytes": before,
++                                        "after_bytes": after, "diff": diff}, ensure_ascii=False) + "\n")
++            except OSError as e:
++                print(f"strata serve: keeper log unavailable ({e})", file=sys.stderr, flush=True)
++
++
+ class Service:
+     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+                  vision: Vision | None = None, sampling_defaults: dict | None = None,
+-                 fit_max_tokens: bool = False):
++                 fit_max_tokens: bool = False, prefix_keeper: bool = False,
++                 prefix_keeper_capacity: int = KEEPER_CAPACITY, prefix_keeper_log=None):
+         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+@@ -824,6 +1362,22 @@ class Service:
+         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
+                             tokenizer.encode("<|endoftext|>", parse_special=True))
++        self.keeper = PrefixKeeper(capacity=prefix_keeper_capacity, enabled=bool(prefix_keeper),
++                                   log_path=prefix_keeper_log)
++
++    def keeper_repair(self, messages, tools, kw):
++        """The prefix keeper's append-only repair (or the inputs untouched when it is off)."""
++        k = getattr(self, "keeper", None)
++        if k is None or not k.enabled:
++            return messages, tools
++        return k.repair(self, messages, tools, kw or {})
++
++    def keeper_remember(self, messages, tools, kw) -> None:
++        """Seed the keeper with a successfully prepared request (a no-op when it is off)."""
++        k = getattr(self, "keeper", None)
++        if k is None or not k.enabled:
++            return
++        k.remember(messages, tools, kw or {})
+ 
+     def set_shared(self, defaults) -> dict:
+         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
+@@ -1630,7 +2184,7 @@ def make_handler(svc: Service):
+ 
+         def _openai(self, req):
+             req = svc.with_shared(req, "openai")
+-            messages, tools, kw = openai_to_messages(req)
++            messages, tools, kw = _keeper_openai_request(req) if svc.keeper.enabled else openai_to_messages(req)
+             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+             aux = is_aux_request(req, tools)      # decided before MCP tools merge in: aux never takes the tool loop
+             if aux:
+@@ -1649,7 +2203,13 @@ def make_handler(svc: Service):
+                 # thinking off, and wait for the main turn before the MCP loop is built - so aux runs once, after
+                 # it, outside any tool loop
+                 kw = {**kw, "enable_thinking": False}
++            if not aux:
++                # prefix keeper: repair AFTER the MCP merge, against the actually forwarded tools, so the
++                # budget estimate covers the full merged prompt (aux still bypasses entirely).
++                messages, tools = svc.keeper_repair(messages, tools, kw)
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
++            if not aux:
++                svc.keeper_remember(messages, tools, kw)   # only prepared requests seed the cache
+             _debug_req("openai-aux" if aux else "openai", req, messages, tools, max_new, thinking, len(ids))
+             cancel = threading.Event()
+             if aux and not svc._yield_to_main_turn(cancel):
+@@ -1683,15 +2243,20 @@ def make_handler(svc: Service):
+ 
+         def _anthropic(self, req):
+             req = svc.with_shared(req, "anthropic")
+-            messages, tools, kw = anthropic_to_messages(req)
++            messages, tools, kw = _keeper_anthropic_request(req) if svc.keeper.enabled else anthropic_to_messages(req)
+             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+             aux = is_aux_request(req, tools)      # no MCP loop on this path; aux just waits for the main request
+             if aux:
+                 # E1/S1: mark the side request so the engine snapshots no tip for it (it still resumes from one).
+                 req = {**req, "strata_aux": True}
++            if not aux:
++                # prefix keeper (no MCP loop on this path; aux just waits for the main request).
++                messages, tools = svc.keeper_repair(messages, tools, kw)
+             if aux:
+                 kw = {**kw, "enable_thinking": False}
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
++            if not aux:
++                svc.keeper_remember(messages, tools, kw)   # only prepared requests seed the cache
+             _debug_req("anthropic-aux" if aux else "anthropic", req, messages, tools, max_new, thinking, len(ids))
+             cancel = threading.Event()
+             if aux and not svc._yield_to_main_turn(cancel):
+@@ -1875,6 +2440,14 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
+     return out
+ 
+ 
++def _keeper_capacity() -> int:
++    """--prefix-keeper-capacity default: STRATA_PREFIX_KEEPER_CAPACITY or 32 (a bad value stays 32)."""
++    try:
++        return max(1, int(os.environ.get("STRATA_PREFIX_KEEPER_CAPACITY", "32")))
++    except (TypeError, ValueError):
++        return KEEPER_CAPACITY
++
++
+ def main() -> int:
+     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+@@ -1895,6 +2468,12 @@ def main() -> int:
+     ap.add_argument("--fit-max-tokens", action="store_true",
+                     help="clamp max_tokens to the remaining context instead of rejecting the request "
+                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
++    ap.add_argument("--prefix-keeper", action="store_true", default=os.environ.get("STRATA_PREFIX_KEEPER") == "1",
++                    help="keep the last forwarded chat requests and repair pruned history / volatile system lines "
++                         "so the engine cache keeps resuming its tip (default off; also STRATA_PREFIX_KEEPER=1)")
++    ap.add_argument("--prefix-keeper-capacity", type=int, default=_keeper_capacity(),
++                    help="how many forwarded requests the prefix keeper remembers "
++                         "(default 32; also STRATA_PREFIX_KEEPER_CAPACITY)")
+     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
+                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
+     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
+@@ -1952,7 +2531,11 @@ def main() -> int:
+     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                   sampling_defaults=sampling_defaults,
+-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
++                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
++                  prefix_keeper=a.prefix_keeper, prefix_keeper_capacity=a.prefix_keeper_capacity)
++    if a.prefix_keeper:
++        print(f"[strata] prefix keeper on: last {a.prefix_keeper_capacity} forwarded requests, append-only repairs",
++              flush=True)
+     svc.api_key = a.api_key or cfg.get("api_key", "")
+     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
+     if a.config:                                        # the Chat settings shared with other apps, from last time
+diff --git a/serve/test_server.py b/serve/test_server.py
+index ff4a460..1a0a2d6 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -4,9 +4,13 @@
+ """
+ from __future__ import annotations
+ 
++import contextlib
++import copy
++import io
+ import json
+ import os
+ import sys
++import tempfile
+ import threading
+ import time
+ import unittest
+@@ -1487,5 +1491,778 @@ class CacheAPI(unittest.TestCase):
+             self.svc.api_key = ""
+ 
+ 
++class PrefixKeeper(unittest.TestCase):
++    """--prefix-keeper: append-only repairs keep the engine cache on its tip (CPU-only).
++
++    Isolated services per test (prefix_keeper=True, temp prefix-keeper.jsonl, port=0 ephemeral
++    HTTP), ByteTokenizer with max_context 65536 unless a test needs the reserve boundary, and the
++    real chat template. Assertions are on actual outcomes - the template-rendered engine prompt,
++    stderr lines and JSONL rows - not on keeper internals.
++    """
++
++    CTX = 65536
++    OAI_TOOLS = [{"type": "function", "function": {"name": "lookup", "description": "d",
++                 "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
++    ANT_TOOLS = [{"name": "lookup", "description": "d", "input_schema": {"type": "object"}}]
++
++    # -- helpers -------------------------------------------------------------
++    def fresh(self, max_context=CTX, capacity=32):
++        tok = ByteTokenizer()
++        eng = RecordingPrompt(tok, "</think>\n\nok", max_context=max_context)
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        log = os.path.join(tmp.name, "prefix-keeper.jsonl")
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
++                      prefix_keeper=True, prefix_keeper_capacity=capacity, prefix_keeper_log=log)
++        httpd = serve(svc, port=0)
++        self.addCleanup(httpd.server_close)
++        self.addCleanup(httpd.shutdown)
++        return svc, eng, log, f"http://127.0.0.1:{httpd.server_address[1]}"
++
++    def bare(self, max_context=CTX, capacity=32):
++        """A keeper service without HTTP (direct repair/remember unit checks)."""
++        tok = ByteTokenizer()
++        eng = MockEngine(tok, "</think>\n\nok", max_context=max_context)
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        log = os.path.join(tmp.name, "prefix-keeper.jsonl")
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
++                      prefix_keeper=True, prefix_keeper_capacity=capacity, prefix_keeper_log=log)
++        return svc, log
++
++    def post(self, base, path, body):
++        req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json"})
++        try:
++            with urllib.request.urlopen(req, timeout=30) as r:
++                return r.status, r.read().decode()
++        except urllib.error.HTTPError as e:
++            with e:
++                return e.code, e.read().decode()
++
++    @staticmethod
++    def prompt(eng):
++        return bytes(i for i in eng.last_ids if i < 256).decode("utf-8", "replace")
++
++    def chat(self, base, api, system, messages, tools=None, stream=False, max_tokens=20, extra=None):
++        if api == "openai":
++            body = {"model": "m",
++                    "messages": ([{"role": "system", "content": system}] if system else []) + messages,
++                    "max_tokens": max_tokens, **(extra or {})}
++            if tools is not None:
++                body["tools"] = tools
++            if stream:
++                body["stream"] = True
++            return self.post(base, "/v1/chat/completions", body)
++        body = {"model": "m", "messages": messages, "max_tokens": max_tokens, **(extra or {})}
++        if system is not None:
++            body["system"] = system
++        if tools is not None:
++            body["tools"] = tools
++        if stream:
++            body["stream"] = True
++        return self.post(base, "/v1/messages", body)
++
++    @staticmethod
++    def system(n=45, volatile="75 untracked"):
++        lines = [f"line-{i:02d} stable context FIXED-{i:02d}" for i in range(n)]
++        lines[10] = f"- Status: 2 modified, {volatile}"
++        return "\n".join(lines)
++
++    @staticmethod
++    def oai_call(name="lookup", args=None, cid="call_1", content="working"):
++        return {"role": "assistant", "content": content, "tool_calls": [
++            {"id": cid, "type": "function",
++             "function": {"name": name, "arguments": json.dumps(args if args is not None else {"q": "1"})}}]}
++
++    @staticmethod
++    def oai_result(text, cid="call_1"):
++        return {"role": "tool", "tool_call_id": cid, "content": text}
++
++    @staticmethod
++    def ant_call(name="lookup", args=None, tid="tu_1", text="working"):
++        return {"role": "assistant", "content": [
++            {"type": "text", "text": text},
++            {"type": "tool_use", "id": tid, "name": name, "input": args if args is not None else {"q": "1"}}]}
++
++    @staticmethod
++    def ant_result(text, tid="tu_1"):
++        return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": text}]}
++
++    def jsonl(self, log):
++        try:
++            text = Path(log).read_text(encoding="utf-8")
++        except OSError:
++            return []
++        return [json.loads(line) for line in text.splitlines() if line.strip()]
++
++    def capture(self, fn):
++        out = io.StringIO()
++        with contextlib.redirect_stderr(out):
++            result = fn()
++        return result, out.getvalue()
++
++    # -- system volatile tail -------------------------------------------------
++    def test_system_volatile_delta_restored(self):
++        for api in ("openai", "anthropic"):
++            for stream in (False, True):
++                with self.subTest(api=api, stream=stream):
++                    svc, eng, log, base = self.fresh()
++                    tools = self.OAI_TOOLS if api == "openai" else self.ANT_TOOLS
++                    old = self.system(volatile="75 untracked")
++                    long_new = "77 untracked " + "N" * 220
++                    new = self.system(volatile=long_new)
++                    s, b = self.chat(base, api, old, [{"role": "user", "content": "Q1-first"}], tools)
++                    self.assertEqual(s, 200, b)
++                    (s, b), err = self.capture(lambda: self.chat(
++                        base, api, new, [{"role": "user", "content": "Q1-first"},
++                                         {"role": "user", "content": "Q2-fresh"}], tools, stream=stream))
++                    self.assertEqual(s, 200, b)
++                    text = self.prompt(eng)
++                    self.assertIn("- Status: 2 modified, 75 untracked", text)  # the stored system is sent
++                    self.assertIn("[context update]", text)
++                    self.assertIn(long_new, text)              # the full >200-char changed line is appended
++                    self.assertLess(text.index("Q2-fresh"), text.index("[context update]"))
++                    self.assertIn("keeper system-delta", err)
++                    rows = [r for r in self.jsonl(log) if r["kind"] == "system-delta"]
++                    self.assertTrue(rows, self.jsonl(log))
++                    self.assertIn(long_new[:50], rows[0]["diff"])
++
++    def test_system_many_changed_lines_passthrough(self):
++        for n, changed in ((200, 9), (40, 3)):        # >8 lines; >5% of lines (3/40 = 7.5%)
++            with self.subTest(n=n, changed=changed):
++                svc, eng, log, base = self.fresh()
++                old = self.system(n=n)
++                lines = old.splitlines()
++                for i in range(changed):
++                    lines[i] = f"CHANGED-{i} brand new content"
++                new = "\n".join(lines)
++                s, b = self.chat(base, "openai", old, [{"role": "user", "content": "Q1"}])
++                self.assertEqual(s, 200, b)
++                (s, b), err = self.capture(lambda: self.chat(
++                    base, "openai", new, [{"role": "user", "content": "Q1"},
++                                          {"role": "user", "content": "Q2"}]))
++                self.assertEqual(s, 200, b)
++                text = self.prompt(eng)
++                self.assertIn("CHANGED-0 brand new content", text)   # Hermes' version goes unchanged
++                self.assertNotIn("[context update]", text)
++                # U1 is retained, so the rewritten system is a detected non-append mutation, never silent
++                self.assertIn("keeper mutation-unrepaired", err)
++                self.assertTrue([r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"],
++                                self.jsonl(log))
++
++    def test_cross_session_system_only_no_resurrection(self):
++        svc, eng, log, base = self.fresh()
++        old = self.system(volatile="75 untracked")
++        new = self.system(volatile="77 untracked")
++        seed = [{"role": "user", "content": "U1-alpha"}, {"role": "assistant", "content": "A1-beta"},
++                {"role": "user", "content": "U2-gamma"}]
++        s, b = self.chat(base, "openai", old, seed)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", new, [{"role": "user", "content": "Unew-delta"}]))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("- Status: 2 modified, 75 untracked", text)
++        self.assertIn("Unew-delta", text)                       # the new session's user turn is preserved
++        self.assertIn("[context update]", text)
++        for marker in ("U1-alpha", "A1-beta", "U2-gamma"):
++            self.assertNotIn(marker, text)                      # no prior history resurrected
++        kinds = {r["kind"] for r in self.jsonl(log)}
++        self.assertEqual(kinds, {"system-delta"}, kinds)
++
++    # -- history: tool results --------------------------------------------------
++    def test_tool_result_prefix_truncation_restored(self):
++        svc, eng, log, base = self.fresh()
++        long = "result-alpha-" * 30
++        seed = [{"role": "user", "content": "Q-phi"}, self.oai_call(),
++                self.oai_result(long), {"role": "assistant", "content": "final-A1"},
++                {"role": "user", "content": "next-Q"}]
++        s, b = self.chat(base, "openai", None, seed, self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", None,
++            [{"role": "user", "content": "Q-phi"}, self.oai_call(),
++             self.oai_result(long[:50]), {"role": "assistant", "content": "final-A1"},
++             {"role": "user", "content": "next-Q"}, {"role": "user", "content": "U-fresh"}],
++            self.OAI_TOOLS))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn(long[-60:], text)                         # the stored full result is re-inserted
++        self.assertIn("final-A1", text)
++        self.assertIn("U-fresh", text)
++        self.assertIn("keeper history-restore", err)
++        self.assertTrue([r for r in self.jsonl(log) if r["kind"] == "history-restore"])
++
++    def test_whole_message_removal_restored_exactly(self):
++        svc, eng, log, base = self.fresh()
++        old, new = self.system(volatile="75 untracked"), self.system(volatile="77 untracked")
++        long = "result-alpha-" * 30
++        full = [{"role": "user", "content": "U1-q"}, {"role": "assistant", "content": "A1-dropped"},
++                self.oai_call(cid="call_9"), self.oai_result(long, cid="call_9"),
++                {"role": "assistant", "content": "A2-k"}, {"role": "user", "content": "U2-k"}]
++        s, b = self.chat(base, "openai", old, full, self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)
++        pruned = [{"role": "user", "content": "U1-q"}, self.oai_call(cid="call_9"),
++                  self.oai_result(long, cid="call_9"), {"role": "assistant", "content": "A2-k"},
++                  {"role": "user", "content": "U2-k"}, {"role": "user", "content": "Ufresh"}]
++        (s, b), err = self.capture(lambda: self.chat(base, "openai", new, pruned, self.OAI_TOOLS))
++        self.assertEqual(s, 200, b)
++        repaired_ids = list(eng.last_ids)
++        self.assertIn("keeper history-restore", err)
++        whole = full + [{"role": "user", "content": "Ufresh"}]
++        (s, b), _ = self.capture(lambda: self.chat(base, "openai", new, whole, self.OAI_TOOLS))
++        self.assertEqual(s, 200, b)
++        self.assertEqual(list(eng.last_ids), repaired_ids)   # removal repair == whole-history repair, byte-exact
++        (s, b), _ = self.capture(lambda: self.chat(
++            base, "openai", new, whole + [{"role": "user", "content": "Ufresh2"}], self.OAI_TOOLS))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("Ufresh2", text)
++        self.assertEqual(text.count("[context update]"), 2)  # prior injected update retained + the new one
++
++    def test_tool_call_id_change_logs_mutation(self):
++        for api in ("openai", "anthropic"):
++            for stream in (False, True):
++                with self.subTest(api=api, stream=stream):
++                    svc, eng, log, base = self.fresh()
++                    tools = self.OAI_TOOLS if api == "openai" else self.ANT_TOOLS
++                    if api == "openai":
++                        call_a, res_a = self.oai_call(cid="call_A"), self.oai_result("R-ok", cid="call_A")
++                        call_b = self.oai_call(cid="call_B")
++                    else:
++                        call_a, res_a = self.ant_call(tid="tu_A"), self.ant_result("R-ok", tid="tu_A")
++                        call_b = self.ant_call(tid="tu_B")
++                    seed = [{"role": "user", "content": "Q-id"}, call_a, res_a,
++                            {"role": "assistant", "content": "final-A1"},
++                            {"role": "user", "content": "next-Q"}]
++                    s, b = self.chat(base, api, None, seed, tools)
++                    self.assertEqual(s, 200, b)
++                    probe = [{"role": "user", "content": "Q-id"}, call_b, res_a,
++                             {"role": "assistant", "content": "final-A1"},
++                             {"role": "user", "content": "next-Q"},
++                             {"role": "user", "content": "U-fresh"}]
++                    (s, b), err = self.capture(lambda: self.chat(
++                        base, api, None, probe, tools, stream=stream))
++                    self.assertEqual(s, 200, b)
++                    self.assertIn("U-fresh", self.prompt(eng))
++                    # the changed call id is a mutation even though the content aligns ...
++                    self.assertIn("keeper mutation-unrepaired", err)
++                    self.assertTrue([r for r in self.jsonl(log)
++                                     if r["kind"] == "mutation-unrepaired"], self.jsonl(log))
++
++    def test_tool_result_id_change_passthrough(self):
++        for api in ("openai", "anthropic"):
++            for stream in (False, True):
++                with self.subTest(api=api, stream=stream):
++                    svc, eng, log, base = self.fresh()
++                    tools = self.OAI_TOOLS if api == "openai" else self.ANT_TOOLS
++                    long = "result-alpha-" * 30
++                    if api == "openai":
++                        seed_call = self.oai_call(cid="call_A")
++                        seed_res = self.oai_result(long, cid="call_A")
++                        probe_res = self.oai_result(long[:50], cid="call_OTHER")
++                    else:
++                        seed_call = self.ant_call(tid="tu_A")
++                        seed_res = self.ant_result(long, tid="tu_A")
++                        probe_res = self.ant_result(long[:50], tid="tu_OTHER")
++                    seed = [{"role": "user", "content": "Q-id"}, seed_call, seed_res,
++                            {"role": "assistant", "content": "final-A1"},
++                            {"role": "user", "content": "next-Q"}]
++                    s, b = self.chat(base, api, None, seed, tools)
++                    self.assertEqual(s, 200, b)
++                    probe = [{"role": "user", "content": "Q-id"}, seed_call, probe_res,
++                             {"role": "assistant", "content": "final-A1"},
++                             {"role": "user", "content": "next-Q"},
++                             {"role": "user", "content": "U-fresh"}]
++                    (s, b), err = self.capture(lambda: self.chat(
++                        base, api, None, probe, tools, stream=stream))
++                    self.assertEqual(s, 200, b)
++                    text = self.prompt(eng)
++                    self.assertNotIn(long[-60:], text)   # a different result id: forwarded unchanged
++                    self.assertIn("U-fresh", text)
++                    self.assertIn("keeper mutation-unrepaired", err)
++
++    def test_same_id_summary_restored(self):
++        for api in ("openai", "anthropic"):
++            for stream in (False, True):
++                with self.subTest(api=api, stream=stream):
++                    svc, eng, log, base = self.fresh()
++                    tools = self.OAI_TOOLS if api == "openai" else self.ANT_TOOLS
++                    long = "result-alpha-" * 30
++                    if api == "openai":
++                        call, res = self.oai_call(cid="call_A"), self.oai_result(long, cid="call_A")
++                        short = self.oai_result("summary: all good, nothing else", cid="call_A")
++                    else:
++                        call, res = self.ant_call(tid="tu_A"), self.ant_result(long, tid="tu_A")
++                        short = self.ant_result("summary: all good, nothing else", tid="tu_A")
++                    seed = [{"role": "user", "content": "Q-id"}, call, res,
++                            {"role": "assistant", "content": "final-A1"},
++                            {"role": "user", "content": "next-Q"}]
++                    s, b = self.chat(base, api, None, seed, tools)
++                    self.assertEqual(s, 200, b)
++                    probe = [{"role": "user", "content": "Q-id"}, call, short,
++                             {"role": "assistant", "content": "final-A1"},
++                             {"role": "user", "content": "next-Q"},
++                             {"role": "user", "content": "U-fresh"}]
++                    (s, b), err = self.capture(lambda: self.chat(
++                        base, api, None, probe, tools, stream=stream))
++                    self.assertEqual(s, 200, b)
++                    text = self.prompt(eng)
++                    self.assertIn(long[-60:], text)     # same-identity summary: the stored result is restored
++                    self.assertIn("U-fresh", text)
++                    self.assertIn("keeper history-restore", err)
++
++    # -- history: reorder / changed calls / changed tools -------------------------
++    def test_reordered_history_passthrough_mutation(self):
++        svc, eng, log, base = self.fresh()
++        seed = [{"role": "user", "content": "UFIRST-marker"}, {"role": "assistant", "content": "AANSWER-marker"},
++                {"role": "user", "content": "USECOND-marker"}]
++        s, b = self.chat(base, "openai", None, seed)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", None,
++            [{"role": "user", "content": "UFIRST-marker"}, {"role": "user", "content": "USECOND-marker"},
++             {"role": "assistant", "content": "AANSWER-marker"}, {"role": "user", "content": "UFRESH-marker"}]))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertLess(text.index("USECOND-marker"), text.index("AANSWER-marker"))  # order as sent, not restored
++        self.assertIn("UFRESH-marker", text)
++        self.assertIn("keeper mutation-unrepaired", err)
++
++    def test_changed_tool_arguments_passthrough_mutation(self):
++        svc, eng, log, base = self.fresh()
++        seed = [{"role": "user", "content": "Q-phi"}, self.oai_call(args={"q": "QQ1"}),
++                self.oai_result("R-ok"), {"role": "assistant", "content": "done"}]
++        s, b = self.chat(base, "openai", None, seed, self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", None,
++            [{"role": "user", "content": "Q-phi"}, self.oai_call(args={"q": "QQ2"}),
++             self.oai_result("R-ok"), {"role": "assistant", "content": "done"},
++             {"role": "user", "content": "U-fresh"}], self.OAI_TOOLS))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("QQ2", text)                             # the changed call goes out as sent
++        self.assertIn("keeper mutation-unrepaired", err)
++        self.assertTrue([r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"])
++
++    def test_first_user_prefix_shortening_does_not_resurrect(self):
++        svc, eng, log, base = self.fresh()
++        s, b = self.chat(base, "openai", None,
++                         [{"role": "user", "content": "please handle lengthy old task"}])
++        self.assertEqual(s, 200, b)
++        (s, b), _ = self.capture(lambda: self.chat(
++            base, "openai", None, [{"role": "user", "content": "please handle"}]))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("please handle", text)
++        # no other unchanged anchor ties the short message to the old one: never resurrect the long intent
++        self.assertNotIn("lengthy old task", text)
++
++    def test_lru_touch_does_not_hide_related_mutation(self):
++        svc, eng, log, base = self.fresh()
++        s, b = self.chat(base, "openai", None, [{"role": "user", "content": "U1-m2"}], self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)                            # e1
++        e2 = [{"role": "user", "content": "U1-m2"}, self.oai_call(args={"q": "W1-marker"}, cid="call_D"),
++              self.oai_result("T-ok", cid="call_D")]
++        s, b = self.chat(base, "openai", None, e2, self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)                            # e2 extends e1
++        # A pure-append repair of e1 would see e2's stronger mutation and never touch e1 (Sol), so the
++        # LRU order is arranged explicitly: e1 most recent, e2 older.
++        e1_key = next(k for k, e in svc.keeper.entries.items() if len(e["messages"]) == 1)
++        with svc.keeper.lock:
++            svc.keeper.entries.move_to_end(e1_key)
++            self.assertEqual(list(svc.keeper.entries)[-1], e1_key)
++        new = [{"role": "user", "content": "U1-m2"}, self.oai_call(args={"q": "W2-marker"}, cid="call_D"),
++               self.oai_result("T-ok", cid="call_D"), {"role": "user", "content": "Ufresh-m2"}]
++        (s, b), err = self.capture(lambda: self.chat(base, "openai", None, new, self.OAI_TOOLS))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("W2-marker", text)       # the changed call goes out as sent ...
++        self.assertNotIn("W1-marker", text)    # ... with nothing resurrected ...
++        self.assertIn("keeper mutation-unrepaired", err)       # ... and the related mutation is logged
++        self.assertTrue([r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"])
++
++    def test_older_append_candidate_does_not_hide_recent_mutation(self):
++        svc, eng, log, base = self.fresh()
++        s, b = self.chat(base, "openai", None, [{"role": "user", "content": "U1-m"}], self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)                            # e1: a plain append candidate
++        e2 = [{"role": "user", "content": "U1-m"}, self.oai_call(args={"q": "V1-marker"}, cid="call_C"),
++              self.oai_result("T-ok", cid="call_C")]
++        s, b = self.chat(base, "openai", None, e2, self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)                            # e2: extends e1, remembered
++        new = [{"role": "user", "content": "U1-m"}, self.oai_call(args={"q": "V2-marker"}, cid="call_C"),
++               self.oai_result("T-ok", cid="call_C"), {"role": "user", "content": "Ufresh-m"}]
++        (s, b), err = self.capture(lambda: self.chat(base, "openai", None, new, self.OAI_TOOLS))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("V2-marker", text)       # the recent change goes out as sent ...
++        self.assertNotIn("V1-marker", text)    # ... with nothing resurrected from any older entry ...
++        self.assertIn("keeper mutation-unrepaired", err)       # ... and the recent mutation is logged
++        self.assertTrue([r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"])
++
++    def test_changed_tools_same_history_passthrough_mutation(self):
++        svc, eng, log, base = self.fresh()
++        other = [{"type": "function", "function": {"name": "search", "description": "d",
++                 "parameters": {"type": "object", "properties": {}}}}]
++        s, b = self.chat(base, "openai", None, [{"role": "user", "content": "U1-k"}],
++                         self.OAI_TOOLS)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", None, [{"role": "user", "content": "U1-k"},
++                                   {"role": "user", "content": "U2-k"}], other))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("U2-k", text)
++        self.assertNotIn("[context update]", text)
++        self.assertIn("keeper mutation-unrepaired", err)
++
++    def test_raw_identity_preserved_both_apis(self):
++        for api in ("openai", "anthropic"):
++            for stream in (False, True):
++                with self.subTest(api=api, stream=stream):
++                    svc, eng, log, base = self.fresh()
++                    tools = self.OAI_TOOLS if api == "openai" else self.ANT_TOOLS
++                    if api == "openai":
++                        call, res = self.oai_call(cid="call_X1"), self.oai_result("R-ok", cid="call_X1")
++                    else:
++                        call, res = self.ant_call(tid="tu_X1"), self.ant_result("R-ok", tid="tu_X1")
++                    msgs = [{"role": "user", "content": "Q-id"}, call, res,
++                            {"role": "assistant", "content": "done"}]
++                    s, b = self.chat(base, api, None, msgs, tools, stream=stream)
++                    self.assertEqual(s, 200, b)
++                    text = self.prompt(eng)
++                    # behaviour proof the raw identity survived: a bare id swap is a mutation, not a match
++                    other = "call_X2" if api == "openai" else "tu_X2"
++                    if api == "openai":
++                        call2, res2 = self.oai_call(cid=other), self.oai_result("R-ok", cid=other)
++                    else:
++                        call2, res2 = self.ant_call(tid=other), self.ant_result("R-ok", tid=other)
++                    probe = [{"role": "user", "content": "Q-id"}, call2, res2,
++                             {"role": "assistant", "content": "done"},
++                             {"role": "user", "content": "U-fresh"}]
++                    (s, b), err = self.capture(lambda: self.chat(
++                        base, api, None, probe, tools, stream=stream))
++                    self.assertEqual(s, 200, b)
++                    self.assertIn("U-fresh", self.prompt(eng))
++                    self.assertIn("keeper mutation-unrepaired", err)
++
++    def test_changed_reasoning_content_passes_unchanged(self):
++        svc, eng, log, base = self.fresh()
++        old_a = {"role": "assistant", "content": "ANS-marker", "reasoning_content": "R1-OLD-marker"}
++        new_a = {"role": "assistant", "content": "ANS-marker", "reasoning_content": "R2-NEW-marker"}
++        s, b = self.chat(base, "openai", None, [{"role": "user", "content": "U1-r"}, old_a,
++                                                 {"role": "user", "content": "U2-r"}])
++        self.assertEqual(s, 200, b)
++        (s, b), _ = self.capture(lambda: self.chat(
++            base, "openai", None, [{"role": "user", "content": "U1-r"}, new_a,
++                                   {"role": "user", "content": "U2-r"}, {"role": "user", "content": "U3-r"}]))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("R2-NEW-marker", text)                   # the new reasoning goes out, not the stored one
++        self.assertNotIn("R1-OLD-marker", text)
++
++    # -- passthrough / flag-off / aux / invalid --------------------------------------
++    def test_pure_append_unchanged_and_silent_over_reserve(self):
++        svc, eng, log, base = self.fresh(max_context=8704)     # room past the reserve is only 512 tokens
++        req1 = [{"role": "user", "content": "U1-" + "a" * 100},
++                {"role": "assistant", "content": "A1-" + "b" * 300},
++                {"role": "user", "content": "U2-" + "c" * 100}]
++        s, b = self.chat(base, "openai", None, req1, max_tokens=5)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", None, req1 + [{"role": "user", "content": "U3-fresh"}], max_tokens=5))
++        self.assertEqual(s, 200, b)
++        self.assertNotIn("keeper", err)                        # a pure append stays silent, however large
++        self.assertEqual(self.jsonl(log), [])
++        off = Service(MockEngine(ByteTokenizer(), "</think>\n\nok", max_context=8704), ByteTokenizer(),
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        off_httpd = serve(off, port=0)
++        self.addCleanup(off_httpd.server_close)
++        self.addCleanup(off_httpd.shutdown)
++        off_base = f"http://127.0.0.1:{off_httpd.server_address[1]}"
++        self.chat(off_base, "openai", None, req1, max_tokens=5)
++        self.chat(off_base, "openai", None, req1 + [{"role": "user", "content": "U3-fresh"}], max_tokens=5)
++        off_ids = list(off.engine.last_prompt)
++        self.assertEqual(list(eng.last_ids), off_ids)          # byte-identical to the keeper-off prompt
++
++    def test_flag_off_ignores_even_a_system_delta(self):
++        tok = ByteTokenizer()
++        eng = RecordingPrompt(tok, "</think>\n\nok", max_context=self.CTX)
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))   # keeper off
++        httpd = serve(svc, port=0)
++        self.addCleanup(httpd.server_close)
++        self.addCleanup(httpd.shutdown)
++        base = f"http://127.0.0.1:{httpd.server_address[1]}"
++        old, new = self.system(volatile="75 untracked"), self.system(volatile="77 untracked")
++        s, b = self.chat(base, "openai", old, [{"role": "user", "content": "Q1"}])
++        self.assertEqual(s, 200, b)
++        s, b = self.chat(base, "openai", new, [{"role": "user", "content": "Q1"},
++                                               {"role": "user", "content": "Q2"}])
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("77 untracked", text)
++        self.assertNotIn("[context update]", text)
++
++    def test_aux_untouched_and_not_cached(self):
++        svc, eng, log, base = self.fresh()
++        s, b = self.chat(base, "openai", None, [{"role": "user", "content": "U1-main"}])
++        self.assertEqual(s, 200, b)
++        self.assertEqual(len(svc.keeper.entries), 1)
++        aux = {"model": "m", "messages": [{"role": "user", "content": "title this"}],
++               "response_format": {"type": "json_object"}, "max_tokens": 20}
++        (s, b), err = self.capture(lambda: self.post(base, "/v1/chat/completions", aux))
++        self.assertEqual(s, 200, b)
++        self.assertEqual(len(svc.keeper.entries), 1)           # aux never seeds the cache
++        self.assertNotIn("keeper", err)
++        self.assertNotIn("[context update]", self.prompt(eng))
++
++    def test_invalid_prepare_not_cached(self):
++        svc, eng, log, base = self.fresh()
++        s, b = self.chat(base, "openai", None, [{"role": "user", "content": "z" * 70000}], max_tokens=5)
++        self.assertEqual(s, 400, b)
++        self.assertEqual(len(svc.keeper.entries), 0)           # a rejected request seeds nothing
++
++    # -- budget / continuity / literal text ---------------------------------------------
++    def test_budget_overflow_forwards_original_with_skip(self):
++        svc, eng, log, base = self.fresh(max_context=8704)     # a repair must fit max_context - 8192 = 512
++        long_a = "A1-" + "M" * 300
++        req1 = [{"role": "user", "content": "U1-" + "a" * 100},
++                {"role": "assistant", "content": long_a},
++                {"role": "user", "content": "U2-" + "b" * 100}]
++        s, b = self.chat(base, "openai", None, req1, max_tokens=5)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", None,
++            [{"role": "user", "content": "U1-" + "a" * 100},
++             {"role": "assistant", "content": long_a[:50]},
++             {"role": "user", "content": "U2-" + "b" * 100},
++             {"role": "user", "content": "Ufresh"}], max_tokens=5))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertNotIn(long_a[-60:], text)                   # over budget: Hermes' pruned version goes out
++        self.assertIn("Ufresh", text)
++        self.assertIn("keeper skip-budget", err)
++        self.assertTrue([r for r in self.jsonl(log) if r["kind"] == "skip-budget"])
++
++    def test_continuity_after_system_delta(self):
++        svc, eng, log, base = self.fresh()
++        old, new = self.system(volatile="75 untracked"), self.system(volatile="77 untracked")
++        s, _ = self.chat(base, "openai", old, [{"role": "user", "content": "C1"}])
++        self.assertEqual(s, 200)
++        s, _ = self.chat(base, "openai", new, [{"role": "user", "content": "C1"},
++                                                {"role": "user", "content": "C2"}])
++        self.assertEqual(s, 200)
++        (s, b), _ = self.capture(lambda: self.chat(      # Hermes echoes without our block: still continuous
++            base, "openai", new, [{"role": "user", "content": "C1"},
++                                   {"role": "user", "content": "C2"},
++                                   {"role": "user", "content": "C3"}]))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        for marker in ("C1", "C2", "C3", "- Status: 2 modified, 75 untracked", "[context update]",
++                       "+ - Status: 2 modified, 77 untracked"):
++            self.assertIn(marker, text)
++
++    def test_literal_context_update_text_survives(self):
++        svc, eng, log, base = self.fresh()
++        old, new = self.system(volatile="75 untracked"), self.system(volatile="77 untracked")
++        s, _ = self.chat(base, "openai", old, [{"role": "user", "content": "U1"}])
++        self.assertEqual(s, 200)
++        literal = "before\n\n[context update]\nmy-literal-text"
++        (s, b), err = self.capture(lambda: self.chat(
++            base, "openai", new, [{"role": "user", "content": "U1"},
++                                   {"role": "user", "content": literal}]))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("before", text)
++        self.assertIn("my-literal-text", text)      # the whole literal is retained, not stripped ...
++        self.assertIn("+ - Status: 2 modified, 77 untracked", text)   # ... plus the keeper delta
++        self.assertIn("keeper system-delta", err)
++        changed = "before\n\n[context update]\nmy-literal-CHANGED"
++        (s, b), _ = self.capture(lambda: self.chat(
++            base, "openai", new, [{"role": "user", "content": "U1"},
++                                   {"role": "user", "content": changed},
++                                   {"role": "user", "content": "U3"}]))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        self.assertIn("my-literal-CHANGED", text)   # a changed literal is retained as sent
++
++    # -- MCP-merged budget ------------------------------------------------------------------
++    def test_mcp_budget_uses_merged_tools(self):
++        big_tool = {"name": "bigtool", "description": "D" * 2000,
++                    "parameters": {"type": "object", "properties": {}}}
++
++        class StubHub:
++            settings = {"max_rounds": 1}
++
++            def wait(self, timeout=None):
++                return True
++
++            def template_tools(self, exclude=()):
++                return [big_tool]
++
++            def routes(self):
++                return {}
++
++        hist = [{"role": "user", "content": "U1-" + "a" * 36},
++                {"role": "assistant", "content": "A1-" + "b" * 46},
++                {"role": "user", "content": "U2-" + "c" * 36}]
++        pruned = [{"role": "user", "content": "U1-" + "a" * 36},
++                  {"role": "assistant", "content": ("A1-" + "b" * 46)[:20]},
++                  {"role": "user", "content": "U2-" + "c" * 36},
++                  {"role": "user", "content": "UF-" + "d" * 21}]
++        mcp = {"strata_mcp": True}
++        ctl, ctl_eng, _, ctl_base = self.fresh(max_context=8704)   # no hub: the repair fits the reserve
++        s, b = self.chat(ctl_base, "openai", None, hist, max_tokens=5, extra=mcp)
++        self.assertEqual(s, 200, b)
++        (s, b), _ = self.capture(lambda: self.chat(ctl_base, "openai", None, pruned, max_tokens=5, extra=mcp))
++        self.assertEqual(s, 200, b)
++        self.assertIn("keeper history-restore", _)
++        svc, eng, log, base = self.fresh(max_context=8704)
++        svc.mcp = StubHub()
++        s, b = self.chat(base, "openai", None, hist, max_tokens=5, extra=mcp)
++        self.assertEqual(s, 200, b)
++        (s, b), err = self.capture(lambda: self.chat(base, "openai", None, pruned, max_tokens=5, extra=mcp))
++        self.assertEqual(s, 200, b)
++        text = self.prompt(eng)
++        # with the merged tools the restored prompt busts the reserve: Hermes' version goes out
++        self.assertNotIn(("A1-" + "b" * 46)[-30:], text)
++        self.assertIn("keeper skip-budget", err)
++
++    # -- keeper mechanics: capacity, input safety, log shape, concurrency ----------------------
++    def test_capacity_lru_bounded(self):
++        svc, _ = self.bare(capacity=2)
++        e1, e2, e3 = [{"role": "user", "content": "E1-x"}], [{"role": "user", "content": "E2-y"}], \
++            [{"role": "user", "content": "E3-z"}]
++        svc.keeper_remember(e1, None, {})
++        svc.keeper_remember(e2, None, {})
++        svc.keeper_remember(e3, None, {})
++        blob = json.dumps([e["messages"] for e in svc.keeper.entries.values()])
++        self.assertEqual(len(svc.keeper.entries), 2)
++        self.assertNotIn("E1-x", blob)
++        self.assertIn("E2-y", blob)
++        fwd, _ = svc.keeper_repair(e2 + [{"role": "user", "content": "probe"}], None, {})  # touches E2
++        self.assertIn("probe", json.dumps(fwd))
++        svc.keeper_remember([{"role": "user", "content": "E4-w"}], None, {})
++        blob = json.dumps([e["messages"] for e in svc.keeper.entries.values()])
++        self.assertIn("E2-y", blob)                        # recently repaired E2 survives ...
++        self.assertNotIn("E3-z", blob)                     # ... while the untouched E3 drops out
++
++    def test_repair_does_not_mutate_inputs(self):
++        svc, _ = self.bare()
++        seed = [{"role": "system", "content": self.system()},
++                {"role": "user", "content": "U1"}, {"role": "assistant", "content": "A1"}]
++        svc.keeper_remember(seed, None, {})
++        messages = [{"role": "system", "content": self.system(volatile="77 untracked")},
++                    {"role": "user", "content": "U1"}, {"role": "assistant", "content": "A1"},
++                    {"role": "user", "content": "U2"}]
++        snap = copy.deepcopy((messages, None, {}))
++        fwd, _ = svc.keeper_repair(messages, None, {})
++        self.assertEqual((messages, None, {}), snap)
++        self.assertIsNot(fwd, messages)
++
++    def test_one_stderr_line_per_event_and_bounded_jsonl(self):
++        svc, log = self.bare()
++        seed = [{"role": "system", "content": self.system()},
++                {"role": "user", "content": "U1-" + "u" * 300}]
++        svc.keeper_remember(seed, None, {})
++        new1 = [{"role": "system", "content": self.system(volatile="77 untracked")},
++                {"role": "user", "content": "U1-" + "u" * 300}, {"role": "user", "content": "U2"}]
++        new2 = [{"role": "system", "content": self.system(volatile="78 untracked")},
++                {"role": "user", "content": "U1-" + "u" * 300}, {"role": "user", "content": "U2"},
++                {"role": "user", "content": "U3"}]
++
++        def both():
++            svc.keeper_repair(new1, None, {})
++            svc.keeper_repair(new2, None, {})
++
++        _, err = self.capture(both)
++        lines = err.splitlines()
++        self.assertEqual(len(lines), 2)                                    # exactly one line per event
++        for line in lines:
++            self.assertTrue(line.startswith("strata serve: keeper system-delta"), line)
++        rows = self.jsonl(log)
++        self.assertEqual(len(rows), 2)
++        for row in rows:
++            self.assertEqual(set(row), {"req", "kind", "index", "before_bytes", "after_bytes", "diff"}, row)
++            self.assertLessEqual(len(row["diff"]), 600)                    # the diff is bounded ...
++        blob = err + Path(log).read_text(encoding="utf-8")
++        self.assertNotIn("u" * 100, blob)                                  # ... and carries no full prompt
++
++    def test_concurrent_repairs_stay_bounded_and_parseable(self):
++        svc, log = self.bare(capacity=8)
++        svc.keeper_remember([{"role": "system", "content": self.system()},
++                             {"role": "user", "content": "seed"}], None, {})
++        errors = []
++
++        def repair_work(n):
++            try:
++                for i in range(5):
++                    svc.keeper_repair(
++                        [{"role": "system",
++                          "content": self.system(volatile=f"77 untracked t{n}")},
++                         {"role": "user", "content": "seed"},
++                         {"role": "user", "content": f"t{n}-{i}"}], None, {})
++            except Exception as e:  # noqa: BLE001 - thread failures are collected and raised on the main thread
++                errors.append(e)
++
++        def run_all(work):
++            threads = [threading.Thread(target=work, args=(n,)) for n in range(4)]
++            for t in threads:
++                t.start()
++            for t in threads:
++                t.join(30)
++
++        _, err = self.capture(lambda: run_all(repair_work))
++        self.assertEqual(errors, [])
++        rows = self.jsonl(log)
++        self.assertEqual(len([r for r in rows if r["kind"] == "system-delta"]), 20)  # every repair logged ...
++        for row in rows:                                                              # ... as a parseable row
++            self.assertEqual(set(row), {"req", "kind", "index", "before_bytes", "after_bytes", "diff"})
++        self.assertNotIn("keeper error", err)
++
++        def remember_work(n):
++            try:
++                for i in range(5):
++                    svc.keeper_remember([{"role": "user", "content": f"w{n}-{i}"}], None, {})
++            except Exception as e:  # noqa: BLE001 - as above
++                errors.append(e)
++
++        self.capture(lambda: run_all(remember_work))
++        self.assertEqual(errors, [])
++        self.assertLessEqual(len(svc.keeper.entries), 8)      # distinct remembers stay bounded
++        for row in self.jsonl(log):
++            self.assertEqual(set(row), {"req", "kind", "index", "before_bytes", "after_bytes", "diff"})
++
++    def test_estimate_failure_forwards_original_unchanged(self):
++        svc, _ = self.bare()
++        tools = [{"name": "t"}]
++        seed = [{"role": "user", "content": "U1"}, {"role": "assistant", "content": "A1"},
++                {"role": "user", "content": "U2"}]
++        svc.keeper_remember(seed, tools, {})
++        messages = [{"role": "user", "content": "U1"}, {"role": "user", "content": "U2"},
++                    {"role": "user", "content": "Ufresh"}]
++        real_encode = svc.tok.encode
++        svc.tok.encode = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("tokenizer down"))
++        try:
++            fwd, fwd_tools = svc.keeper_repair(messages, tools, {})
++        finally:
++            svc.tok.encode = real_encode
++        self.assertIs(fwd, messages)          # estimation failed: Hermes' version goes out untouched
++        self.assertIs(fwd_tools, tools)
++
++    def test_multimodal_bypasses_keeper(self):
++        svc, _ = self.bare()
++        svc.keeper_remember([{"role": "user", "content": "seed"}], None, {})
++        before = len(svc.keeper.entries)
++        messages = [{"role": "user", "content": [{"type": "text", "text": "hi"},
++                                                 {"type": "image", "source": "x"}]}]
++        fwd, _ = svc.keeper_repair(messages, None, {})
++        self.assertIs(fwd, messages)          # list content: never estimated, no vision touched ...
++        svc.keeper_remember(messages, None, {})
++        self.assertEqual(len(svc.keeper.entries), before)   # ... and never remembered
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.54.0.windows.1
+

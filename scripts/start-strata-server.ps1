@@ -10,7 +10,8 @@ param(
     [int]$Cache = 7500,
     [ValidateSet('none', 'cpu')][string]$Vision = 'none',
     [ValidateSet('cache', '0121', 'legacy')][string]$Engine = 'cache',   # cache = 0121 + saved-state cache f621c84 (pinned), 0121 = upstream 0.1.21 port (pinned), legacy = 726f8b5
-    [switch]$Force
+    [switch]$Force,
+    [switch]$NoKeeper                                          # cache engine: disable the server's prefix keeper
 )
 $ErrorActionPreference = 'Continue'
 $Port  = 18100
@@ -22,7 +23,7 @@ $CfgRun  = "$Root\deploy-strata\strata-qwen-$Quant.run.json"
 $Log   = "$Root\deploy-strata\strata-server.log"
 if ($Engine -in 'cache', '0121') {
     if ($Engine -eq 'cache') {
-        $SrvRoot = "$Root\strata-prod-cache"            # detached worktree @ cache-fix-1 f621c84 (roots/tips, F1/F2b)
+        $SrvRoot = "$Root\strata-prod-cache"            # detached worktree @ cache-fix-1 5e18098 (roots/tips, F1/F2b, prefix keeper; engine exe = f621c84)
         $Exe     = "$Root\deploy-strata\bin-cache\strata.exe"
     } else {
         $SrvRoot = "$Root\strata-prod"                  # detached worktree @ v100-upstream c6d44e6
@@ -73,6 +74,8 @@ $Kv = 'fp16'
 if ($Ctx -gt 8192) { $kept += @('--kv', 'int8'); $Kv = 'int8' }
 if (($Engine -in 'cache', '0121') -and $KvResident) { $kept += @('--kv-resident', "$KvResident"); $Kv += "+stream$KvResident" }
 if ($Engine -eq 'cache') { $kept += @('--root-dir', "$Root\strata-cache\roots") }   # pinned roots persist across restarts (E3)
+# prefix keeper (server.py, 5e18098): keeps Hermes requests append-only (volatile system lines -> [context update], pruned history restored)
+$env:STRATA_PREFIX_KEEPER = if ($Engine -eq 'cache' -and -not $NoKeeper) { '1' } else { '' }
 if ($Vision -eq 'cpu') {
     # images: strata-vision (llama.cpp mtmd + mmproj) on the CPU, ~300 image tokens per picture; engine takes GENI
     $kept += '--vision'

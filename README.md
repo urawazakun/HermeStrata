@@ -32,11 +32,13 @@ one line is the right trade-off. With 128 GB host RAM and an agent harness, seve
 | Strata | **saved states**: pinned *roots* (fixed prefix = tools + system prompt) and LRU *tips* (end of each conversation line) in host RAM, restore of the longest validated prefix, per-request resume/snapshot stats | `0005-0008` |
 | Strata | roots persisted to disk (lazy load, identity check, size cap, `--no-root-disk`), aux composition tests, `/v1/cache` inventory + DELETE of non-pinned tips | `0009-0011` |
 | Strata | fixes from GPU acceptance: fall back to the next valid restore point instead of cold (F1); tips keep a restore point at the last turn boundary of the prompt, not only the generation end (F2/F2b) | `0012-0016` |
+| Strata server | **prefix keeper** (`--prefix-keeper`): keeps Hermes requests append-only for the cache — volatile system lines become a trailing `[context update]`, pruned history is restored; idea by the owner | `0017` (live acceptance in progress) |
 | Hermes | fixed prefix discipline: git workspace snapshot moved to the volatile tail (`HERMES_WORKSPACE_LATE=1`), title generated after the turn (`HERMES_TITLE_AFTER_TURN=1`) | `patches/hermes-agent/0001` |
 | Hermes | `delegate_task` **fork mode**: a child starts from the parent's exact prompt (+ its tool call + a tool result carrying the task), so the engine resumes it from the parent's saved state; blocked tools and depth limit are refused at call time instead of being removed from `tools[]` | `patches/hermes-agent/0002` |
+| Hermes | **work deadline** tools (`set_work_deadline` / `finish_work`): "work until 18:00" keeps the agent going until the deadline; run budget stays the ceiling | `patches/hermes-agent/0003` (experimental) |
 
 Design: [docs/DESIGN.md](docs/DESIGN.md). How the fixes were found: [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
-Acceptance ledger: [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md).
+Acceptance ledger: [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Live Hermes runs and what they exposed: [docs/LIVE-HERMES.md](docs/LIVE-HERMES.md).
 
 Memory cost per saved line (measured unit costs): KV int8 12.7 KB/token, MTP rows 1.06 KB/token, recurrent state
 113 MiB per snapshot. A 12K root ≈ 0.27 GB; a 100K conversation tip ≈ 1.5 GB. Default tip budget 8 GiB.
