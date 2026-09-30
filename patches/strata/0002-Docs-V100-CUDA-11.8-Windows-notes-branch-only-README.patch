@@ -1,0 +1,129 @@
+From c6d44e6462e6a94468015881e3ec753a13be1d42 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Tue, 29 Sep 2026 17:06:02 +0900
+Subject: [PATCH 02/16] Docs: V100 / CUDA 11.8 Windows notes (branch-only
+ README pointer + docs/windows-cuda118.md)
+
+---
+ README.md               |  8 ++++
+ docs/windows-cuda118.md | 89 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+)
+ create mode 100644 docs/windows-cuda118.md
+
+diff --git a/README.md b/README.md
+index f8234ad..79c45f7 100644
+--- a/README.md
++++ b/README.md
+@@ -3,6 +3,14 @@
+ <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
+ one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
+ 
++> **On this branch (`v100-upstream`) only: Tesla V100 / Volta (sm_70) on Windows, CUDA 11.8** (tested: V100-SXM2
++> 16 GB, driver 472.12, AVX2 CPU). Upstream supports RTX 30/40/50 with a current driver; this branch port is
++> experimental. Earlier-fork measurements on the same machine (re-measurement on 0.1.21 pending), GSQ-RCO Q2_0
++> + MTP: **51-53 tok/s decode, ~545 tok/s prefill** at 8K context; 131K context starts with `--kv int8` and 6400
++> cached experts. **GSQ-RCO IQ3_S** also ran (34.5 tok/s at 900 MHz; 131K with `--kv int8` and 2800 cached experts). Build notes,
++> measurements and limits: [docs/windows-cuda118.md](docs/windows-cuda118.md). Answer **no** to "Images?" (the
++> vision helper is not tested on sm_70 yet).
++
+ <p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
+ <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
+ <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+diff --git a/docs/windows-cuda118.md b/docs/windows-cuda118.md
+new file mode 100644
+index 0000000..ad7d8f6
+--- /dev/null
++++ b/docs/windows-cuda118.md
+@@ -0,0 +1,89 @@
++# Windows / CUDA 11.8 / V100 (sm_70) build
++
++Scope: branch `v100-upstream` (upstream engine 0.1.21 + the V100 / CUDA 11.8 port below), for machines whose NVIDIA
++driver tops out at CUDA 11.x (tested on driver 472.12, Tesla V100 16 GB). Nothing in the upstream 0.1.21 feature set
++(conversation cache, AVX2 i-quant kernels, Q4_0 KV, multi-GPU layer split) is changed by this port; V100-specific
++limits are listed at the end. Upstream's own requirements (RTX 30/40/50, current driver) still apply to anything
++outside this branch.
++
++## Port changes on this branch (vs upstream 0.1.21)
++
++- CUDA standard 17 for nvcc 11.8 (nvcc 11.8 accepts at most C++17); host C++ stays at 20.
++- `cudaGraphInstantiate` rewritten from the CUDA 12 3-argument form to the CUDA 11.8 5-argument form.
++- `setup.py`: Volta (sm_70) builds locally with CUDA 11.8 (nvcc 11.8 is the last one emitting sm_70; the V100 box runs
++  driver 472) with `nvidia-*-cu11` pip wheels and minimum driver 452; sm_80+ keeps upstream's CUDA 13 path.
++- Kernels: IQ4_XS (type 23) in `native_expert_grouped` (needed by GSQ-RCO IQ3_S), and `gather_rows` for rows that are
++  not 16-byte multiples (the IQ3_S MTP head row is 2100 B). Covered by `native_expert_parity --selftest` (ctest).
++
++## Toolchain
++
++- CUDA 11.8 (`nvcc`), MSVC 14.34 (VS 2022 Build Tools), Ninja, CMake
++- `CMAKE_CUDA_ARCHITECTURES=70`, `CMAKE_BUILD_TYPE=Release`
++
++Build with the wrapper script (output `H:\qwen38-v100\build-strata-up\strata.exe`):
++
++```bat
++cmd /c H:\qwen38-v100\scripts\build-strata-up.bat
++```
++
++Manual equivalent (same flags as the script — without `-DSTRATA_ENABLE_CUDA=ON` the build is CPU-only,
++and without `-DSTRATA_GGML_DIR` CMake tries to fetch ggml from the network):
++
++```bat
++call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.34
++set PATH=C:\llm-local\cuda-11.8\bin;%PATH%
++cmake -S H:\qwen38-v100\strata-up -B H:\qwen38-v100\build-strata-up -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_CUDA_COMPILER=C:/llm-local/cuda-11.8/bin/nvcc.exe -DCUDAToolkit_ROOT=C:/llm-local/cuda-11.8 -DSTRATA_GGML_DIR=H:/qwen38-v100/llama-pinned
++cmake --build H:\qwen38-v100\build-strata-up
++ctest --test-dir H:\qwen38-v100\build-strata-up
++```
++
++Step-1 status on this branch: `native_expert_parity --selftest` passes; ctest 22/24 pass — the 2 failures are absent
++PLE fixtures and Windows privilege 1314, not code failures.
++
++## Measured (Qwen3.8-Flash-Next, ISTA-DASLab GSQ-RCO Q2_0, V100 16GB + DDR4 host)
++
++Measured on the earlier `win-cuda118` fork (same machine, older engine base); re-measurement on 0.1.21 is pending.
++
++`--expert-cache 7500 --prefill 2048 --spec 4 --spec-min-p 0.5 --mtp <q2_0 rt> --max-context 8192`, Swift expert profile:
++
++| | tok/s |
++|---|---|
++| decode | 51.0 / 53.0 / 51.8 |
++| prefill (2047 tokens) | 541 – 547 |
++
++At `--max-context 131072 --kv int8` the largest expert cache that starts and serves is 6400 slots (VRAM 16.19 / 16.26 GB). A 30k-token needle test answered correctly.
++
++The MTP runtime pack was built with `STRATA_GGUF_PY` pointing at a llama.cpp `gguf-py` checkout.
++
++## GSQ-RCO IQ3_S (3.5 bpw) and the clock sweet spot
++
++Same provenance as above (earlier fork, same machine). Cache sizes that start: 3500 slots at 8K, 2800 at
++`--max-context 131072 --kv int8`.
++
++One pelican-SVG generation per point, GPU clock locked for the measurement, energy from 2 Hz GPU power samples:
++
++| quant | clock | tok/s | J/token (GPU) |
++|---|---|---|---|
++| Q2_0 | 600 MHz | 34.9 | 1.44 |
++| Q2_0 | 900 MHz | 47.6 | 1.22 |
++| Q2_0 | 1500 MHz | 62.3 | 1.87 |
++| IQ3_S | 600 MHz | 26.3 | 1.89 |
++| IQ3_S | 900 MHz | 34.5 | 1.60 |
++
++Observed sweet spot was ~900 MHz: Q2_0 kept 76 % of the stock-boost speed (47.6 vs 62.3 tok/s) for 65 % of the GPU
++energy per token (1.22 vs 1.87 J), ~55 W average, ~54 °C. Going lower (600 MHz) cost speed without saving energy per
++token. Decode here is bound by expert traffic over PCIe and host RAM, so the top clocks buy relatively little.
++
++IQ3_S matched a Q4_K_XL llama.cpp baseline on our small math (15/15) and code (8/8) sets; Q2_0 lost visibly on SVG
++drawing.
++
++## Branch-specific limitations (not upstream behavior)
++
++- No ready-made sm_70 engine: `setup.py`'s `PREBUILT_URL` points at upstream (Niko1221), whose single-asset
++  0.1.21 prebuilt has no sm_70 build, so on a V100 setup compiles the engine locally with CUDA 11.8 (or pass
++  `--prebuilt` / `STRATA_PREBUILT_URL` pointing at a compatible sm_70 asset explicitly).
++- Answer **no** to "Images?": the vision helper is not tested on sm_70 yet.
++- Upstream 0.1.21's multi-GPU layer split is unvalidated on V100 (a second V100 is expected; until then, single-GPU).
++- Upstream's conversation cache (`--prompt-cache`, see `src/program/generate.cpp` `ConvCheckpoint` and
++  `include/strata/program/conv_cache.hpp`) is evaluated separately; the fork's own prefix-cache series was
++  deliberately not ported (see the merge report in `H:\qwen38-v100\briefs\REPORT-UPSTREAM-MERGE.md`).
+-- 
+2.54.0.windows.1
+

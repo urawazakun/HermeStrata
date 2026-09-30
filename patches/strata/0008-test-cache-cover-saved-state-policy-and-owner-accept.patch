@@ -1,0 +1,629 @@
+From b6f6f0c5448bab6b816f8b288396eb8f2f2fa253 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 06:36:56 +0900
+Subject: [PATCH 08/16] test(cache): cover saved-state policy and owner
+ acceptance
+
+Implemented: Muse / reviewed: Sol. E5 CPU fixtures and reproducible CUDA-free test build.
+---
+ CMakeLists.txt                   |   4 +
+ docs/hermes-cache-acceptance.md  |  54 ++++
+ src/program/saved_state_test.cpp | 504 ++++++++++++++++++++++++++++++-
+ 3 files changed, 560 insertions(+), 2 deletions(-)
+ create mode 100644 docs/hermes-cache-acceptance.md
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e80fce1..883570f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -592,8 +592,12 @@ if(STRATA_BUILD_TESTS)
+   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
+   # plan v0.3 P5: the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
+   # the 38 GB model; run it by hand or from tools/gpu_session.py)
++  # E5: GPU-gated - needs strata_kernels + cudart, so a CPU-only test dir skips it (it is
++  # not a ctest there either: it needs the 38 GB model; run it by hand or from tools/gpu_session.py)
++  if(STRATA_ENABLE_CUDA)
+   add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
+   target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact CUDA::cudart)
++  endif()
+ 
+   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
+   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
+diff --git a/docs/hermes-cache-acceptance.md b/docs/hermes-cache-acceptance.md
+new file mode 100644
+index 0000000..13e7b3a
+--- /dev/null
++++ b/docs/hermes-cache-acceptance.md
+@@ -0,0 +1,54 @@
++# Hermes × Strata cache: owner GPU acceptance recipe (E5)
++
++Design: `H:\qwen38-v100\briefs\DESIGN-HERMES-CACHE.md` (user idea, Claude design).
++Status: `H:\qwen38-v100\briefs\REPORT-HERMES-CACHE.md` (implemented: Muse / reviewed: Sol).
++This recipe is the runnable form of the report's owner recipe. GPU measurements belong to the
++owner and have not been run here. E3's actual disk-persistence tests are deferred to E3.
++
++## Ground rules
++
++- Build with the exact `H:\qwen38-v100\scripts\build-strata-up.bat`. Same model/pack/numeric
++  flags across cached and cold runs. Isolated development engine at 18101 only.
++- Never touch production, deploy-strata, port 18100, or GPU clocks. Restart only the dev engine
++  when a case calls for it. Three repeats per case, unique result files per repeat.
++- Record per repeat: logs, timings, cache inventory, parity result, configuration identity.
++
++## True-cold flags
++
++Cold must disable every layer, not just the chain: `--prompt-cache 0 --tip-cache-gib 0
++--prompt-cache-root 0`. (`--prompt-cache 0` alone no longer suffices: root capture already
++requires prompt_cache > 0 in generate.cpp, `--tip-cache-gib 0` turns tips off while roots stay
++pinned, and `--prompt-cache-root 0` disables the root-pinning threshold.) When E3 lands, cold
++runs must also disable root-disk loading; if E3 ships enabled by default, it must provide an
++explicit disable flag and cold runs must pass it.
++
++## Cases
++
++1. Warm root + aux: fixed tools/system prefix session, then a title/aux request, then a second
++   session with the identical prefix and a different suffix. Require root reuse, second prefill
++   <= 2 s, and no tip from the aux request (main tip/root intact).
++2. Disk root (PENDING E3 - do not run yet): after root persistence completes, restart only the
++   dev engine with the same `--root-dir H:\qwen38-v100\strata-cache\roots`. New session on that
++   prefix must log `resume from root-disk` at the expected root length, prefill <= 5 s. In a
++   separate configuration, change one model/numeric identity field and confirm the
++   incompatible root file is ignored.
++3. Alternation and fork: parent -> isolated child (other root) -> parent, then parent -> forked
++   child -> parent. The fork prompt must carry the parent's generated assistant tool-call tokens
++   plus the tool result. Require the parent tip length to include generated tokens, tip reuse at
++   the longest matching prefix, suffix-only prefill (<= 3 s restore overhead + suffix cost), and
++   deterministic parity against cold output.
++4. Mixed correctness: cold run with the true-cold flags above; cached run with standard flags.
++   `python dev-18101/step3_validate.py capture --base-url http://127.0.0.1:18101 --label cold
++   --out <unique-cold.jsonl>`, same with `--label cached`, then `python
++   dev-18101/step3_validate.py compare --cold <cold.jsonl> --cached <cached.jsonl> --md
++   <unique-report.md>`. Require all 20 requests sane with token/output parity where applicable.
++   Include cvec/image identity boundaries and cancellation/recovery if supported.
++5. Speed: A/B `--spec-adapt` off/on x cache cold/warm for code, 12K, 40K shapes (same sampling
++   and length). Record resume source/k/suffix, restore/snapshot ms, prefill ms, decode tok/s,
++   acceptance. Decode must stay within measured run-to-run noise.
++6. Capacity/debug (GET/DELETE need S2; budget/eviction parts run now): lower the tip budget,
++   alternate enough lines to force eviction. Require pinned roots to survive, tip bytes within
++   budget, exact-prefix matching (two unrelated same-length lines must not cross-match), and the
++   disk dir within cap after background writes settle. After S2: GET `/v1/cache` inventory and
++   DELETE dropping non-pinned tips only. Record peak host RAM and retained lines; the fork
++   budget must hold at least depth+1 intended lines.
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index f030f19..2ca16af 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -1,14 +1,26 @@
+-// src/program/saved_state_test.cpp - E2 SavedState selection: the eligibility walk and the exact lookup.
++// src/program/saved_state_test.cpp - SavedState store policy + payload validation (CPU-only).
+ //
+-// Sol final-review regression: skipping ONE rejected pointer loops forever with two invalid candidates
++// E2 (Sol final-review regression): skipping ONE rejected pointer loops forever with two invalid candidates
+ // (A skipped -> B invalid -> A returned again). The store therefore walks with an accumulating skip set
+ // (find_best_except) plus an exact-length lookup (find_exact) that sees an item even under a longer tip.
+ // CPU-only (saved_state.{hpp,cpp}, no CUDA); mirrors the serve loop's selection structure with a fake
+ // eligibility predicate. Termination IS the regression: every walk below must end.
++//
++// E5 (DESIGN-HERMES-CACHE.md section 5): dedicated store/payload suite - exact full-ids matching (two
++// unrelated equal-length lines), longest prefix, cvec/image identity, pinned roots, byte-budget LRU and
++// note_use, aux insertion as a strict no-op (no insert, no eviction, no clock), depth+1 fork retention
++// (section 7: parent and forked-child tips coexist, no prefix collapsing), duplicate replacement, stage
++// mismatch, drop tips preserving roots, header mismatch, and incomplete/malformed KV/scales/MTP/boundary
++// rejection. Fixture sizes below are hand-derived literals (see the geometry comments), not calls into the
++// implementation's own size helpers, so the tests check the policy rather than re-stating it. E3's actual
++// disk persistence tests are deferred to E3 (only the header gate is covered here).
++//
++// Implemented: Muse / reviewed: Sol.
+ #include "strata/program/saved_state.hpp"
+ 
+ #include <cstdint>
+ #include <cstdio>
++#include <functional>
+ #include <vector>
+ 
+ namespace saved = strata::program::saved_state;
+@@ -73,6 +85,183 @@ std::vector<int32_t> req_ids(int n) {
+     for (int i = 0; i < n; ++i) v[(size_t) i] = i;
+     return v;
+ }
++
++// ---- E5 fixtures -----------------------------------------------------------
++//
++// Two small geometries with hand-derived byte sizes (literals, worked out by hand from the layout
++// contract in saved_state.hpp - not via kv_pool_bytes - so a wrong formula fails the test):
++//
++//   gA fp16: 1 layer, 1 KV head, head_dim 8, page 4. One code row = 8 dim * 2 B = 16 B; one page
++//     holds 1 head * 4 cells * 16 B = 64 B. C cells -> ceil(C/4) pages -> ceil(C/4)*64 B per k/v,
++//     no scales. Indexer (block 4, idx_dim 4): rows = L/4+1, pooled = rows*16 B, dead_key 16 B.
++//   gB int8/q4: 1 layer, 2 KV heads, head_dim 64, page 8. int8 code row = 64 B, scale row =
++//     (64/64 group)*2 B = 2 B; one page = 2 heads * 8 cells * row -> 1024 B code, 32 B scales.
++//     q4: one head = (64/32 blocks)*18 B = 36 B; one page = 2*8*36 = 576 B, no scales.
++// Boundary row everywhere: hc=2, n_embd=4 -> 8 floats.
++
++saved::SnapshotGeom geom_a() {
++    saved::SnapshotGeom g;
++    g.n_qsa_layers = 1;
++    g.n_head_kv = 1;
++    g.head_dim = 8;
++    g.idx_dim = 4;
++    g.idx_block = 4;
++    g.page_size = 4;
++    return g;
++}
++
++saved::SnapshotGeom geom_b() {
++    saved::SnapshotGeom g;
++    g.n_qsa_layers = 1;
++    g.n_head_kv = 2;
++    g.head_dim = 64;
++    g.idx_dim = 4;
++    g.idx_block = 4;
++    g.page_size = 8;
++    return g;
++}
++
++void fill_indexer(saved::StagePayload& sp, int L, const saved::SnapshotGeom& g) {
++    saved::IndexerPayload ix;
++    ix.pooled_rows = L / (int) g.idx_block + 1;
++    ix.pooled.assign((size_t) (ix.pooled_rows * g.idx_dim * 4), 0x11);
++    ix.block_pos = {3};
++    ix.dead_key.assign((size_t) (g.idx_dim * 4), 0x22);
++    sp.idx.push_back(std::move(ix));
++}
++
++void fill_boundary(saved::SavedItem& it) {
++    it.boundary.hc = 2;
++    it.boundary.n_embd = 4;
++    it.boundary.row.assign(8, 0.5f);
++}
++
++// Complete fp16 gA item, ids = base..base+L-1 (two different bases = two unrelated lines).
++saved::SavedItem make_line(int L, int base) {
++    saved::SavedItem it;
++    it.ids.resize((size_t) L);
++    for (int i = 0; i < L; ++i) it.ids[(size_t) i] = (int32_t) (base + i);
++    it.cvec = true;
++    it.n_stages = 1;
++    it.geom = geom_a();
++    saved::StagePayload sp;
++    sp.rec.gdn = {7, 9};
++    sp.rec.tails = {8};
++    sp.rec.ple_prev[0] = L >= 2 ? L - 2 : -1;
++    sp.rec.ple_prev[1] = L - 1;
++    const size_t code = (size_t) ((L + 3) / 4) * 64;   // ceil(L/4) pages * 64 B
++    saved::KvLayerPayload kv;
++    kv.fmt = saved::kKvF16;
++    kv.cells = L;
++    kv.k.assign(code, 0x31);
++    kv.v.assign(code, 0x32);
++    sp.kv.push_back(std::move(kv));
++    fill_indexer(sp, L, it.geom);
++    it.stages.push_back(std::move(sp));
++    fill_boundary(it);
++    if (L > 1) {
++        const size_t mcode = (size_t) ((L - 1 + 3) / 4) * 64;   // MTP rows are exactly [0, L-1)
++        saved::KvLayerPayload m;
++        m.fmt = saved::kKvF16;
++        m.cells = L - 1;
++        m.k.assign(mcode, 0x41);
++        m.v.assign(mcode, 0x42);
++        it.mtp.kv.push_back(std::move(m));
++        it.mtp.cells = L - 1;
++        it.mtp.valid_from = 0;
++    }
++    return it;
++}
++
++// Complete int8 gB item (codes + scales, same fmt on MTP).
++saved::SavedItem make_int8_line(int L, int base) {
++    saved::SavedItem it;
++    it.ids.resize((size_t) L);
++    for (int i = 0; i < L; ++i) it.ids[(size_t) i] = (int32_t) (base + i);
++    it.cvec = false;
++    it.n_stages = 1;
++    it.geom = geom_b();
++    saved::StagePayload sp;
++    sp.rec.gdn = {7};
++    sp.rec.ple = {1, 2, 3};
++    sp.rec.tails = {8};
++    const size_t pages = (size_t) ((L + 7) / 8);
++    saved::KvLayerPayload kv;
++    kv.fmt = saved::kKvInt8;
++    kv.cells = L;
++    kv.k.assign(pages * 1024, 0x51);
++    kv.v.assign(pages * 1024, 0x52);
++    kv.ks.assign(pages * 32, 0x53);
++    kv.vs.assign(pages * 32, 0x54);
++    sp.kv.push_back(std::move(kv));
++    fill_indexer(sp, L, it.geom);
++    it.stages.push_back(std::move(sp));
++    fill_boundary(it);
++    if (L > 1) {
++        const size_t mp = (size_t) ((L - 1 + 7) / 8);
++        saved::KvLayerPayload m;
++        m.fmt = saved::kKvInt8;
++        m.cells = L - 1;
++        m.k.assign(mp * 1024, 0x61);
++        m.v.assign(mp * 1024, 0x62);
++        m.ks.assign(mp * 32, 0x63);
++        m.vs.assign(mp * 32, 0x64);
++        it.mtp.kv.push_back(std::move(m));
++        it.mtp.cells = L - 1;
++        it.mtp.valid_from = 0;
++    }
++    return it;
++}
++
++// Complete q4 gB item (no scales anywhere).
++saved::SavedItem make_q4_line(int L, int base) {
++    saved::SavedItem it;
++    it.ids.resize((size_t) L);
++    for (int i = 0; i < L; ++i) it.ids[(size_t) i] = (int32_t) (base + i);
++    it.cvec = true;
++    it.n_stages = 1;
++    it.geom = geom_b();
++    saved::StagePayload sp;
++    sp.rec.gdn = {7};
++    sp.rec.tails = {8};
++    const size_t pages = (size_t) ((L + 7) / 8);
++    saved::KvLayerPayload kv;
++    kv.fmt = saved::kKvQ4;
++    kv.cells = L;
++    kv.k.assign(pages * 576, 0x71);
++    kv.v.assign(pages * 576, 0x72);
++    sp.kv.push_back(std::move(kv));
++    fill_indexer(sp, L, it.geom);
++    it.stages.push_back(std::move(sp));
++    fill_boundary(it);
++    if (L > 1) {
++        const size_t mp = (size_t) ((L - 1 + 7) / 8);
++        saved::KvLayerPayload m;
++        m.fmt = saved::kKvQ4;
++        m.cells = L - 1;
++        m.k.assign(mp * 576, 0x81);
++        m.v.assign(mp * 576, 0x82);
++        it.mtp.kv.push_back(std::move(m));
++        it.mtp.cells = L - 1;
++        it.mtp.valid_from = 0;
++    }
++    return it;
++}
++
++std::vector<int32_t> req_at(int base, int n) {
++    std::vector<int32_t> v((size_t) n);
++    for (int i = 0; i < n; ++i) v[(size_t) i] = (int32_t) (base + i);
++    return v;
++}
++
++// A mutated copy must fail complete() AND be refused by insert_tip (the store's structural gate).
++void rejects(saved::SavedItem good, const std::function<void(saved::SavedItem&)>& mut, const char* what,
++             const char* what_ins) {
++    mut(good);
++    check(!good.complete(), what);
++    saved::SavedStateStore st;
++    check(!st.insert_tip(good, false) && st.tips() == 0, what_ins);
++}
+ }  // namespace
+ 
+ int main() {
+@@ -146,6 +335,317 @@ int main() {
+         check(st.find_exact(div, no_imgs, true, 100) == nullptr, "divergent ids miss");
+         check(st.find_best(div, no_imgs, true) == nullptr, "divergent ids have no best either");
+     }
++    {   // E5: is_prefix compares exact full ids; empty is never a prefix (resume 0 reads fresh).
++        check(saved::is_prefix({1, 2, 3}, {1, 2, 3, 4}), "proper prefix matches");
++        check(saved::is_prefix({1, 2, 3}, {1, 2, 3}), "equal ids are a prefix (exact-length hit)");
++        check(!saved::is_prefix({}, {1, 2, 3}), "empty prefix never matches");
++        check(!saved::is_prefix({1, 2, 3, 4, 5}, {1, 2, 3}), "longer candidate is not a prefix");
++        check(!saved::is_prefix({1, 2, 9}, {1, 2, 3, 4}), "one divergent id rejects");
++        check(!saved::is_prefix({9}, {1, 2, 3}), "divergent first id rejects");
++    }
++    {   // E5: imgs_below keeps images strictly below L (an image AT the resume point is suffix).
++        const std::vector<saved::ImgKey> all = {{3, 99}, {10, 7}, {20, 8}};
++        check(saved::imgs_below(all, 11) == std::vector<saved::ImgKey>{{3, 99}, {10, 7}},
++              "imgs_below keeps starts strictly below L");
++        check(saved::imgs_below(all, 10).size() == 1, "an image at exactly L is suffix, not state");
++        check(saved::imgs_below(all, 0).empty(), "nothing is below 0");
++    }
++    {   // E5: two unrelated equal-length lines never cross-match: validity needs the full ids,
++        // not a length or a hash. Line A lives at ids 1000.., line B at 5000...
++        saved::SavedStateStore st;
++        check(st.insert_tip(make_line(50, 1000), false), "line A(50) stores");
++        check(st.insert_tip(make_line(50, 5000), false), "unrelated line B(50) stores alongside");
++        check(st.tips() == 2, "equal-length lines coexist (no key collapse)");
++        const std::vector<int32_t> req_a = req_at(1000, 80);
++        const std::vector<int32_t> req_b = req_at(5000, 80);
++        const saved::SavedItem* ba = st.find_best(req_a, no_imgs, true);
++        const saved::SavedItem* bb = st.find_best(req_b, no_imgs, true);
++        check(ba != nullptr && ba->ids[0] == 1000, "request A resumes from line A");
++        check(bb != nullptr && bb->ids[0] == 5000, "request B resumes from line B");
++        check(st.find_best(req_at(9000, 80), no_imgs, true) == nullptr, "a third line matches neither");
++        check(st.find_exact(req_a, no_imgs, true, 50)->ids[0] == 1000, "find_exact sees A under no longer tip");
++        check(st.find_exact(req_b, no_imgs, true, 50)->ids[0] == 5000, "find_exact sees B under no longer tip");
++    }
++    {   // E5: longest exact prefix wins across kinds; a longer divergent item is skipped for a
++        // shorter true prefix. Root 120 beats tip 80 on the root's line; on a line diverging at
++        // 120 the 150/200 tips are out and root 100 still matches.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_line(120, 0)), "root(120) stores");
++        check(st.insert_tip(make_line(80, 0), false), "shorter tip(80) stores");
++        const saved::SavedItem* b = st.find_best(req_at(0, 200), no_imgs, true);
++        check(b != nullptr && b->ids.size() == 120 && b->kind == saved::Kind::Root,
++              "longer root beats shorter tip on its line");
++        saved::SavedStateStore st2;
++        check(st2.insert_root(make_item(100)), "root(100) stores");
++        check(st2.insert_tip(make_item(200), false), "tip(200) stores");
++        check(st2.insert_tip(make_item(150), false), "tip(150) stores");
++        std::vector<int32_t> div = req;
++        div[120] = 999;
++        const saved::SavedItem* bd = st2.find_best(div, no_imgs, true);
++        check(bd != nullptr && bd->ids.size() == 100, "divergence at 120 falls back to root(100)");
++    }
++    {   // E5: cvec identity. A flipped request misses; same ids under both cvec values coexist
++        // and each request finds its own.
++        saved::SavedStateStore st;
++        check(st.insert_tip(make_line(40, 0), false), "cvec=true tip stores");
++        saved::SavedItem off = make_line(40, 0);
++        off.cvec = false;
++        check(st.insert_tip(off, false), "same ids with cvec=false stores alongside");
++        check(st.find_best(req_at(0, 60), no_imgs, false)->cvec == false, "cvec=false request finds its item");
++        check(st.find_best(req_at(0, 60), no_imgs, true)->cvec == true, "cvec=true request finds its item");
++        saved::SavedStateStore st2;
++        check(st2.insert_tip(make_line(40, 0), false), "lone cvec=true tip stores");
++        check(st2.find_best(req_at(0, 60), no_imgs, false) == nullptr, "flipped cvec request misses");
++        check(st2.find_exact(req_at(0, 60), no_imgs, false, 40) == nullptr, "flipped cvec exact misses");
++    }
++    {   // E5: image identity mirrors generate.cpp's ImgKey: same pads with a different grid hash,
++        // a shifted image, or an extra image below L all reject; an image at/above L is suffix.
++        saved::SavedStateStore st;
++        saved::SavedItem it = make_line(40, 0);
++        it.imgs = {{3, 99}};
++        check(st.insert_tip(it, false), "tip with one image stores");
++        const std::vector<saved::ImgKey> same = {{3, 99}};
++        check(st.find_best(req_at(0, 60), same, true) != nullptr, "identical image hits");
++        check(st.find_best(req_at(0, 60), std::vector<saved::ImgKey>{{3, 100}}, true) == nullptr,
++              "same pads with a different grid hash miss");
++        check(st.find_best(req_at(0, 60), std::vector<saved::ImgKey>{{4, 99}}, true) == nullptr,
++              "shifted image start misses");
++        check(st.find_best(req_at(0, 60), std::vector<saved::ImgKey>{{3, 99}, {5, 1}}, true) == nullptr,
++              "extra image below L misses");
++        check(st.find_best(req_at(0, 60), std::vector<saved::ImgKey>{{3, 99}, {40, 1}}, true) != nullptr,
++              "image at exactly L is suffix: still hits");
++        check(st.find_best(req_at(0, 60), no_imgs, true) == nullptr, "missing image misses");
++        check(st.find_exact(req_at(0, 60), same, true, 40) != nullptr, "exact lookup respects images too");
++    }
++    {   // E5: roots are pinned - a tip budget that rotates tips never takes a root, and S2's
++        // drop keeps every root while reporting the dropped tip count.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_line(100, 0)), "root(100) stores");
++        check(st.insert_tip(make_line(200, 0), false), "tip(200) stores");
++        check(st.insert_tip(make_line(150, 0), false), "tip(150) stores");
++        const uint64_t keep = st.inventory()[2].bytes;   // roots first: [root, tip200, tip150]
++        st.set_tip_budget_bytes(keep);                   // room for exactly one tip
++        check(st.roots() == 1 && st.tips() == 1, "budget pressure keeps the root and one tip");
++        check(st.find_best(req, no_imgs, true)->ids.size() == 150, "the surviving tip is the fresher 150");
++        const saved::SavedItem* r = st.find_exact(req, no_imgs, true, 100);
++        check(r != nullptr && r->kind == saved::Kind::Root, "root still addressable after eviction");
++        auto inv = st.inventory();
++        check(inv.size() == 2 && inv[0].kind == saved::Kind::Root && inv[0].ids_len == 100,
++              "inventory lists roots first with ids length");
++        check(st.drop_non_pinned() == 1 && st.tips() == 0 && st.tip_bytes() == 0, "drop clears tips, counts them");
++        check(st.roots() == 1 && st.find_best(req, no_imgs, true)->kind == saved::Kind::Root,
++              "drop preserves the pinned root");
++    }
++    {   // E5: byte-budget LRU counts mounts, not just inserts - note_use refreshes A so the
++        // next insert evicts B. (Design: a mount MUST call note_use.)
++        saved::SavedStateStore st;
++        check(st.insert_tip(make_line(20, 100), false), "tip A stores");
++        check(st.insert_tip(make_line(40, 200), false), "tip B stores");
++        const uint64_t budget = st.inventory()[0].bytes + st.inventory()[1].bytes;
++        st.set_tip_budget_bytes(budget);
++        const saved::SavedItem* a = st.find_best(req_at(100, 60), no_imgs, true);
++        check(a != nullptr && st.note_use(a), "mounting A refreshes it");
++        check(!st.note_use(nullptr), "note_use(null) fails");
++        saved::SavedItem foreign = make_line(20, 100);
++        check(!st.note_use(&foreign), "note_use(foreign pointer) fails");
++        check(st.insert_tip(make_line(30, 300), false), "tip C stores under the full budget");
++        check(st.tips() == 2, "one victim left");
++        check(st.find_best(req_at(100, 60), no_imgs, true) != nullptr, "refreshed A survives");
++        check(st.find_best(req_at(200, 60), no_imgs, true) == nullptr, "stale B is the LRU victim");
++        check(st.find_best(req_at(300, 60), no_imgs, true) != nullptr, "newcomer C stays");
++    }
++    {   // E5: aux insertion (titles, S1) is a strict no-op - false, no insert, no eviction of a
++        // full store, and the LRU clock frozen.
++        saved::SavedStateStore st;
++        check(st.clock() == 0, "fresh clock is 0");
++        check(!st.insert_tip(make_line(500, 7000), true), "aux insert returns false");
++        check(st.tips() == 0 && st.clock() == 0, "aux insert adds nothing and freezes the clock");
++        check(st.insert_tip(make_line(20, 100), false), "main A stores");
++        check(st.insert_tip(make_line(40, 200), false), "main B stores");
++        st.set_tip_budget_bytes(st.inventory()[0].bytes + st.inventory()[1].bytes);   // exactly full
++        const uint64_t c1 = st.clock();
++        check(!st.insert_tip(make_line(500, 7000), true), "aux insert under a full budget returns false");
++        check(st.tips() == 2 && st.clock() == c1, "aux insert evicts nothing and freezes the clock");
++        check(st.find_best(req_at(100, 60), no_imgs, true) != nullptr, "main A intact after aux traffic");
++        check(st.find_best(req_at(200, 60), no_imgs, true) != nullptr, "main B intact after aux traffic");
++    }
++    {   // E5 section 7: depth+1 fork retention. The parent tip covers prompt + GENERATED tokens at
++        // the DONE boundary; the forked child extends those ids with its tool result. Both tips
++        // coexist (no prefix collapsing) and each line resumes from its own tip, even when the
++        // budget holds exactly depth+1 lines.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_line(40, 0)), "fixed-prefix root(40) stores");
++        check(st.insert_tip(make_line(60, 0), false), "parent tip(60, prompt+generated) stores");
++        check(st.insert_tip(make_line(75, 0), false), "forked child tip(75) stores alongside");
++        check(st.tips() == 2, "child insert does not collapse the parent tip");
++        st.set_tip_budget_bytes(st.inventory()[1].bytes + st.inventory()[2].bytes);   // depth+1
++        check(st.tips() == 2, "depth+1 budget retains parent and child");
++        check(st.find_best(req_at(0, 90), no_imgs, true)->ids.size() == 75, "child line resumes from child tip");
++        check(st.find_best(req_at(0, 65), no_imgs, true)->ids.size() == 60, "parent line resumes from parent tip");
++        check(st.find_best(req_at(0, 45), no_imgs, true)->kind == saved::Kind::Root,
++              "short request still finds the root");
++    }
++    {   // E5: exact-duplicate replacement refreshes in place (one recent tip per line for re-runs).
++        saved::SavedStateStore st;
++        check(st.insert_tip(make_line(50, 1000), false), "tip stores");
++        const uint64_t b0 = st.tip_bytes();
++        check(st.insert_tip(make_line(50, 1000), false), "duplicate insert returns true");
++        check(st.tips() == 1 && st.tip_bytes() == b0, "duplicate replaces in place (no growth)");
++        check(st.insert_root(make_line(100, 0)), "root stores");
++        check(st.insert_root(make_line(100, 0)), "duplicate root returns true");
++        check(st.roots() == 1, "duplicate root replaces in place");
++    }
++    {   // E5: stage-count mismatch is rejected at insert, and a stage-layout change clears the
++        // store rather than risk a cross-layout restore. Same count is a no-op (roots survive).
++        saved::SavedStateStore st;
++        saved::SavedItem two = make_line(20, 0);
++        two.stages.push_back(two.stages[0]);
++        two.n_stages = 2;
++        check(two.complete(), "two-stage item is structurally complete");
++        check(!st.insert_tip(two, false), "tip with a foreign stage count rejected");
++        check(!st.insert_root(two), "root with a foreign stage count rejected");
++        saved::SavedItem bad_n = make_line(20, 0);
++        bad_n.n_stages = 2;   // scalar disagrees with stages.size()
++        check(!bad_n.complete(), "n_stages/stages.size() disagreement is incomplete");
++        check(st.insert_root(make_line(40, 0)), "root stores");
++        st.set_stage_count(1);
++        check(st.roots() == 1, "same stage count keeps the store");
++        st.set_stage_count(2);
++        check(st.roots() == 0 && st.tips() == 0 && st.stage_count() == 2, "layout change clears the store");
++        check(st.insert_tip(two, false), "two-stage item stores under the new layout");
++    }
++    {   // E5: RootDiskHeader gates E3 loads - every numerics/model identity field must match.
++        // ids_len/ids_hash do NOT gate compatibility (the full-ids prefix rule applies after load).
++        saved::RootDiskHeader h0;
++        h0.engine_version = "0.1.21";
++        h0.pack_path = "pack/full";
++        h0.kv_type = "int8";
++        h0.mtp_dir = "mtp";
++        h0.model_fingerprint = "sizes+mtimes";
++        h0.numeric_flags = "native+resident";
++        check(h0.compatible_with(h0), "identical headers are compatible");
++        saved::RootDiskHeader h = h0;
++        h.ids_len = 999;
++        h.ids_hash = 12345;
++        check(h.compatible_with(h0), "ids length/hash do not gate compatibility");
++        h = h0;
++        h.magic = 0;
++        check(!h.compatible_with(h0), "magic mismatch rejected");
++        h = h0;
++        h.version = 999;
++        check(!h.compatible_with(h0), "version mismatch rejected");
++        h = h0;
++        h.engine_version = "0.1.22";
++        check(!h.compatible_with(h0), "engine version mismatch rejected");
++        h = h0;
++        h.pack_path = "pack/other";
++        check(!h.compatible_with(h0), "pack path mismatch rejected");
++        h = h0;
++        h.kv_type = "q4_0";
++        check(!h.compatible_with(h0), "kv type mismatch rejected");
++        h = h0;
++        h.mtp_dir = "mtp2";
++        check(!h.compatible_with(h0), "mtp dir mismatch rejected");
++        h = h0;
++        h.model_fingerprint = "other";
++        check(!h.compatible_with(h0), "model fingerprint mismatch rejected");
++        h = h0;
++        h.numeric_flags = "other";
++        check(!h.compatible_with(h0), "numeric flags mismatch rejected");
++    }
++    {   // E5: happy paths for every format - minimal L=1 (no MTP pair exists yet), int8 with
++        // scales, q4 without, and a non-empty PLE history.
++        saved::SavedItem one = make_line(1, 5);
++        check(one.complete(), "L=1 fp16 item (empty MTP) is complete");
++        saved::SavedStateStore st1;
++        check(st1.insert_tip(one, false), "L=1 item stores");
++        saved::SavedItem i8 = make_int8_line(9, 0);
++        check(i8.complete(), "int8 item with scales is complete");
++        saved::SavedStateStore st8;
++        check(st8.insert_tip(i8, false), "int8 item stores");
++        saved::SavedItem q4 = make_q4_line(9, 0);
++        check(q4.complete(), "q4 item without scales is complete");
++        saved::SavedStateStore st4;
++        check(st4.insert_tip(q4, false), "q4 item stores");
++        check(st4.find_best(req_at(0, 20), no_imgs, true) != nullptr, "q4 tip is addressable");
++        check(st8.find_best(req_at(0, 20), no_imgs, false) != nullptr, "int8 tip is addressable");
++    }
++    {   // E5: incomplete/malformed payloads never become restorable - each mutated copy fails
++        // complete() and is refused by insert_tip.
++        const saved::SavedItem good = make_line(12, 0);   // fp16: k/v 192 B, pooled 64 B, MTP 192 B
++        check(good.complete(), "fixture itself is complete");
++        rejects(good, [](saved::SavedItem& m) { m.ids.clear(); }, "empty ids incomplete",
++                "empty ids refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].rec.gdn.clear(); }, "empty gdn incomplete",
++                "empty gdn refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].rec.tails.clear(); }, "empty tails incomplete",
++                "empty tails refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].kv[0].cells = 13; }, "KV cells != L incomplete",
++                "KV cells != L refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].kv[0].k.pop_back(); }, "truncated k incomplete",
++                "truncated k refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].kv[0].v.pop_back(); }, "truncated v incomplete",
++                "truncated v refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].kv[0].ks.push_back(1); },
++                "fp16 with scales incomplete", "fp16 with scales refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].kv[0].fmt = 7; }, "unknown KV format incomplete",
++                "unknown KV format refused");
++        rejects(good, [](saved::SavedItem& m) { m.mtp.cells = 12; }, "MTP cells != L-1 incomplete",
++                "MTP cells != L-1 refused");
++        rejects(good, [](saved::SavedItem& m) { m.mtp.kv.clear(); }, "L>1 with empty MTP incomplete",
++                "L>1 with empty MTP refused");
++        rejects(good, [](saved::SavedItem& m) { m.mtp.valid_from = m.mtp.cells + 1; },
++                "MTP valid_from past cells incomplete", "MTP valid_from past cells refused");
++        rejects(good, [](saved::SavedItem& m) { m.mtp.valid_from = -1; }, "negative MTP valid_from incomplete",
++                "negative MTP valid_from refused");
++        rejects(good, [](saved::SavedItem& m) { m.mtp.kv[0].k.pop_back(); }, "truncated MTP k incomplete",
++                "truncated MTP k refused");
++        rejects(good, [](saved::SavedItem& m) { m.mtp.kv[0].fmt = saved::kKvInt8; },
++                "MTP/main format split incomplete", "MTP/main format split refused");
++        rejects(good, [](saved::SavedItem& m) { m.boundary.row.clear(); }, "missing boundary row incomplete",
++                "missing boundary row refused");
++        rejects(good, [](saved::SavedItem& m) { m.boundary.hc = 0; }, "zero boundary hc incomplete",
++                "zero boundary hc refused");
++        rejects(good, [](saved::SavedItem& m) { m.boundary.row.pop_back(); }, "short boundary row incomplete",
++                "short boundary row refused");
++        rejects(good, [](saved::SavedItem& m) { m.geom.head_dim = 0; }, "zero head_dim incomplete",
++                "zero head_dim refused");
++        rejects(good, [](saved::SavedItem& m) { m.geom.page_size = 0; }, "zero page_size incomplete",
++                "zero page_size refused");
++        rejects(good, [](saved::SavedItem& m) { m.imgs.push_back({12, 1}); }, "image at >= L incomplete",
++                "image at >= L refused");
++        rejects(good, [](saved::SavedItem& m) { m.imgs.push_back({-1, 1}); }, "negative image start incomplete",
++                "negative image start refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].idx[0].pooled_rows += 1; },
++                "indexer row count split incomplete", "indexer row count split refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].idx[0].pooled.pop_back(); },
++                "truncated pooled keys incomplete", "truncated pooled keys refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].idx[0].dead_key.pop_back(); },
++                "truncated dead key incomplete", "truncated dead key refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages[0].idx[0].block_pos.push_back(1); },
++                "doubled block_pos incomplete", "doubled block_pos refused");
++        rejects(good, [](saved::SavedItem& m) { m.stages.clear(); }, "no stages incomplete",
++                "no stages refused");
++        rejects(good, [](saved::SavedItem& m) { m.n_stages = 0; }, "zero n_stages incomplete",
++                "zero n_stages refused");
++        const saved::SavedItem one = make_line(1, 5);
++        rejects(one, [](saved::SavedItem& m) { m.mtp.cells = 1; }, "L=1 with MTP cells incomplete",
++                "L=1 with MTP cells refused");
++        const saved::SavedItem i8 = make_int8_line(9, 0);
++        check(i8.complete(), "int8 fixture itself is complete");
++        rejects(i8, [](saved::SavedItem& m) { m.stages[0].kv[0].ks.clear(); }, "int8 without scales incomplete",
++                "int8 without scales refused");
++        rejects(i8, [](saved::SavedItem& m) { m.stages[0].kv[0].vs.pop_back(); }, "int8 short vs incomplete",
++                "int8 short vs refused");
++        rejects(i8, [](saved::SavedItem& m) { m.mtp.kv[0].ks.clear(); }, "int8 MTP without scales incomplete",
++                "int8 MTP without scales refused");
++        const saved::SavedItem q4 = make_q4_line(9, 0);
++        check(q4.complete(), "q4 fixture itself is complete");
++        rejects(q4, [](saved::SavedItem& m) { m.stages[0].kv[0].v.pop_back(); }, "q4 truncated v incomplete",
++                "q4 truncated v refused");
++        rejects(q4, [](saved::SavedItem& m) { m.stages[0].kv[0].ks.push_back(1); }, "q4 with scales incomplete",
++                "q4 with scales refused");
++    }
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }
+-- 
+2.54.0.windows.1
+

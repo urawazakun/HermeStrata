@@ -1,0 +1,108 @@
+From 93c95493db8e27bba8c91074135516b71ad01e35 Mon Sep 17 00:00:00 2001
+From: urawa <30615262+urawazakun@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 04:13:24 +0900
+Subject: [PATCH 1/2] Single-slot local backend: HERMES_WORKSPACE_LATE (git
+ snapshot to volatile tail), HERMES_TITLE_AFTER_TURN (title upgrade after the
+ turn)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/conversation_loop.py |  5 +++++
+ agent/system_prompt.py     |  9 ++++++++-
+ agent/title_generator.py   | 28 ++++++++++++++++++++++++++--
+ 3 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index f27245eb..668c3d89 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1607,6 +1607,11 @@ def run_conversation(
+         moa_config=moa_config,
+         turn_author=turn_author,
+     )
++    try:  # HERMES_TITLE_AFTER_TURN: title upgrades held back until the turn has answered
++        from agent.title_generator import flush_deferred_titles
++        flush_deferred_titles()
++    except Exception:
++        pass
+     return export_current_turn_boundary(agent, result, user_message)
+ 
+ 
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index 37785159..22398a4c 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -640,7 +640,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+     if system_message is not None:
+         context_parts.append(system_message)
+     context_parts.extend(_context_files_part(agent, _ctx_len, _soul_loaded))
+-    if coding_workspace_parts:
++    # Single-slot local backends (HERMES_WORKSPACE_LATE=1): the git snapshot differs every session on one machine,
++    # so it moves to the volatile tail (just before the timestamp) and everything else stays in the reused prefix.
++    workspace_late = bool(coding_workspace_parts) and os.environ.get("HERMES_WORKSPACE_LATE") == "1"
++    if workspace_late:
++        context_parts.extend([*coding_trailing_parts, *post_workspace_parts])
++    elif coding_workspace_parts:
+         context_parts.extend([*coding_workspace_parts, *coding_trailing_parts, *post_workspace_parts])
+     else:
+         # Preserve the stable placement for non-workspace sessions; there is no
+@@ -653,6 +658,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+     # Plugin sections are confined to one coarse anchor in the volatile tail so
+     # a resumed process can reconstruct the stable prefix without re-running plugins.
+     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
++    if workspace_late:
++        volatile_parts.extend(coding_workspace_parts)
+     volatile_parts.append(_timestamp_line(agent))
+     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
+     # host examples cannot shadow it during persisted-prompt validation.
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index eaeb4501..7bb9de7c 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -8,6 +8,7 @@ and neither replaces a name the user typed."""
+ import json
+ import logging
+ import re
++import os
+ import threading
+ from contextlib import suppress
+ from typing import Any, Callable, Optional
+@@ -437,10 +438,33 @@ def maybe_auto_title(
+         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
+         return
+     apply_instant_title(session_db, session_id, user_message, title_callback)
+-    threading.Thread(
++    thread = threading.Thread(
+         target=auto_title_session,
+         args=(session_db, session_id, user_message),
+         kwargs=dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback, runtime_validator=runtime_validator),
+         daemon=True,
+         name="auto-title",
+-    ).start()
++    )
++    if os.environ.get("HERMES_TITLE_AFTER_TURN") == "1":
++        # Single-slot local backends: a title request queued ahead of the turn delays it and evicts the engine's
++        # prompt cache. Hold the upgrade until the turn has answered (flush_deferred_titles at turn end).
++        with _DEFERRED_LOCK:
++            _DEFERRED_TITLES.append(thread)
++        return
++    thread.start()
++
++
++_DEFERRED_TITLES: list = []
++_DEFERRED_LOCK = threading.Lock()
++
++
++def flush_deferred_titles() -> None:
++    """Start title upgrades held back by HERMES_TITLE_AFTER_TURN; called when a turn finishes. Never fatal."""
++    with _DEFERRED_LOCK:
++        pending = list(_DEFERRED_TITLES)
++        _DEFERRED_TITLES.clear()
++    for t in pending:
++        try:
++            t.start()
++        except Exception:
++            logger.debug("Deferred auto-title failed to start", exc_info=True)
+-- 
+2.54.0.windows.1
+

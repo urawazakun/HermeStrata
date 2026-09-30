@@ -1,0 +1,80 @@
+From 1a327cacdd5e1fa8e71896e263f574348b100af9 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 11:02:48 +0900
+Subject: [PATCH 10/16] Verify aux forwarding and cache-safe yield composition
+
+---
+ serve/test_server.py | 58 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 95a8954..7308f12 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -751,5 +751,63 @@ class AuxYield(unittest.TestCase):
+         self.assertEqual(svc._mcp_turns, 0)
+ 
+ 
++    def test_aux_flag_reaches_the_gen_line(self):
++        """S1 forwarding: strata_aux=True rides the GEN line as `aux=1` (the engine then
++        snapshots no tip for it, keeping the main tip budget intact); main traffic has no key."""
++        self.assertIn("aux=1", StrataEngine.sampling_keys({"strata_aux": True}).split())
++        self.assertFalse([k for k in StrataEngine.sampling_keys({}).split() if k.startswith("aux=")])
++        self.assertFalse([k for k in StrataEngine.sampling_keys({"strata_aux": False}).split()
++                          if k.startswith("aux=")])
++
++    def test_aux_flag_reaches_the_engine_over_both_apis(self):
++        """S1 forwarding end to end: an aux HTTP request arrives at engine.generate with
++        strata_aux=True (so the engine resumes but snapshots nothing); a main request has no flag."""
++
++        class Sampled(MockEngine):
++            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++                self.last_sampling = dict(sampling or {})
++                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
++
++        tok = ByteTokenizer()
++        eng = Sampled(tok, "</think>\n\nok", max_context=CTX)
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++
++            def post(path, body):
++                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
++                                             headers={"Content-Type": "application/json"})
++                with urllib.request.urlopen(req, timeout=30) as r:
++                    return json.loads(r.read())
++
++            for path, aux in (("/v1/chat/completions", dict(self.AUX_OPENAI)),
++                              ("/v1/messages", dict(self.AUX_ANTHROPIC))):
++                with self.subTest(path=path):
++                    post(path, aux)
++                    self.assertTrue(eng.last_sampling.get("strata_aux"), eng.last_sampling)
++            post("/v1/chat/completions",
++                 {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
++            self.assertNotIn("strata_aux", eng.last_sampling, eng.last_sampling)
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_aux_yields_across_mcp_rounds(self):
++        """S1 yield: an aux request waits while an MCP turn holds the engine between rounds
++        (_mcp_turns covers the gaps, not just active generation)."""
++        tok = ByteTokenizer()
++        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        with svc.status_lock:
++            svc._mcp_turns = 1
++        try:
++            self.assertFalse(svc._yield_to_main_turn(threading.Event(), wait=0.3, grace=0))
++        finally:
++            with svc.status_lock:
++                svc._mcp_turns = 0
++        self.assertTrue(svc._yield_to_main_turn(threading.Event(), wait=5, grace=0))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.54.0.windows.1
+

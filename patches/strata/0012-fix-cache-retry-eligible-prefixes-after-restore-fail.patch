@@ -1,0 +1,860 @@
+From 23e193ccfaf204d065d8641b2e68123a3555cfb1 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 11:04:29 +0900
+Subject: [PATCH 12/16] fix(cache): retry eligible prefixes after restore
+ failures (F1)
+
+---
+ src/program/generate.cpp         | 683 ++++++++++++++++++++-----------
+ src/program/saved_state_test.cpp |  47 +++
+ 2 files changed, 498 insertions(+), 232 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0b76e80..9a62a99 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1129,12 +1129,14 @@ bool saved_snapshot_stage(const strata::core::SessionState& ss, const strata::co
+     return true;
+ }
+ 
+-// ---- E2: SavedState restore (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum).
+-// Implemented: Muse / review: Sol. Longest exact-prefix live-chain/tip/root match (chain wins ties);
+-// roots/tips are independent of chain pruning and --prompt-cache. ALL validation (geometry, payload sizes,
+-// MTP reachable valid_from) runs BEFORE any GPU state is touched; any failure at any stage takes the cold
+-// path (session_zero on ALL stages, chain cleared, resume 0) - never a stale chain after overwritten KV,
+-// never silently consuming corrupted state.
++// ---- E2/F1: SavedState restore (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum;
++// F1: BRIEF-CACHE-FIX-1 - failed restores fall through to the next candidate, never to cold).
++// Implemented: Muse / review: Sol. Unified longest-first walk over {live, chain, tip, root} (chain wins
++// ties); roots/tips are independent of chain pruning and --prompt-cache. ALL validation (geometry, payload
++// sizes, MTP reachable valid_from) plus the chain/live boundary-repair pre-check runs BEFORE any GPU state
++// is touched; any mount/boundary failure at any stage resets for coherence (session_zero on ALL stages,
++// chain cleared) and tries the next shorter candidate - cold (resume 0) only when exhausted. Never a stale
++// chain after overwritten KV, never silently consuming corrupted state.
+ //
+ // E2 REVIEW MAP (for Sol) - where each repair lives:
+ //   KV repair:    saved_restore_kv() per layer: host copy for kv-resident streamed/ring layouts, device pools
+@@ -4508,70 +4510,163 @@ int main(int argc, char** argv) {
+             }
+             int64_t resume = 0;
+             bool from_live = false;
+-            mtp.set_prompt_len(n);   // E2: the new request's length before resume selection - the restore
+-                                     // validation reads prefill_valid_from() (the new drafter window) from it
+-            if (o.prompt_cache > 0) {
+-                if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
+-                for (const ConvCheckpoint& c : checks)
+-                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
+-                        resume = (int64_t) c.ids.size();
+-                        from_live = false;
+-                    }
+-            }
+-            // E2: the SavedState lookup (DESIGN-HERMES-CACHE.md section 1 resume rule). Independent of chain
+-            // pruning and --prompt-cache (finding 4: tips work with cache 0). Eligibility filter BEFORE the
+-            // longest choice (blocker 2): walk longest-first, skipping k>=n (the decoder starts at p=n-1 with
+-            // n-1 consumed inputs - mounting n cells would double-feed the last prompt token) and anything
+-            // failing validation, so a shorter valid root/tip wins over cold. The first valid candidate mounts
+-            // once; a failed UPLOAD goes cold (the GPU may be partially written - the chain is never retried
+-            // over overwritten KV). Ties and shorter candidates stay on the live chain (no upload).
+             bool from_saved = false;
+             const saved::SavedItem* saved_hit = nullptr;
+             // E3: a disk-loaded mount lives here for the request (a local: no store mutation can move it).
+             saved::SavedItem disk_mount;
+             const saved::SavedItem* disk_hit = nullptr;
+             std::string disk_hit_path;
++            int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
++            static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
++            mtp.set_prompt_len(n);   // E2: the new request's length before resume selection - the restore
++                                     // validation reads prefill_valid_from() (the new drafter window) from it
+             std::vector<int32_t> ids32;
+             ids32.reserve((size_t) n);
+             for (int64_t t : ids) ids32.push_back((int32_t) t);
+             std::vector<saved::ImgKey> req_simgs;
+             req_simgs.reserve(req_imgs.size());
+             for (const ImgKey& k : req_imgs) req_simgs.push_back({k.start, k.hash});
+-            // E4: actual restore cost (uploads + the repairs below, not cold prefill). Segment A: the saved walk.
++            // E4: actual restore cost (uploads + the repairs below, not cold prefill): the whole F1 walk.
+             const auto e4_restore_t0 = Clock::now();
+             try {
+-                // accumulating skip set (blocker 5 review): each rejected candidate joins, so the walk is
+-                // longest-first without revisit and always terminates (both sides exhausted ends it).
+-                std::vector<const saved::SavedItem*> cand_skip;
+                 // E3: the disk side's own skip set (paths): a failed lazy load or validation tries the next
+-                // shorter on-disk root, never the same file twice.
++                // shorter on-disk root, never the same file twice. The disk peek in the loop below is
++                // metadata-only; the payload is lazy-loaded only when the disk entry is the longest side.
+                 std::vector<std::string> disk_skip;
+                 const bool use_disk = root_disk_store.enabled();
+-                for (;;) {
+-                    const saved::SavedItem* cand =
+-                        saved_states.find_best_except(ids32, req_simgs, cvec_cached, cand_skip);
+-                    const int64_t sk_ram = cand == nullptr ? -1 : (int64_t)cand->ids.size();
+-                    // E3: the longest on-disk root strictly above the chain resume and below n (chain wins
+-                    // ties; k == n never mounts). Metadata-only: no payload is read until the entry is the
+-                    // longest candidate.
++                // F1 (BRIEF-CACHE-FIX-1) + E3 disk: unified longest-first walk over {live, chain,
++                // RAM saved, on-disk roots}. Collection is CPU-only (no GPU touched): chain/live prefix matches WITH an MTP boundary repair source (a
++                // chain checkpoint carries no MTP rows of its own - without the live row or a same-length saved
++                // boundary the k-1 cell cannot be paired, so the candidate is not offered), saved longest-first
++                // WITH full restore validation (independent of chain pruning and --prompt-cache, finding 4:
++                // tips work with cache 0). The attempt loop mounts in that order, ties preferring live/chain
++                // (no upload); ANY mount/boundary failure logs and continues with the next shorter candidate -
++                // cold only when exhausted. After any mount attempt the GPU may be partially written:
++                // cold_reset_all restores coherence and kills the remaining live/chain candidacy (the reset
++                // clears the checks; the store is untouched, so shorter saved candidates stay tryable). Every
++                // continue retires one candidate (or kills the chain), so the loop always terminates.
++                const size_t f1_hcn = (size_t) g.hc * (size_t) g.n_embd;
++                const int64_t f1_new_vf = mtp.prefill_valid_from();
++                auto f1_chain_repairable = [&](int64_t k, bool is_live) -> bool {
++                    try {
++                    if (k < 1 || k >= n || f1_hcn == 0) return false;
++                    if (is_live) {
++                        return live_bdry_L == k && live_bdry.size() == f1_hcn && f1_hcn > 0 &&
++                               live_bdry_hash == fnv1a(live.data(), live.size() * sizeof(int32_t)) &&
++                               f1_new_vf >= live_bdry_vf;
++                    }
++                    const saved::SavedItem* exact =
++                        saved_states.find_exact(ids32, req_simgs, cvec_cached, k);
++                    return exact != nullptr && exact->boundary.complete() &&
++                           exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
++                           exact->boundary.row.size() == f1_hcn && f1_new_vf >= exact->mtp.valid_from;
++                    } catch (const std::exception& ex) {
++                        std::fprintf(stderr, "strata serve: candidate at %lld tokens repair check threw (%s): "
++                                             "trying shorter\n", (long long) k, ex.what());
++                        return false;
++                    } catch (...) {
++                        std::fprintf(stderr, "strata serve: candidate at %lld tokens repair check threw: "
++                                             "trying shorter\n", (long long) k);
++                        return false;
++                    }
++                };
++                struct F1ChainCand { int64_t k; bool live; };
++                std::vector<F1ChainCand> f1_chain;
++                if (o.prompt_cache > 0) {
++                    if (live_ok && starts_with(live, live_imgs)) {
++                        const int64_t lk = (int64_t) live.size();
++                        if (f1_chain_repairable(lk, true))
++                            f1_chain.push_back({lk, true});
++                        else
++                            std::fprintf(stderr, "strata serve: live candidate at %lld tokens has no MTP "
++                                                 "boundary repair source: trying shorter\n", (long long) lk);
++                    }
++                    for (const ConvCheckpoint& cc : checks) {
++                        const int64_t ck = (int64_t) cc.ids.size();
++                        if (!starts_with(cc.ids, cc.imgs)) continue;
++                        if (f1_chain_repairable(ck, false))
++                            f1_chain.push_back({ck, false});
++                        else
++                            std::fprintf(stderr, "strata serve: chain candidate at %lld tokens has no MTP "
++                                                 "boundary repair source: trying shorter\n", (long long) ck);
++                    }
++                    std::sort(f1_chain.begin(), f1_chain.end(), [](const F1ChainCand& a, const F1ChainCand& b) {
++                        if (a.k != b.k) return a.k > b.k;
++                        return a.live && !b.live;
++                    });
++                }
++                std::vector<const saved::SavedItem*> f1_saved;   // validated, longest-first
++                {
++                    // accumulating skip set (blocker 5 review): each rejected candidate joins, so the walk is
++                    // longest-first without revisit and always terminates (cand==nullptr ends it).
++                    std::vector<const saved::SavedItem*> skip;
++                    for (;;) {
++                        const saved::SavedItem* cand =
++                            saved_states.find_best_except(ids32, req_simgs, cvec_cached, skip);
++                        if (cand == nullptr) break;
++                        const int64_t sk = (int64_t) cand->ids.size();
++                        if (sk >= n) {
++                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens skipped "
++                                                 "(at/past the request end)\n",
++                                         (long long) sk);
++                            skip.push_back(cand);
++                            continue;
++                        }
++                        std::string why;
++                        bool eligible = false;
++                        try {
++                            eligible = saved_validate_for_restore(*cand, ids32, req_simgs, cvec_cached, n, g,
++                                                                  ss, stages, mtp, why);
++                        } catch (const std::exception& ex) {
++                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens validation "
++                                                 "threw (%s): trying shorter\n",
++                                         (long long) sk, ex.what());
++                            skip.push_back(cand);
++                            continue;
++                        } catch (...) {
++                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens validation "
++                                                 "threw: trying shorter\n",
++                                         (long long) sk);
++                            skip.push_back(cand);
++                            continue;
++                        }
++                        if (!eligible) {
++                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens ineligible "
++                                                 "(%s): trying shorter\n",
++                                         (long long) sk, why.c_str());
++                            skip.push_back(cand);
++                            continue;
++                        }
++                        f1_saved.push_back(cand);
++                        skip.push_back(cand);
++                    }
++                }
++                bool chain_dead = false;   // a mount was attempted: live/chain no longer trustworthy
++                for (size_t f1_ci = 0, f1_si = 0;;) {
++                    // E3: longest on-disk root below n (chain wins ties; k == n never mounts).
++                    // Metadata-only: no payload is read until the entry is the longest side.
+                     saved::RootDiskStore::Entry dent;
+                     const bool have_dent =
+                         use_disk && root_disk_store.find_match(ids32, req_simgs, cvec_cached,
+-                                                               disk_skip, resume, n, dent);
++                                                               disk_skip, -1, n, dent);
+                     const int64_t sk_disk = have_dent ? (int64_t)dent.meta.ids.size() : -1;
+-                    if (sk_ram <= resume && sk_disk <= resume) break;
+-                    // The longer side mounts (disk wins strict-longer only: an equal-length RAM item needs
+-                    // no disk read). Either side's rejection tries the next shorter on its own side.
+-                    const saved::SavedItem* mount_src = nullptr;
+-                    int64_t sk = -1;
+-                    bool mount_disk = false;
+-                    std::string dent_path;
+-                    if (sk_disk > sk_ram) {
++                    const int64_t sk_ram =
++                        f1_si < f1_saved.size() ? (int64_t) f1_saved[f1_si]->ids.size() : -1;
++                    const int64_t sk_saved = sk_disk > sk_ram ? sk_disk : sk_ram;
++                    bool take_chain = false;
++                    if (!chain_dead && f1_ci < f1_chain.size() &&
++                        ((f1_si >= f1_saved.size() && sk_disk < 0) ||
++                         f1_chain[f1_ci].k >= sk_saved))
++                        take_chain = true;   // ties prefer live/chain: no upload
++                    if (!take_chain && f1_si >= f1_saved.size() && sk_disk < 0) break;   // exhausted: cold below
++                    // E3: the disk side mounts here (strict-longer only over RAM: an equal-length RAM
++                    // item needs no disk read). Load/validation failures retire the file and try shorter.
++                    if (!take_chain && sk_disk > sk_ram) {
+                         std::string why;
+                         if (!root_disk_store.load_item(dent, disk_mount, why)) {
+                             std::fprintf(stderr, "strata serve: root-disk at %lld tokens unreadable "
+                                                  "(%s): trying shorter\n",
+-                                          (long long)sk_disk, why.c_str());
++                                         (long long)sk_disk, why.c_str());
+                             // Invalidate the index entry: without this the corrupt file pins its key
+                             // (enqueue dedups against the index) and a recaptured root could never
+                             // replace it. The file itself stays for trim; the rewrite replaces it.
+@@ -4583,48 +4678,251 @@ int main(int argc, char** argv) {
+                                                         ss, stages, mtp, why)) {
+                             std::fprintf(stderr, "strata serve: root-disk at %lld tokens ineligible "
+                                                  "(%s): trying shorter\n",
+-                                          (long long)sk_disk, why.c_str());
++                                         (long long)sk_disk, why.c_str());
+                             root_disk_store.drop_path(dent.path);
+                             disk_skip.push_back(dent.path);
+                             continue;
+                         }
+-                        mount_src = &disk_mount;
+-                        sk = sk_disk;
+-                        mount_disk = true;
+-                        dent_path = dent.path;
+-                    } else {
+-                        if (sk_ram >= n) {
+-                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens skipped "
+-                                                 "(at/past the request end)\n",
+-                                         (long long)sk_ram);
+-                            cand_skip.push_back(cand);
++                        // Retire for this request before touching the GPU: a failed upload/repair below
++                        // resets for coherence, kills live/chain, and tries shorter (never this file again).
++                        disk_skip.push_back(dent.path);
++                        const saved::SavedItem* mount_src = &disk_mount;
++                        const int64_t sk = sk_disk;
++                        const std::string dent_path = dent.path;
++                        bool ok = cudaDeviceSynchronize() == cudaSuccess;
++                        std::string why2;
++                        if (!ok) why2 = "device not idle";
++                        if (ok && !saved_restore_stage(ss, g, mount_src->stages[0], mount_src->ids, sk, main_cs,
++                                                       why2))
++                            ok = false;
++                        for (size_t i = 0; ok && i < stages.size(); ++i) {
++                            const strata::core::OnDevice on(stages[i]->dev);
++                            if (!saved_restore_stage(stages[i]->ss, g, mount_src->stages[i + 1],
++                                                     mount_src->ids, sk, (void*)stages[i]->stream, why2))
++                                ok = false;
++                        }
++                        if (ok && !saved_restore_mtp(mtp, g, mount_src->mtp, why2)) ok = false;
++                        if (ok) {   // order the streamed-slot resets before any later resolve reads them
++                            if (cudaDeviceSynchronize() != cudaSuccess) { why2 = "restore sync failed"; ok = false; }
++                            for (size_t i = 0; ok && i < stages.size(); ++i) {
++                                const strata::core::OnDevice on(stages[i]->dev);
++                                if (cudaDeviceSynchronize() != cudaSuccess) {
++                                    why2 = "stage sync failed";
++                                    ok = false;
++                                }
++                            }
++                        }
++                        if (!ok) {
++                            std::fprintf(stderr, "strata serve: root-disk restore at %lld tokens failed (%s): "
++                                                 "trying shorter\n",
++                                         (long long) sk, why2.c_str());
++                            if (!cold_reset_all()) {
++                                std::printf("ERR SavedState cold reset failed after a failed mount\n");
++                                return 1;
++                            }
++                            chain_dead = true;
++                            live_ok = false;
+                             continue;
+                         }
+-                        std::string why;
+-                        if (!saved_validate_for_restore(*cand, ids32, req_simgs, cvec_cached, n, g, ss,
+-                                                        stages, mtp, why)) {
+-                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens ineligible "
+-                                                 "(%s): trying shorter\n",
+-                                         (long long)sk_ram, why.c_str());
+-                            cand_skip.push_back(cand);
++                        mtp.kv_restore(sk);
++                        {
++                            const saved::BoundaryRow& b = mount_src->boundary;
++                            const int32_t btok = (int32_t) ids[(size_t) sk];
++                            std::string be;
++                            bool bok = b.row.size() == f1_hcn && f1_hcn > 0;
++                            try {
++                                const strata::core::OnDevice on_row(mtp.device());
++                                std::unique_ptr<float, CudaFreeDel> bdev;
++                                float* raw = nullptr;
++                                if (bok && cudaMalloc(&raw, f1_hcn * sizeof(float)) == cudaSuccess) {
++                                    bdev.reset(raw);
++                                    if (cudaMemcpy(bdev.get(), b.row.data(), f1_hcn * sizeof(float),
++                                                   cudaMemcpyHostToDevice) == cudaSuccess)
++                                        bok = mtp.prefill(bdev.get(), &btok, 1, sk - 1, be);
++                                    else
++                                        bok = false;
++                                } else {
++                                    bok = false;
++                                }
++                            } catch (const std::exception& ex) {
++                                bok = false;
++                                be = ex.what();
++                            } catch (...) { bok = false; }
++                            if (!bok) {
++                                std::fprintf(stderr, "strata serve: root-disk boundary repair at %lld failed "
++                                                     "(%s): trying shorter\n",
++                                             (long long) sk, be.empty() ? "staging failed" : be.c_str());
++                                if (!cold_reset_all()) {
++                                    std::printf("ERR SavedState cold reset failed after a failed repair\n");
++                                    return 1;
++                                }
++                                chain_dead = true;
++                                live_ok = false;
++                                continue;
++                            }
++                        }
++                        resume = sk;
++                        from_live = false;
++                        from_saved = true;
++                        saved_hit = nullptr;
++                        disk_hit = &disk_mount;
++                        disk_hit_path = dent_path;
++                        live_bdry_L = -1;   // the session now holds the snapshot's line, not the old live one
++                        break;
++                    }
++                    if (take_chain) {
++                        const int64_t k = f1_chain[f1_ci].k;
++                        const bool is_live = f1_chain[f1_ci].live;
++                        ++f1_ci;
++                        try {
++                        if (reread) {
++                            // STRATA_CKPT_REREAD debug mode: re-read instead of restoring (as before).
++                            strata::core::session_zero(ss, g, nullptr, main_cs);
++                            cudaStreamSynchronize(main_stream);
++                            for (auto& st : stages) {
++                                const strata::core::OnDevice on(st->dev);
++                                strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
++                                cudaStreamSynchronize(st->stream);
++                            }
++                            reread_to = k;
++                            live_bdry_L = -1;
++                            std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
++                                                 "restoring\n", (long long) k);
++                            resume = k;
++                            from_live = is_live;
++                            break;
++                        }
++                        ConvCheckpoint* c = nullptr;
++                        if (!is_live) {
++                            for (ConvCheckpoint& kk : checks)
++                                if ((int64_t) kk.ids.size() == k) c = &kk;
++                            if (c == nullptr) { chain_dead = true; continue; }   // cleared under us: drop chain
++                            c->used = ++check_clock;   // mounting through it is the use LRU counts
++                        }
++                        bool mounted = is_live || checkpoint_restore(*c, ss, g);
++                        if (mounted && !is_live && c->stage_parts.size() != stages.size()) mounted = false;
++                        if (mounted && !is_live) {
++                            for (size_t i = 0; i < stages.size(); ++i) {
++                                const strata::core::OnDevice on(stages[i]->dev);
++                                if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) {
++                                    mounted = false;
++                                    break;
++                                }
++                            }
++                        }
++                        if (!mounted) {
++                            // F1: a failed mount falls through to shorter candidates (never fatal, never cold
++                            // yet). The GPU may be partially written: reset for coherence, drop live/chain.
++                            std::fprintf(stderr, "strata serve: conversation checkpoint restore at %lld tokens "
++                                                 "failed: trying shorter\n", (long long) k);
++                            if (!cold_reset_all()) {
++                                std::printf("ERR checkpoint cold reset failed after a failed mount\n");
++                                return 1;
++                            }
++                            chain_dead = true;
++                            live_ok = false;
++                            continue;
++                        }
++                        // KV streaming: the drafter's ring may hold cells past k from a longer turn; refill it
++                        // from the live host rows before the boundary pairing below overwrites cell k-1.
++                        mtp.kv_restore(k);
++                        // E2b boundary repair (was below: ALWAYS repair cell k-1, no proven-older shortcut).
++                        // The repairability pre-check above ran on untouched state, so a failure here is
++                        // transient: reset and fall through, same as a failed mount.
++                        {
++                            const int32_t btok = (int32_t) ids[(size_t) k];
++                            const float* bdry_src = nullptr;
++                            if (is_live && live_bdry_L == k && live_bdry.size() == f1_hcn && f1_hcn > 0 &&
++                                live_bdry_hash == fnv1a(live.data(), live.size() * sizeof(int32_t)) &&
++                                f1_new_vf >= live_bdry_vf) {
++                                bdry_src = live_bdry.data();
++                            } else if (!is_live) {
++                                const saved::SavedItem* exact =
++                                    saved_states.find_exact(ids32, req_simgs, cvec_cached, k);
++                                if (exact != nullptr && exact->boundary.complete() &&
++                                    exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
++                                    exact->boundary.row.size() == f1_hcn && f1_hcn > 0 &&
++                                    f1_new_vf >= exact->mtp.valid_from)
++                                    bdry_src = exact->boundary.row.data();
++                            }
++                            const int32_t btok_use = bdry_src == nullptr ? 0 : btok;
++                            std::string be;
++                            bool bok = bdry_src != nullptr;
++                            try {
++                                const strata::core::OnDevice on_row(mtp.device());
++                                std::unique_ptr<float, CudaFreeDel> bdev;
++                                float* raw = nullptr;
++                                if (bok && cudaMalloc(&raw, f1_hcn * sizeof(float)) == cudaSuccess) {
++                                    bdev.reset(raw);
++                                    if (cudaMemcpy(bdev.get(), bdry_src, f1_hcn * sizeof(float),
++                                                   cudaMemcpyHostToDevice) == cudaSuccess)
++                                        bok = mtp.prefill(bdev.get(), &btok_use, 1, k - 1, be);
++                                    else
++                                        bok = false;
++                                } else {
++                                    bok = false;
++                                }
++                            } catch (const std::exception& ex) {
++                                bok = false;
++                                be = ex.what();
++                            } catch (...) { bok = false; }
++                            if (!bok) {
++                                std::fprintf(stderr, "strata serve: MTP boundary at %lld missing/unrepaired "
++                                                     "(%s): trying shorter\n",
++                                             (long long) (k - 1), be.empty() ? "no repair source" : be.c_str());
++                                if (!cold_reset_all()) {
++                                    std::printf("ERR MTP boundary cold reset failed\n");
++                                    return 1;
++                                }
++                                chain_dead = true;
++                                live_ok = false;
++                                continue;
++                            }
++                        }
++                        resume = k;
++                        from_live = is_live;
++                        from_saved = false;
++                        break;
++                        } catch (const std::exception& ex) {
++                            // F1: a throwing mount/repair/ring-refill is a failed candidate, not a cold request:
++                            // log, reset for coherence (the GPU may be touched), drop live/chain, continue.
++                            std::fprintf(stderr, "strata serve: live/chain candidate at %lld tokens threw (%s): "
++                                                 "trying shorter\n", (long long) k, ex.what());
++                            if (!cold_reset_all()) {
++                                std::printf("ERR MTP boundary cold reset failed\n");
++                                return 1;
++                            }
++                            chain_dead = true;
++                            live_ok = false;
++                            continue;
++                        } catch (...) {
++                            std::fprintf(stderr, "strata serve: live/chain candidate at %lld tokens threw: "
++                                                 "trying shorter\n", (long long) k);
++                            if (!cold_reset_all()) {
++                                std::printf("ERR MTP boundary cold reset failed\n");
++                                return 1;
++                            }
++                            chain_dead = true;
++                            live_ok = false;
+                             continue;
+                         }
+-                        mount_src = cand;
+-                        sk = sk_ram;
+                     }
+-                    bool ok = cudaDeviceSynchronize() == cudaSuccess;
++                    const saved::SavedItem* cand = f1_saved[f1_si++];
++                    const int64_t sk = (int64_t) cand->ids.size();
+                     std::string why;
++                    try {
++                    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+                     if (!ok) why = "device not idle";
+-                    if (ok && !saved_restore_stage(ss, g, mount_src->stages[0], mount_src->ids, sk, main_cs,
++                    if (ok && !saved_restore_stage(ss, g, cand->stages[0], cand->ids, sk, main_cs,
+                                                    why))
+                         ok = false;
+                     for (size_t i = 0; ok && i < stages.size(); ++i) {
+                         const strata::core::OnDevice on(stages[i]->dev);
+-                        if (!saved_restore_stage(stages[i]->ss, g, mount_src->stages[i + 1],
+-                                                 mount_src->ids, sk, (void*)stages[i]->stream, why))
++                        if (!saved_restore_stage(stages[i]->ss, g, cand->stages[i + 1],
++                                                 cand->ids, sk, (void*)stages[i]->stream, why))
+                             ok = false;
+                     }
+-                    if (ok && !saved_restore_mtp(mtp, g, mount_src->mtp, why)) ok = false;
++                    if (ok && !saved_restore_mtp(mtp, g, cand->mtp, why)) ok = false;
+                     if (ok) {   // order the streamed-slot resets before any later resolve reads them
+                         if (cudaDeviceSynchronize() != cudaSuccess) { why = "restore sync failed"; ok = false; }
+                         for (size_t i = 0; ok && i < stages.size(); ++i) {
+@@ -4636,26 +4934,91 @@ int main(int argc, char** argv) {
+                         }
+                     }
+                     if (!ok) {
++                        // F1: fall through to the next shorter candidate (cold only when exhausted). Reset
++                        // for coherence first: the GPU may be partially written, so live/chain are dead.
+                         std::fprintf(stderr, "strata serve: SavedState restore at %lld tokens failed (%s): "
+-                                             "cold prefill\n",
+-                                     (long long)sk, why.c_str());
++                                             "trying shorter\n",
++                                     (long long) sk, why.c_str());
+                         if (!cold_reset_all()) {
+                             std::printf("ERR SavedState cold reset failed after a failed mount\n");
+                             return 1;
+                         }
+-                        resume = 0;
+-                    } else {
+-                        resume = sk;
+-                        from_saved = true;
+-                        if (mount_disk) {
+-                            disk_hit = &disk_mount;
+-                            disk_hit_path = dent_path;
+-                        } else {
+-                            saved_hit = cand;
++                        chain_dead = true;
++                        live_ok = false;
++                        continue;
++                    }
++                    // After a saved mount refill the ring from the RESTORED host rows (saved_restore_mtp put
++                    // them there) - so the boundary pairing below runs after it, overwriting cell k-1.
++                    mtp.kv_restore(sk);
++                    // E2 boundary repair (MtpPayload invariant: cell i pairs R_i with tok_{i+1}): pair cell
++                    // k-1 with the first suffix token BEFORE the suffix prefill (which still starts at k).
++                    {
++                        const saved::BoundaryRow& b = cand->boundary;
++                        const int32_t btok = (int32_t) ids[(size_t) sk];
++                        std::string be;
++                        bool bok = b.row.size() == f1_hcn && f1_hcn > 0;
++                        try {
++                            const strata::core::OnDevice on_row(mtp.device());
++                            std::unique_ptr<float, CudaFreeDel> bdev;
++                            float* raw = nullptr;
++                            if (bok && cudaMalloc(&raw, f1_hcn * sizeof(float)) == cudaSuccess) {
++                                bdev.reset(raw);
++                                if (cudaMemcpy(bdev.get(), b.row.data(), f1_hcn * sizeof(float),
++                                               cudaMemcpyHostToDevice) == cudaSuccess)
++                                    bok = mtp.prefill(bdev.get(), &btok, 1, sk - 1, be);
++                                else
++                                    bok = false;
++                            } else {
++                                bok = false;
++                            }
++                        } catch (const std::exception& ex) {
++                            bok = false;
++                            be = ex.what();
++                        } catch (...) { bok = false; }
++                        if (!bok) {
++                            std::fprintf(stderr, "strata serve: SavedState boundary repair at %lld failed "
++                                                 "(%s): trying shorter\n",
++                                         (long long) sk, be.empty() ? "staging failed" : be.c_str());
++                            if (!cold_reset_all()) {
++                                std::printf("ERR SavedState cold reset failed after a failed repair\n");
++                                return 1;
++                            }
++                            chain_dead = true;
++                            live_ok = false;
++                            continue;
+                         }
+-                        live_bdry_L = -1;   // the session now holds the snapshot's line, not the old live one
+                     }
++                    resume = sk;
++                    from_live = false;
++                    from_saved = true;
++                    saved_hit = cand;
++                    live_bdry_L = -1;   // the session now holds the snapshot's line, not the old live one
+                     break;
++                    } catch (const std::exception& ex) {
++                        // F1: same as the chain branch above - a throw retires this candidate, never colds the
++                        // request while shorter candidates remain.
++                        std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens threw (%s): "
++                                             "trying shorter\n",
++                                     (long long) sk, ex.what());
++                        if (!cold_reset_all()) {
++                            std::printf("ERR SavedState cold reset failed after a failed mount\n");
++                            return 1;
++                        }
++                        chain_dead = true;
++                        live_ok = false;
++                        continue;
++                    } catch (...) {
++                        std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens threw: "
++                                             "trying shorter\n",
++                                     (long long) sk);
++                        if (!cold_reset_all()) {
++                            std::printf("ERR SavedState cold reset failed after a failed mount\n");
++                            return 1;
++                        }
++                        chain_dead = true;
++                        live_ok = false;
++                        continue;
++                    }
+                 }
+             } catch (const std::exception& ex) {
+                 std::fprintf(stderr, "strata serve: SavedState selection threw (%s): cold prefill\n", ex.what());
+@@ -4686,8 +5049,6 @@ int main(int argc, char** argv) {
+                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                          }), checks.end());
+             live_ok = false;   // until this request has finished, the session is in between
+-            int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+-            const auto e4_chain_t0 = Clock::now();   // E4 segment B: a chain checkpoint mount (memcpy restore)
+             if (resume == 0) {
+                 strata::core::session_zero(ss, g, nullptr, main_cs);
+                 cudaStreamSynchronize(main_stream);
+@@ -4698,152 +5059,12 @@ int main(int argc, char** argv) {
+                 }
+                 checks.clear();
+                 live_bdry_L = -1;
+-            } else if (!from_live && !from_saved) {
+-                ConvCheckpoint* c = nullptr;
+-                for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
+-                if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
+-                static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+-                if (reread && c != nullptr) {
+-                    // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
+-                    // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
+-                    // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
+-                    // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
+-                    // checkpoint missed shows up as a difference.
+-                    strata::core::session_zero(ss, g, nullptr, main_cs);
+-                    cudaStreamSynchronize(main_stream);
+-                    for (auto& st : stages) {
+-                        const strata::core::OnDevice on(st->dev);
+-                        strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+-                        cudaStreamSynchronize(st->stream);
+-                    }
+-                    reread_to = resume;
+-                    live_bdry_L = -1;
+-                    std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
+-                                         "restoring\n", (long long) resume);
+-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+-                           [&] {
+-                               for (size_t i = 0; i < stages.size(); ++i) {
+-                                   const strata::core::OnDevice on(stages[i]->dev);
+-                                   if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
+-                               }
+-                               return false;
+-                           }()) {
+-                    std::printf("ERR restoring a conversation checkpoint failed\n");
+-                    return 1;
+-                }
+             }
+-            // E4: a chain checkpoint mount costs its memcpy restore; cold (resume==0), live (no copy) and the
+-            // reread debug mode contribute nothing. Segment C starts: the ring refill (trivial) + the repairs.
+-            if (!from_live && !from_saved && resume > 0 && reread_to <= 0)
+-                saved_stats.restore_ms +=
+-                    std::chrono::duration<double, std::milli>(Clock::now() - e4_chain_t0).count();
+-            const auto e4_repair_t0 = Clock::now();
+-            // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
+-            // host copies and slots are always current (every writer writes both), so they need nothing.
+-            // After a saved mount this refills the ring from the RESTORED host rows (saved_restore_mtp put them
+-            // there) - so the boundary pairing below runs after it, overwriting cell k-1 with the real pair.
+-            if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
++            // F1: live/chain/saved/disk mounts (and their boundary repairs) all ran inside the attempt
++            // loop above; resume/from_live/from_saved/saved_hit/disk_hit/reread_to are final here. Cold (resume==0) reads from 0.
+             tr("request", n, geni ? 1 : 0);
+-            // E2 boundary repair (MtpPayload invariant: cell i pairs R_i with tok_{i+1}): the snapshot holds
+-            // pairs [0, k-1) and R_(k-1); pair cell k-1 with the first suffix token BEFORE the suffix prefill.
+-            // The suffix still starts at k. k==n never reaches here (rejected in selection: the decoder would
+-            // double-feed the last prompt token), so tok_k always exists.
+-            if (from_saved && reread_to <= 0 && resume < n) {
+-                // E3: the repair row rides with the mount source (RAM store or the disk-loaded item).
+-                const saved::BoundaryRow& b = disk_hit != nullptr ? disk_hit->boundary : saved_hit->boundary;
+-                const int32_t btok = (int32_t) ids[(size_t) resume];
+-                const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
+-                std::string be;
+-                bool bok = b.row.size() == hcn && hcn > 0;
+-                try {
+-                    const strata::core::OnDevice on_row(mtp.device());
+-                    std::unique_ptr<float, CudaFreeDel> bdev;   // after the guard: freed on this device
+-                    float* raw = nullptr;
+-                    if (bok && cudaMalloc(&raw, hcn * sizeof(float)) == cudaSuccess) {
+-                        bdev.reset(raw);
+-                        if (cudaMemcpy(bdev.get(), b.row.data(), hcn * sizeof(float),
+-                                       cudaMemcpyHostToDevice) == cudaSuccess)
+-                            bok = mtp.prefill(bdev.get(), &btok, 1, resume - 1, be);
+-                        else
+-                            bok = false;
+-                    } else {
+-                        bok = false;
+-                    }
+-                } catch (const std::exception& ex) {
+-                    bok = false;
+-                    be = ex.what();
+-                } catch (...) { bok = false; }
+-                if (!bok) {
+-                    std::fprintf(stderr, "strata serve: SavedState boundary repair at %lld failed (%s): "
+-                                         "cold prefill\n",
+-                                 (long long) resume, be.empty() ? "staging failed" : be.c_str());
+-                    if (!cold_reset_all()) {
+-                        std::printf("ERR SavedState cold reset failed after a failed repair\n");
+-                        return 1;
+-                    }
+-                    resume = 0;
+-                    from_saved = false;
+-                    saved_hit = nullptr;
+-                    disk_hit = nullptr;
+-                }
+-            }
+-            // E2b (Sol final review): ALWAYS repair chain/live cell k-1 - no proven-older shortcut. The
+-            // mounted k cells do not determine the pair: it needs tok_k, and the new request may share the
+-            // first k tokens while changing tok_k (then the old pair is simply wrong). A shorter new request
+-            // can also reach window-skipped old pairs the mounted line never proved. So pair (R_(k-1), tok_k)
+-            // fresh from the live row (live line only - hash lineage) or a same-length saved boundary (prefix
+-            // lineage, no upload; find_exact sees it even under a longer tip), else cold - on the repeated
+-            // token correctness baseline no unknown MTP bytes are accepted. Both sources carry a valid_from
+-            // and the new window must not reach below it (reject/cold otherwise).
+-            if (!from_saved && resume > 0 && reread_to <= 0 && resume < n) {
+-                const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
+-                const int64_t new_vf = mtp.prefill_valid_from();
+-                const float* bdry_src = nullptr;
+-                if (from_live && live_bdry_L == resume && live_bdry.size() == hcn && hcn > 0 &&
+-                    live_bdry_hash == fnv1a(live.data(), live.size() * sizeof(int32_t)) &&
+-                    new_vf >= live_bdry_vf) {
+-                    bdry_src = live_bdry.data();
+-                } else if (!from_live) {
+-                    const saved::SavedItem* exact =
+-                        saved_states.find_exact(ids32, req_simgs, cvec_cached, resume);
+-                    if (exact != nullptr && exact->boundary.complete() &&
+-                        exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
+-                        exact->boundary.row.size() == hcn && hcn > 0 &&
+-                        new_vf >= exact->mtp.valid_from)
+-                        bdry_src = exact->boundary.row.data();
+-                }
+-                    const int32_t btok = bdry_src == nullptr ? 0 : (int32_t) ids[(size_t) resume];
+-                    std::string be;
+-                    bool bok = bdry_src != nullptr;
+-                    try {
+-                        const strata::core::OnDevice on_row(mtp.device());
+-                        std::unique_ptr<float, CudaFreeDel> bdev;   // after the guard: freed on this device
+-                        float* raw = nullptr;
+-                        if (bok && cudaMalloc(&raw, hcn * sizeof(float)) == cudaSuccess) {
+-                            bdev.reset(raw);
+-                            if (cudaMemcpy(bdev.get(), bdry_src, hcn * sizeof(float),
+-                                           cudaMemcpyHostToDevice) == cudaSuccess)
+-                                bok = mtp.prefill(bdev.get(), &btok, 1, resume - 1, be);
+-                            else
+-                                bok = false;
+-                        } else {
+-                            bok = false;
+-                        }
+-                    } catch (const std::exception& ex) {
+-                        bok = false;
+-                        be = ex.what();
+-                    } catch (...) { bok = false; }
+-                    if (!bok) {
+-                        std::fprintf(stderr, "strata serve: MTP boundary at %lld missing/unrepaired (%s): "
+-                                             "cold prefill\n",
+-                                     (long long) (resume - 1), be.empty() ? "no repair source" : be.c_str());
+-                        if (!cold_reset_all()) {
+-                            std::printf("ERR MTP boundary cold reset failed\n");
+-                            return 1;
+-                        }
+-                        resume = 0;
+-                    }
+-            }
++            // F1: boundary repairs ran inside the attempt loop (each mount pairs cell k-1 before the
++            // suffix prefill, disk mounts included); resume is final here.
+             if (from_saved && saved_hit != nullptr) saved_states.note_use(saved_hit);   // mounts count as use
+             // E3: a successful disk mount joins the RAM roots (later requests find it with no disk read)
+             // and refreshes the file's mtime for the LRU trim. insert_root re-validates the payload;
+@@ -4872,10 +5093,8 @@ int main(int argc, char** argv) {
+                     // best-effort mtime refresh: never fatal.
+                 }
+             }
+-            // E4: the source E2 chose (chain wins ties: both hits stay null then). k/suffix are final: the
+-            // boundary repairs above can still cold-reset resume to 0.
+-            saved_stats.restore_ms +=
+-                std::chrono::duration<double, std::milli>(Clock::now() - e4_repair_t0).count();
++            // E4: the source the walk chose (chain wins ties: both hits stay null then). k/suffix
++            // are final: the loop cold-resets resume to 0 only when no candidate restores.
+             if (reread_to > 0) {
+                 // STRATA_CKPT_REREAD debug mode: the checkpoint was re-read, not mounted - actual reuse is
+                 // zero. The legacy RESUME line below stays nominal; only these stats report truth.
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index d3491d6..aceae6d 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -391,6 +391,53 @@ int main() {
+         check(pick != nullptr && pick->ids.size() == 100 && pick->kind == saved::Kind::Root,
+               "walk terminates picking the eligible shorter root");
+     }
++    {
++        // F1 (BRIEF-CACHE-FIX-1): the serve loop's fall-through policy at the store level. Three longest
++        // candidates fail in turn (validation rejection, mount failure, repair failure - the loop cannot
++        // tell them apart, each just joins the skip set), the walk visits each exactly once longest-first,
++        // and terminates on the pinned root. Cold only when the walk ends with no pick.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_item(100)), "F1 root(100) stores");
++        check(st.insert_tip(make_item(220), false), "F1 tip(220) stores");
++        check(st.insert_tip(make_item(180), false), "F1 tip(180) stores");
++        check(st.insert_tip(make_item(140), false), "F1 tip(140) stores");
++        std::vector<const saved::SavedItem*> skip;
++        std::vector<int> seen;
++        const saved::SavedItem* pick = nullptr;
++        for (;;) {
++            const saved::SavedItem* cand = st.find_best_except(req, no_imgs, true, skip);
++            if (cand == nullptr) break;
++            seen.push_back((int) cand->ids.size());
++            if (cand->ids.size() != 100) {
++                skip.push_back(cand);
++                continue;
++            }
++            pick = cand;
++            break;
++        }
++        check(seen == std::vector<int>{220, 180, 140, 100},
++              "F1 walk visits 220, 180, 140, then 100 (no revisit)");
++        check(pick != nullptr && pick->ids.size() == 100 && pick->kind == saved::Kind::Root,
++              "F1 multiple failures fall through to the root");
++    }
++    {
++        // F1 tie behavior (store-level half): an equal-length root+tip are both eligible; the walk offers
++        // the root first (roots enumerate before tips), and rejecting it falls through to the tip instead
++        // of cold. (The other half - live/chain winning ties over saved with no upload - is call-site
++        // policy in generate.cpp's F1 attempt loop, not unit-testable on CPU.)
++        saved::SavedStateStore st;
++        check(st.insert_root(make_item(120)), "F1 tie root(120) stores");
++        check(st.insert_tip(make_item(120), false), "F1 tie tip(120) stores alongside");
++        std::vector<const saved::SavedItem*> skip;
++        const saved::SavedItem* first = st.find_best_except(req, no_imgs, true, skip);
++        check(first != nullptr && first->kind == saved::Kind::Root, "F1 tie offers the root first");
++        skip.push_back(first);
++        const saved::SavedItem* second = st.find_best_except(req, no_imgs, true, skip);
++        check(second != nullptr && second->kind == saved::Kind::Tip && second->ids.size() == 120,
++              "F1 rejecting the root falls through to the equal-length tip");
++        skip.push_back(second);
++        check(st.find_best_except(req, no_imgs, true, skip) == nullptr, "F1 tie walk terminates");
++    }
+     {
+         // equal-length root+tip: both enumerate (roots first), neither hides the other.
+         saved::SavedStateStore st;
+-- 
+2.54.0.windows.1
+

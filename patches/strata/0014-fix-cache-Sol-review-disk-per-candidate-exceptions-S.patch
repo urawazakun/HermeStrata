@@ -1,0 +1,184 @@
+From 7909bb9389d6c6a58fe2a598d5e06d64b0d2e9ec Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 12:00:50 +0900
+Subject: [PATCH 14/16] fix(cache): Sol review - disk per-candidate exceptions,
+ S2 row-count drop, hpp comment dedup
+
+---
+ include/strata/program/saved_state.hpp |  7 +--
+ src/program/generate.cpp               | 60 +++++++++++++++++++++-----
+ src/program/saved_state.cpp            |  5 ++-
+ src/program/saved_state_test.cpp       | 22 ++++++++++
+ 4 files changed, 78 insertions(+), 16 deletions(-)
+
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 0cc0d2a..030a460 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -334,10 +334,6 @@ struct SavedItem {
+     }
+ };
+ 
+-/// E3's on-disk header: every field that changes numerics must match, else the file is
+-/// ignored. The engine fills it per process (see generate.cpp's root_*_identity helpers); compatible_with()
+-/// gates the load. Pure and CPU-testable. ids_len/ids_hash never gate compatibility: the full-ids prefix
+-/// rule applies after load (never hash-only).
+ /// F2: one tip line's TWO coherent restorable points (see the file-top note).
+ ///
+ /// The prompt point is the state at exactly the prompt end n (NOT n-1, NOT a header/turn boundary): the next
+@@ -563,7 +559,8 @@ class SavedStateStore {
+     /// F2: the generation item backing a prompt point (null unless `p` is a paired entry's prompt). E2 uses
+     /// it to validate and mount the prompt point against the shared KV/MTP backing without any copy.
+     const SavedItem* tip_gen_for(const SavedItem* p) const;
+-    /// S2 DELETE: drop all non-pinned items. Returns how many tip LINES were dropped.
++    /// S2 DELETE: drop all non-pinned items. Returns how many tip inventory ROWS (restorable
++    /// points, as inventory() lists them: two for a paired tip) were dropped. tips() keeps line semantics.
+     size_t drop_non_pinned();
+     /// S2 GET: roots then tips. F2: a paired tip lists TWO rows (prompt point, then generation point) sharing
+     /// the entry's last_use; their bytes sum to the entry bytes (shared KV counted once, in the gen row).
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 65fe3dd..2de783c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4717,16 +4717,22 @@ int main(int argc, char** argv) {
+                     // E3: the disk side mounts here (strict-longer only over RAM: an equal-length RAM
+                     // item needs no disk read). Load/validation failures retire the file and try shorter.
+                     if (!take_chain && sk_disk > sk_ram) {
++                        // Retire first: every continue below moves to a shorter candidate, never this
++                        // file again.
++                        disk_skip.push_back(dent.path);
++                        const int64_t sk = sk_disk;
++                        const std::string dent_path = dent.path;
+                         std::string why;
++                        // Phase 1 (no GPU touched): lazy load + full validation. A throw here keeps the
++                        // chain alive. Load/validation failures drop the index entry: without this a corrupt
++                        // file pins its key (enqueue dedups against the index) and a recaptured root could
++                        // never replace it. The file itself stays for trim; the rewrite replaces it.
++                        try {
+                         if (!root_disk_store.load_item(dent, disk_mount, why)) {
+                             std::fprintf(stderr, "strata serve: root-disk at %lld tokens unreadable "
+                                                  "(%s): trying shorter\n",
+                                          (long long)sk_disk, why.c_str());
+-                            // Invalidate the index entry: without this the corrupt file pins its key
+-                            // (enqueue dedups against the index) and a recaptured root could never
+-                            // replace it. The file itself stays for trim; the rewrite replaces it.
+                             root_disk_store.drop_path(dent.path);
+-                            disk_skip.push_back(dent.path);
+                             continue;
+                         }
+                         if (!saved_validate_for_restore(disk_mount, ids32, req_simgs, cvec_cached, n, g,
+@@ -4735,15 +4741,24 @@ int main(int argc, char** argv) {
+                                                  "(%s): trying shorter\n",
+                                          (long long)sk_disk, why.c_str());
+                             root_disk_store.drop_path(dent.path);
+-                            disk_skip.push_back(dent.path);
+                             continue;
+                         }
+-                        // Retire for this request before touching the GPU: a failed upload/repair below
+-                        // resets for coherence, kills live/chain, and tries shorter (never this file again).
+-                        disk_skip.push_back(dent.path);
++                        } catch (const std::exception& ex) {
++                            std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw (%s): "
++                                                 "trying shorter\n",
++                                         (long long) sk, ex.what());
++                            continue;
++                        } catch (...) {
++                            std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw: "
++                                                 "trying shorter\n",
++                                         (long long) sk);
++                            continue;
++                        }
++                        // Phase 2 (may write the GPU): upload + ring refill + boundary repair. Any failure
++                        // or throw resets for coherence, kills live/chain, and tries shorter. The file stays
++                        // indexed throughout: an upload/repair failure is transient, not corruption.
+                         const saved::SavedItem* mount_src = &disk_mount;
+-                        const int64_t sk = sk_disk;
+-                        const std::string dent_path = dent.path;
++                        try {
+                         bool ok = cudaDeviceSynchronize() == cudaSuccess;
+                         std::string why2;
+                         if (!ok) why2 = "device not idle";
+@@ -4816,6 +4831,31 @@ int main(int argc, char** argv) {
+                                 continue;
+                             }
+                         }
++                        } catch (const std::exception& ex) {
++                            // The GPU may be partially written: reset for coherence, kill live/chain, and
++                            // try shorter. No result was recorded yet, so nothing stale remains.
++                            std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw (%s): "
++                                                 "trying shorter\n",
++                                         (long long) sk, ex.what());
++                            if (!cold_reset_all()) {
++                                std::printf("ERR SavedState cold reset failed after a failed mount\n");
++                                return 1;
++                            }
++                            chain_dead = true;
++                            live_ok = false;
++                            continue;
++                        } catch (...) {
++                            std::fprintf(stderr, "strata serve: root-disk candidate at %lld tokens threw: "
++                                                 "trying shorter\n",
++                                         (long long) sk);
++                            if (!cold_reset_all()) {
++                                std::printf("ERR SavedState cold reset failed after a failed mount\n");
++                                return 1;
++                            }
++                            chain_dead = true;
++                            live_ok = false;
++                            continue;
++                        }
+                         resume = sk;
+                         from_live = false;
+                         from_saved = true;
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index e2ba27c..c5edf83 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -196,7 +196,10 @@ const SavedItem* SavedStateStore::tip_gen_for(const SavedItem* p) const {
+     return nullptr;
+ }
+ 
+-size_t SavedStateStore::drop_non_pinned() {    const size_t n = tips_.size();
++size_t SavedStateStore::drop_non_pinned() {
++    // S2 rows, not F2 lines: inventory lists BOTH points of a paired tip, so the dropped count is the
++    // removed restorable-point rows (tip_points()), matching what inventory reported.
++    const size_t n = tip_points();
+     tips_.clear();
+     tip_bytes_ = 0;
+     return n;
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index 7f2debe..0a1a3a0 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -622,6 +622,28 @@ int main() {
+         check(st.roots() == 1 && st.find_best(req, no_imgs, true)->kind == saved::Kind::Root,
+               "drop preserves the pinned root");
+     }
++    {   // S2: DELETE counts inventory ROWS, not tip lines. A paired tip lists two rows (prompt, then
++        // generation, the shared KV/MTP backing counted in the gen row only); a single tip lists one.
++        // The pinned root is never dropped.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_line(40, 0)), "s2 root(40) stores");
++        check(st.insert_tip_pair(make_prompt_item(60, 100), make_line(100, 100), false), "s2 paired tip stores");
++        check(st.insert_tip(make_line(75, 5000), false), "s2 single tip stores");
++        check(st.tips() == 2 && st.tip_points() == 3, "s2 two lines hold three restorable points");
++        auto inv = st.inventory();
++        check(inv.size() == 4, "s2 inventory lists the root plus three tip rows");
++        check(inv[0].kind == saved::Kind::Root && inv[0].ids_len == 40, "s2 root row first");
++        check(inv[1].ids_len == 60 && inv[2].ids_len == 100 && inv[3].ids_len == 75,
++              "s2 paired rows (prompt, generation) then the single tip");
++        uint64_t tip_sum = 0;
++        for (size_t i = 1; i < inv.size(); ++i) tip_sum += inv[i].bytes;
++        check(tip_sum == st.tip_bytes(), "s2 tip rows sum to the tip budget use (shared KV once)");
++        check(st.drop_non_pinned() == 3, "s2 delete reports three removed tip rows");
++        check(st.tips() == 0 && st.tip_points() == 0 && st.tip_bytes() == 0, "s2 delete zeroes tip use");
++        check(st.roots() == 1 && st.inventory().size() == 1, "s2 pinned root remains, alone in inventory");
++        check(st.find_exact(req_at(0, 60), no_imgs, true, 40) != nullptr, "s2 root still addressable");
++        check(st.drop_non_pinned() == 0, "s2 repeated delete reports zero");
++    }
+     {   // E5: byte-budget LRU counts mounts, not just inserts - note_use refreshes A so the
+         // next insert evicts B. (Design: a mount MUST call note_use.)
+         saved::SavedStateStore st;
+-- 
+2.54.0.windows.1
+

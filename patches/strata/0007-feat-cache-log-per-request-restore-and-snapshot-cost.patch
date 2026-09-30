@@ -1,0 +1,182 @@
+From dcd76a46c33896a8aed72e5fb7d224f702ed93f6 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 06:28:10 +0900
+Subject: [PATCH 07/16] feat(cache): log per-request restore and snapshot costs
+
+Implemented: Muse / reviewed: Sol. E4 stats include post-DONE preparation and failure paths.
+---
+ src/program/generate.cpp | 75 +++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 70 insertions(+), 5 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 277824b..0ac02ac 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -3513,7 +3513,7 @@ int main(int argc, char** argv) {
+         saved::SavedStateStore saved_states;
+         saved_states.set_tip_budget_gib(o.tip_cache_gib);
+         saved_states.set_stage_count((int) stages.size() + 1);
+-        saved::ResumeStats saved_stats;   // E4 fills per request; E1 records snapshot_ms only
++        saved::ResumeStats saved_stats;   // E4: per-request resume stats; reset every GEN/GENI at the loop top
+         // E1 final review: the MTP repair row R_(root_at-1) for roots. R rows are borrowed prompt-path scratch
+         // (batched chunks, verify windows), overwritten by the next chunk/window - so on_chunk/read_windows stash
+         // the boundary row inside the callback while it is valid. e1_root_at is published per request (from
+@@ -3933,6 +3933,8 @@ int main(int argc, char** argv) {
+                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+             } busy_scope;
+             stop_req.store(false);   // a STOP that arrived between requests is stale
++            saved_stats = saved::ResumeStats{};   // E4: fresh counters every GEN/GENI (aux/cancel/recovery
++                                                  // included); early continues log nothing, so no stale stats
+             const bool geni = line.rfind("GENI ", 0) == 0;
+             if (!geni && line.rfind("GEN ", 0) != 0) {
+                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
+@@ -4147,6 +4149,8 @@ int main(int argc, char** argv) {
+             std::vector<saved::ImgKey> req_simgs;
+             req_simgs.reserve(req_imgs.size());
+             for (const ImgKey& k : req_imgs) req_simgs.push_back({k.start, k.hash});
++            // E4: actual restore cost (uploads + the repairs below, not cold prefill). Segment A: the saved walk.
++            const auto e4_restore_t0 = Clock::now();
+             try {
+                 // accumulating skip set (blocker 5 review): each rejected candidate joins, so the walk is
+                 // longest-first without revisit and always terminates (cand==nullptr ends it).
+@@ -4230,6 +4234,8 @@ int main(int argc, char** argv) {
+                 from_saved = false;
+                 saved_hit = nullptr;
+             }
++            saved_stats.restore_ms +=
++                std::chrono::duration<double, std::milli>(Clock::now() - e4_restore_t0).count();
+             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
+             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+@@ -4237,6 +4243,7 @@ int main(int argc, char** argv) {
+                          }), checks.end());
+             live_ok = false;   // until this request has finished, the session is in between
+             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
++            const auto e4_chain_t0 = Clock::now();   // E4 segment B: a chain checkpoint mount (memcpy restore)
+             if (resume == 0) {
+                 strata::core::session_zero(ss, g, nullptr, main_cs);
+                 cudaStreamSynchronize(main_stream);
+@@ -4281,6 +4288,12 @@ int main(int argc, char** argv) {
+                     return 1;
+                 }
+             }
++            // E4: a chain checkpoint mount costs its memcpy restore; cold (resume==0), live (no copy) and the
++            // reread debug mode contribute nothing. Segment C starts: the ring refill (trivial) + the repairs.
++            if (!from_live && !from_saved && resume > 0 && reread_to <= 0)
++                saved_stats.restore_ms +=
++                    std::chrono::duration<double, std::milli>(Clock::now() - e4_chain_t0).count();
++            const auto e4_repair_t0 = Clock::now();
+             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
+             // host copies and slots are always current (every writer writes both), so they need nothing.
+             // After a saved mount this refills the ring from the RESTORED host rows (saved_restore_mtp put them
+@@ -4386,6 +4399,28 @@ int main(int argc, char** argv) {
+                     }
+             }
+             if (from_saved && saved_hit != nullptr) saved_states.note_use(saved_hit);   // mounts count as use
++            // E4: the source E2 chose (chain wins ties: saved_hit stays null then). k/suffix are final: the
++            // boundary repairs above can still cold-reset resume to 0. RootDisk arrives with E3 (no loader yet).
++            saved_stats.restore_ms +=
++                std::chrono::duration<double, std::milli>(Clock::now() - e4_repair_t0).count();
++            if (reread_to > 0) {
++                // STRATA_CKPT_REREAD debug mode: the checkpoint was re-read, not mounted - actual reuse is
++                // zero. The legacy RESUME line below stays nominal; only these stats report truth.
++                saved_stats.source = saved::ResumeSource::None;
++                saved_stats.k = 0;
++                saved_stats.suffix = n;
++            } else {
++                if (from_saved && saved_hit != nullptr) {
++                    saved_stats.source = saved_hit->kind == saved::Kind::Root ? saved::ResumeSource::Root
++                                                                               : saved::ResumeSource::Tip;
++                } else if (resume > 0) {
++                    saved_stats.source = saved::ResumeSource::Chain;
++                } else {
++                    saved_stats.source = saved::ResumeSource::None;
++                }
++                saved_stats.k = resume;
++                saved_stats.suffix = n - resume;
++            }
+             const int64_t read_from = reread_to > 0 ? 0 : resume;
+             pp_total = n;
+             pp_from = read_from;
+@@ -4598,6 +4633,10 @@ int main(int argc, char** argv) {
+                     // Never fatal (finding 5): snapshot/insert failures - including allocation faults - only drop
+                     // the root; the chain checkpoint above still stands. insert_root also rejects incomplete
+                     // payloads (SavedItem::complete).
++                    // E4: the root snapshot cost (saved_snapshot + insert) adds to snapshot_ms; a later tip
++                    // in this request adds too. Excluded setup: the boundary-row stash D2H, which rides the
++                    // prompt read above (one hc x n_embd row, sub-ms) rather than the snapshot.
++                    const auto e4_root_t0 = Clock::now();
+                     try {
+                         saved::SavedItem root;
+                         const std::vector<int32_t> rids(cur.begin(), cur.begin() + root_at);
+@@ -4619,6 +4658,8 @@ int main(int argc, char** argv) {
+                     } catch (...) {
+                         std::fprintf(stderr, "strata serve: SavedState root snapshot threw: skipped\n");
+                     }
++                    saved_stats.snapshot_ms +=
++                        std::chrono::duration<double, std::milli>(Clock::now() - e4_root_t0).count();
+                 }
+             }
+             if (!refill(err)) {
+@@ -4896,9 +4937,16 @@ int main(int argc, char** argv) {
+             // E1 final review: the tip's MTP repair row R_(L-1), D2H'd from the flush residual below (last
+             // stage on a split). A tip without it is rejected - E2 cannot repair pair L-1 without R_(L-1).
+             std::vector<float> flush_R;
++            // E4: the full post-DONE cache preparation (catch-up, flush, residual copy, snapshot incl.
++            // failures) lands in snapshot_ms once, below the catches. No nested timers (no double count).
++            const auto e4_post_t0 = Clock::now();
+             try {
+                 if (stop_req.load()) { live_ok = false; boundary_ok = false; live_bdry_L = -1; }
+-                if (boundary_ok && mtp_ok && produced_n > 0 && emit_win_e > 0) {
++                // (a) runs only when a tip or live-boundary retention can come of it (same aux/budget gate
++                // as the flush below): drafter-only work, so skipping it for aux/budget-off lines leaves live
++                // and the chain exactly as the catch-up-failure path does (tip suppressed, live/chain kept).
++                if (boundary_ok && mtp_ok && produced_n > 0 && emit_win_e > 0 && !req_aux &&
++                    o.tip_cache_gib > 0.0) {
+                     std::vector<int32_t> fnxt((size_t) emit_win_e);
+                     for (int t = 0; t < emit_win_e; ++t)
+                         fnxt[(size_t) t] = t + 1 < emit_win_e ? window[(size_t) (t + 1)] : emit_last;
+@@ -4971,13 +5019,10 @@ int main(int argc, char** argv) {
+                 // drop the tip).
+                 if (boundary_ok && mtp_ok && !flush_R.empty() && !req_aux && o.tip_cache_gib > 0.0 &&
+                     !live.empty()) {
+-                    const auto snap0 = Clock::now();
+                     saved::SavedItem tip;
+                     if (saved_snapshot((int64_t) live.size(), live, live_imgs, cvec_cached, flush_R.data(),
+                                        g.hc, g.n_embd, tip)) {
+                         saved_states.insert_tip(std::move(tip), false);
+-                        saved_stats.snapshot_ms =
+-                            std::chrono::duration<double, std::milli>(Clock::now() - snap0).count();
+                     } else {
+                         std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
+                                      (long long) live.size());
+@@ -4995,6 +5040,26 @@ int main(int argc, char** argv) {
+                 boundary_ok = false;
+                 live_bdry_L = -1;
+             }
++            // E4: one timing for all of the above, success and failure paths alike; adds to any root cost.
++            saved_stats.snapshot_ms +=
++                std::chrono::duration<double, std::milli>(Clock::now() - e4_post_t0).count();
++            // E4: one stats line per request, stderr only (stdout keeps the GEN protocol: RESUME/PP/T/DONE).
++            // After post-DONE work, so snapshot_ms holds root + full post-DONE cost and k/suffix are final.
++            {
++                const char* e4_src = "none";
++                switch (saved_stats.source) {
++                    case saved::ResumeSource::Chain: e4_src = "chain"; break;
++                    case saved::ResumeSource::Tip: e4_src = "tip"; break;
++                    case saved::ResumeSource::Root: e4_src = "root"; break;
++                    case saved::ResumeSource::RootDisk: e4_src = "root-disk"; break;
++                    default: break;
++                }
++                std::fprintf(stderr, "strata serve: resume from %s at %lld, suffix %lld, restore %.1f ms, "
++                                     "snapshot %.1f ms\n",
++                             e4_src, (long long) saved_stats.k, (long long) saved_stats.suffix,
++                             saved_stats.restore_ms, saved_stats.snapshot_ms);
++                std::fflush(stderr);
++            }
+             const int64_t fresh = n - resume;
+             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
+                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
+-- 
+2.54.0.windows.1
+

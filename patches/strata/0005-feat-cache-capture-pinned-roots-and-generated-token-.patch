@@ -1,0 +1,1218 @@
+From 2aaac835950c891e11c958a1b6fd459a4e67dbbc Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 05:41:26 +0900
+Subject: [PATCH 05/16] feat(cache): capture pinned roots and generated-token
+ tips
+
+Implemented: Muse / reviewed: Sol. E1 of Hermes cache design.
+---
+ CMakeLists.txt                         |   4 +-
+ include/strata/core/mtp.hpp            |  11 +
+ include/strata/program/saved_state.hpp | 378 ++++++++++++++++++++
+ serve/server.py                        |  14 +-
+ src/program/generate.cpp               | 457 ++++++++++++++++++++++++-
+ src/program/saved_state.cpp            | 117 +++++++
+ 6 files changed, 968 insertions(+), 13 deletions(-)
+ create mode 100644 include/strata/program/saved_state.hpp
+ create mode 100644 src/program/saved_state.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e6b8d9b..2b22e42 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -457,7 +457,9 @@ endif()
+ #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
+ #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
+ # Plan v0.3 P6: speculation components that need no GPU.
+-add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
++# E1 (DESIGN-HERMES-CACHE.md): the SavedState store policy - CPU-only, no CUDA (see saved_state.hpp).
++add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
++            src/program/saved_state.cpp)
+ target_include_directories(strata_spec PUBLIC include)
+ if(STRATA_BUILD_TESTS)
+   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index dbdebb3..af21077 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -50,6 +50,17 @@ public:
+     uint64_t vram_bytes() const { return vram_; }
+     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
+     const QsaState& kv_state() const { return st_; }
++    /// E1 snapshot capture: the device `load` ran on (the drafter lives on a layer split's last stage).
++    /// SavedState snapshots guard their device copies with it instead of guessing the stage.
++    int device() const { return device_; }
++    /// E1 snapshot accounting (Sol review finding 3): the first cell whose (R_i, tok_{i+1}) pair prefill()
++    /// was actually given. Mirrors prefill()'s skip: cells the attention window can never reach again are
++    /// never written. 0 when the window covers everything.
++    int64_t prefill_valid_from() const {
++        if (window_ <= 0 || prompt_len_ <= 0) return 0;
++        const int64_t f = prompt_len_ - window_ - 64;
++        return f > 0 ? f : 0;
++    }
+     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
+     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
+     void kv_restore(int64_t upto);
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+new file mode 100644
+index 0000000..72f220b
+--- /dev/null
++++ b/include/strata/program/saved_state.hpp
+@@ -0,0 +1,378 @@
++// include/strata/program/saved_state.hpp - E1: the SavedState store (DESIGN-HERMES-CACHE.md sections 1, 2, 7).
++//
++// Implemented: Muse / review: Sol.
++//
++// Three kinds of saved state: pinned ROOTS (the end of a fixed prefix, keyed by token ids, never evicted by
++// traffic, E3 persists them to disk), byte-budget LRU TIPS (one recent tip per conversation line in host RAM,
++// what makes parent<->child alternation and forked children cheap), and upstream's live ConvCheckpoint CHAIN
++// (unchanged, lives in generate.cpp).
++//
++// This header is CPU-ONLY on purpose: no CUDA includes, no device code. The store owns the policy (prefix match
++// by exact full ids, cvec/image identity, pin, LRU budget, per-line replacement, split-stage generation) while
++// generate.cpp fills the opaque payload blobs from the device. That keeps the policy unit-testable on CPU for E5
++// and leaves E2 (restore), E3 (disk), E4 (stats) and S2 (inventory) as consumers of this interface:
++//
++//   E2 restores via find_best() + the payload blobs (upload KV [0,k) + recurrent state, re-point page table).
++//   E3 serialises SavedItem + RootDiskHeader (header.compatible_with() gates loads).
++//   E4 fills ResumeStats per request (source/k/suffix/restore_ms/snapshot_ms).
++//   S2 serves inventory() and drop_non_pinned().
++//
++// Payload completeness (section 1: "A saved item contains"): ids, recurrent state snapshot (GDN recurrence +
++// conv history, PLE history + token window, QSA indexer tails), the pooled indexer keys + block positions, QSA
++// KV cells [0,k) for all 12 layers (host copy when kv-resident, else a D2H copy), and the MTP draft rows [0,k).
++// The residual R is deliberately NOT saved: it is per-token scratch rebuilt from the next token's embedding
++// (put_input rebroadcasts every token; session_zero at position 0).
++//
++// Section 7 (forked children): a tip covers prompt + GENERATED assistant tokens at exactly the DONE boundary,
++// so a forked child (parent prompt + parent's generated tool-call + a short tool result) resumes with a tiny
++// suffix. Tips are snapshotted after DONE is sent/flushed, never blocking the reply.
++#pragma once
++
++#include "strata/kernels/kv_q4.hpp"   // authoritative q4 row formula (CPU-clean: <cstdint> + qsa.hpp only)
++#include "strata/kernels/kv_q8.hpp"   // authoritative int8 group (same)
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::program::saved_state {
++
++/// Default tip budget: --tip-cache-gib. 8 GiB holds >= depth+1 lines: a 12K prefix tip is ~150 MiB KV +
++/// ~113 MiB recurrent state, a 40K tip ~550 MiB + state (DESIGN section 0 numbers).
++inline constexpr double kDefaultTipCacheGib = 8.0;
++/// E3's --root-dir default. E1 parses the flag but does not write (interface ready).
++inline const char* kDefaultRootDir = "H:\\qwen38-v100\\strata-cache\\roots";
++
++/// An image among the ids: its first <|image_pad|> position plus the hash of its grid and embeddings.
++/// Mirrors generate.cpp's ImgKey; compared exactly (section 1: validity needs the full picture, not a hash of
++/// the pads alone).
++struct ImgKey {
++    int64_t start = 0;
++    uint64_t hash = 0;
++    bool operator==(const ImgKey& o) const { return start == o.start && hash == o.hash; }
++};
++
++enum class Kind : uint8_t { Root, Tip };
++
++/// E4's resume source. E1 only defines it; the restore path (E2) and the per-request stats line (E4) fill it.
++enum class ResumeSource : uint8_t { None, Chain, Tip, Root, RootDisk };
++
++/// Exact full-ids prefix comparison (section 1: "valid only if its full ids are a prefix of P, not just the
++/// hash"). Empty `pre` is never a valid prefix: resume 0 means "read from the start".
++inline bool is_prefix(const std::vector<int32_t>& pre, const std::vector<int32_t>& full) {
++    if (pre.empty() || pre.size() > full.size()) return false;
++    for (size_t i = 0; i < pre.size(); ++i)
++        if (pre[i] != full[i]) return false;
++    return true;
++}
++
++/// The images among the first L tokens (mirrors generate.cpp's imgs_below).
++inline std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L) {
++    std::vector<ImgKey> v;
++    for (const ImgKey& k : all)
++        if (k.start < L) v.push_back(k);
++    return v;
++}
++
++/// KV cell storage format (mirrors qsa_kv_format: 0 fp16, 1 int8, 2 q4_0).
++enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2 };
++
++/// QSA KV cells [0, cells) of ONE layer, identity layout [block][kv_head][page_size][head_dim].
++/// k/v hold codes (or fp16 halves as bytes); ks/vs the int8 scales (empty in fp16/q4_0).
++struct KvLayerPayload {
++    int fmt = kKvF16;
++    int64_t cells = 0;
++    std::vector<uint8_t> k, v, ks, vs;
++    uint64_t bytes() const { return (uint64_t)k.size() + v.size() + ks.size() + vs.size(); }
++};
++
++/// The indexer's pooled block keys rows [0, pooled_rows) plus the block positions and the constant dead key.
++/// pooled is float32 rows of idx_dim; block_pos/dead_key appended after it by the capturer is NOT assumed here:
++/// block_pos is stored separately, dead_key (one idx_dim row) rides at the end of pooled when present.
++struct IndexerPayload {
++    int64_t pooled_rows = 0;
++    std::vector<uint8_t> pooled;          ///< pooled_rows * idx_dim floats (D2H copy; no host original exists)
++    std::vector<int32_t> block_pos;       ///< per-layer block cursor (1 int32)
++    std::vector<uint8_t> dead_key;        ///< one idx_dim float row: the spare slot's key (sequence-constant)
++    uint64_t bytes() const {
++        return (uint64_t)pooled.size() + (uint64_t)block_pos.size() * 4 + (uint64_t)dead_key.size();
++    }
++};
++
++/// The recurrent snapshot: GDN recurrence + conv history, PLE history + token window, QSA raw tails.
++/// Same set checkpoint_save() copies today (conv_state_sizes), plus the ple window.
++struct RecurrentPayload {
++    std::vector<uint8_t> gdn, ple, tails;
++    int32_t ple_prev[2] = {-1, -1};
++    uint64_t bytes() const { return (uint64_t)gdn.size() + ple.size() + tails.size() + 8; }
++};
++
++/// One GPU stage's worth of state. Stage 0 is the main session; a layer split's later stages append theirs
++/// (mirrors ConvCheckpoint::stage_parts). n_stages is fixed at startup; a change clears the store.
++struct StagePayload {
++    RecurrentPayload rec;
++    std::vector<IndexerPayload> idx;  ///< one per QSA layer of this stage's session (pooled keys are per layer)
++    std::vector<KvLayerPayload> kv;       ///< one per QSA layer of this stage's session
++    uint64_t bytes() const {
++        uint64_t b = rec.bytes();
++        for (const IndexerPayload& l : idx) b += l.bytes();
++        for (const KvLayerPayload& l : kv) b += l.bytes();
++        return b;
++    }
++};
++
++/// The MTP repair row (Sol final review): R_(L-1), the main model's final residual after the last layer
++/// for the last consumed token, as a host float blob with its layout. The residual R is per-token scratch
++/// (rebuilt from each token's embedding), so WITHOUT this row E2 could not repair MTP pair L-1: pairing cell
++/// L-1 needs (R_(L-1), tok_L), and tok_L is the new request's first suffix token (request.ids[L]).
++///
++/// REQUIRED E2 REPAIR (documented here, implemented in E2): on resume at k=L with suffix starting at tok_L,
++/// pair cell L-1 via mtp.prefill(&boundary.row, &tok_L, 1, L-1) BEFORE the suffix prefill, then prefill the
++/// suffix normally. E2 MUST reject a candidate outright when the new request's drafter window reaches below
++/// valid_from (rows there are unwritten zeros, not pairs - resuming under them would attend garbage).
++/// Roots and tips both carry the row (roots: stashed from the authoritative prompt source inside on_chunk /
++/// read_windows before scratch is overwritten; tips: the final flush verifier residual, last stage on split).
++/// A snapshot without its boundary row is rejected (complete()).
++struct BoundaryRow {
++    int64_t hc = 0;                       ///< ModelGeometry::hc at capture (E2/E3 layout validation)
++    int64_t n_embd = 0;                   ///< ModelGeometry::n_embd at capture
++    std::vector<float> row;               ///< R_(L-1): hc*n_embd host floats
++    uint64_t bytes() const { return (uint64_t)row.size() * 4 + 16; }
++    bool complete() const { return hc > 0 && n_embd > 0 && (int64_t)row.size() == hc * n_embd; }
++};
++
++/// The MTP drafter's K/V rows: the valid-pair invariant (Sol review finding 3).
++///
++/// AUTHORITATIVE SEMANTICS (see MtpDrafter::prefill/draft): drafter cell i pairs the main model's final
++/// residual R_i with the token at position i+1. Prompt cells are exact (on_chunk/read_windows prefill with
++/// real next tokens); decode cells over kept rows are exact (draft() catch-up pairs kept rows with their real
++/// argmaxes; the final window gets its exact catch-up post-DONE before any snapshot). The last main cell's
++/// pairing needs tok_L, which does not exist yet, and is NEVER invented: a snapshot of L main tokens carries
++/// exactly cells = L-1 valid pairs in rows [0, cells).
++///
++/// WINDOWING: prompt prefill skips cells the attention window can never reach again, so rows below
++/// valid_from may be unwritten zeros (deterministic - the drafter starts zeroed). Rows [valid_from, cells)
++/// are real-paired. E2 MUST repair the boundary on restore by re-pairing from the resume suffix (prefill /
++/// draft over the suffix, as prompt reads do) rather than trusting speculative rows past it.
++struct MtpPayload {
++    std::vector<KvLayerPayload> kv;       ///< exactly one entry (the drafter's layer) when captured
++    int64_t cells = 0;                    ///< valid-pair count: L-1 for a snapshot of L main tokens
++    int64_t valid_from = 0;               ///< first row with a real pairing (MtpDrafter::prefill_valid_from)
++    uint64_t bytes() const {
++        uint64_t b = 0;
++        for (const KvLayerPayload& l : kv) b += l.bytes();
++        return b;
++    }
++};
++
++/// Geometry/layout key captured with every snapshot (E1) and validated before any restore (E2) or disk
++/// load (E3): a stage layout, KV format geometry or indexer shape change must never restore stale bytes.
++/// Per-layer KV formats ride in each KvLayerPayload::fmt; this covers the shared geometry.
++struct SnapshotGeom {
++    int64_t n_qsa_layers = 0;
++    int64_t n_head_kv = 0;
++    int64_t head_dim = 0;
++    int64_t idx_dim = 0;
++    int64_t idx_block = 0;
++    int64_t page_size = 0;
++    bool operator==(const SnapshotGeom& o) const {
++        return n_qsa_layers == o.n_qsa_layers && n_head_kv == o.n_head_kv && head_dim == o.head_dim &&
++               idx_dim == o.idx_dim && idx_block == o.idx_block && page_size == o.page_size;
++    }
++    bool operator!=(const SnapshotGeom& o) const { return !(*this == o); }
++};
++
++/// Exact pool bytes for `cells` cells (Sol final-review fix): pages = ceil(cells/page_size), each page
++/// n_head_kv*page_size rows of `row` bytes. Row widths mirror the capturer bit-for-bit: fp16 halves, int8
++/// codes + scales per KV_Q8_GROUP values, q4 via the authoritative kv_q4_bytes_per_head. `scales` selects the
++/// scale pools (int8 only).
++inline uint64_t kv_pool_bytes(int fmt, int64_t cells, int64_t n_head_kv, int64_t head_dim, int64_t page_size,
++                              bool scales) {
++    const uint64_t pages = (uint64_t)((cells + page_size - 1) / page_size);
++    uint64_t row = 0;
++    if (scales) {
++        row = (uint64_t)(head_dim / strata::kernels::KV_Q8_GROUP) * 2;
++    } else if (fmt == kKvF16) {
++        row = (uint64_t)head_dim * 2;
++    } else if (fmt == kKvInt8) {
++        row = (uint64_t)head_dim;
++    } else {
++        row = strata::kernels::kv_q4_bytes_per_head((int)head_dim);
++    }
++    return pages * (uint64_t)n_head_kv * (uint64_t)page_size * row;
++}
++
++/// Exact k/v/scale validation for one layer's [0, cells) range against the page geometry.
++inline bool kv_blob_ok(const KvLayerPayload& k, int64_t cells, const SnapshotGeom& gm) {
++    if (k.cells != cells) return false;
++    if (k.fmt != kKvF16 && k.fmt != kKvInt8 && k.fmt != kKvQ4) return false;
++    const uint64_t code = kv_pool_bytes(k.fmt, cells, gm.n_head_kv, gm.head_dim, gm.page_size, false);
++    if ((uint64_t)k.k.size() != code || (uint64_t)k.v.size() != code) return false;
++    const uint64_t sc =
++        k.fmt == kKvInt8 ? kv_pool_bytes(k.fmt, cells, gm.n_head_kv, gm.head_dim, gm.page_size, true) : 0;
++    return (uint64_t)k.ks.size() == sc && (uint64_t)k.vs.size() == sc;
++}
++
++struct SavedItem {
++    Kind kind = Kind::Tip;    std::vector<int32_t> ids;             ///< the tokens this state has consumed (prompt + generated for tips)
++    std::vector<ImgKey> imgs;             ///< imgs_below(all, ids.size()) at capture
++    bool cvec = true;                     ///< the control-vector enablement the state was read with
++    int n_stages = 1;                     ///< stages.size(); must match the store's stage count
++    uint64_t bytes = 0;                   ///< set by the store on insert (payload + ids/imgs overhead)
++    uint64_t last_use = 0;                ///< set by the store (LRU clock)
++    SnapshotGeom geom;                    ///< geometry/layout the payloads were captured under (E2 validates)
++    std::vector<StagePayload> stages;
++    MtpPayload mtp;
++    BoundaryRow boundary;                 ///< R_(L-1): the MTP repair row (Sol final review; E2 pairs it)
++    uint64_t payload_bytes() const {
++        uint64_t b = (uint64_t)ids.size() * 4 + (uint64_t)imgs.size() * 16 + 16 + 48;   // +48: geom + scalars
++        for (const StagePayload& s : stages) b += s.bytes();
++        b += mtp.bytes() + boundary.bytes();
++        return b;
++    }
++    /// Strict structural gate (findings 5 + final review): the store rejects anything inconsistent or
++    /// incomplete - a truncated copy must never become a restorable item. ple may be empty (no-PLE builds);
++    /// gdn/tails never are. Byte sizes are checked against the geometry, not just non-emptiness.
++    bool complete() const {
++        const int64_t L = (int64_t)ids.size();
++        if (L < 1 || n_stages < 1 || (int)stages.size() != n_stages) return false;
++        if (geom.n_qsa_layers < 1 || geom.n_head_kv < 1 || geom.head_dim < 1 || geom.idx_dim < 1 ||
++            geom.idx_block < 1 || geom.page_size < 1)
++            return false;
++        for (const ImgKey& k : imgs)
++            if (k.start < 0 || k.start >= L) return false;
++        if (!boundary.complete()) return false;   // no MTP repair row, no snapshot
++        const int64_t prow = L / geom.idx_block + 1;   // pooled rows covering [0, L)
++        for (const StagePayload& s : stages) {
++            if (s.rec.gdn.empty() || s.rec.tails.empty()) return false;
++            if ((int64_t)s.kv.size() != geom.n_qsa_layers || (int64_t)s.idx.size() != geom.n_qsa_layers)
++                return false;
++            for (const KvLayerPayload& k : s.kv)
++                if (!kv_blob_ok(k, L, geom)) return false;   // main cells are exactly [0, L), byte-exact
++            for (const IndexerPayload& x : s.idx) {
++                if (x.pooled_rows != prow) return false;
++                if ((int64_t)x.pooled.size() != prow * geom.idx_dim * 4) return false;
++                if ((int64_t)x.dead_key.size() != geom.idx_dim * 4) return false;
++                if (x.block_pos.size() != 1) return false;
++            }
++        }
++        // MTP: exactly L-1 real pairs (L==1: no pair exists, mtp stays empty), valid_from inside
++        // [0, cells], sizes matching, same KV format as the main layers.
++        if (L == 1) {
++            if (!mtp.kv.empty() || mtp.cells != 0) return false;
++        } else {
++            if (mtp.kv.empty() || mtp.kv.size() != 1) return false;
++            if (mtp.cells != L - 1) return false;
++            if (mtp.valid_from < 0 || mtp.valid_from > mtp.cells) return false;
++            const KvLayerPayload& m = mtp.kv[0];
++            if (m.fmt != stages[0].kv[0].fmt) return false;
++            if (!kv_blob_ok(m, mtp.cells, geom)) return false;   // MTP rows byte-exact over [0, cells)
++        }
++        return true;
++    }
++};
++
++/// E3's on-disk header (interface only in E1): every field that changes numerics must match, else the file is
++/// ignored. The capturer fills it; compatible_with() gates the load. Pure and CPU-testable.
++struct RootDiskHeader {
++    static constexpr uint32_t kMagic = 0x48535452;   // 'HSTR' (Hermes strata root)
++    static constexpr uint32_t kVersion = 1;
++    uint32_t magic = kMagic;
++    uint32_t version = kVersion;
++    std::string engine_version;           ///< STRATA_VERSION
++    std::string pack_path;
++    std::string kv_type;                  ///< --kv: fp16|int8|q4_0
++    std::string mtp_dir;                  ///< --mtp DIR (draft quality only affects drafts, but keep it strict)
++    std::string model_fingerprint;        ///< model file sizes+mtimes (or hash)
++    std::string numeric_flags;            ///< flags that change numerics: --native set, --kv-resident mode class
++    int64_t ids_len = 0;
++    uint64_t ids_hash = 0;                ///< FNV-1a over the ids (prefix rule still compares full ids after load)
++    bool compatible_with(const RootDiskHeader& o) const {
++        return magic == o.magic && version == o.version && engine_version == o.engine_version &&
++               pack_path == o.pack_path && kv_type == o.kv_type && mtp_dir == o.mtp_dir &&
++               model_fingerprint == o.model_fingerprint && numeric_flags == o.numeric_flags;
++    }
++};
++
++/// E4's per-request stats (interface only in E1): `resume from {chain|tip|root|root-disk} at k, suffix n,
++/// restore ms, snapshot ms`.
++struct ResumeStats {
++    ResumeSource source = ResumeSource::None;
++    int64_t k = 0;                        ///< reused prefix cells
++    int64_t suffix = 0;                   ///< cells read fresh
++    double restore_ms = 0.0;
++    double snapshot_ms = 0.0;
++};
++
++/// S2's inventory row (interface only in E1): GET /v1/cache lists these; DELETE drops all non-pinned.
++struct InventoryEntry {
++    Kind kind = Kind::Tip;
++    size_t ids_len = 0;
++    uint64_t bytes = 0;
++    uint64_t last_use = 0;
++};
++
++/// Roots (pinned) + tips (byte-budget LRU). Not thread-safe: the serve loop is single-threaded per process.
++class SavedStateStore {
++  public:
++    SavedStateStore();
++
++    void set_tip_budget_bytes(uint64_t b) { tip_budget_ = b; evict_tips(); }
++    void set_tip_budget_gib(double gib) {
++        tip_budget_ = gib <= 0.0 ? 0 : (uint64_t)(gib * 1073741824.0);
++        evict_tips();
++    }
++    uint64_t tip_budget_bytes() const { return tip_budget_; }
++    uint64_t tip_bytes() const { return tip_bytes_; }
++
++    /// Split-stage generation. The split is fixed at startup; a change clears the store rather than risk a
++    /// cross-layout restore (never silently corrupt the cache).
++    void set_stage_count(int n);
++    int stage_count() const { return n_stages_; }
++
++    size_t roots() const { return roots_.size(); }
++    size_t tips() const { return tips_.size(); }
++    uint64_t clock() const { return clock_; }
++
++    /// Insert a root: pinned, never evicted by traffic. An exact-duplicate (same ids+imgs+cvec) refresh is
++    /// replaced in place. Rejects stage-count mismatches.
++    bool insert_root(SavedItem item);
++    /// Insert a tip. is_aux (title/side requests, S1) is a strict no-op: no insert, no eviction, no clock
++    /// advance - aux traffic must never cost the main path anything. Exact-duplicate ids refresh in place
++    /// (one recent tip per line for re-runs); otherwise LRU-evict tips past the byte budget.
++    ///
++    /// Deliberately NOT collapsing prefix-related tips of the same line: a forked child (section 7) extends
++    /// its parent's ids, and dropping the parent's tip on the child's insert would destroy the alternation
++    /// benefit. The byte budget bounds the duplication; E2 may add line collapsing once restore lands.
++    bool insert_tip(SavedItem item, bool is_aux);
++    /// E2's resume lookup: longest item whose full ids are a prefix of `ids` with exact image and cvec
++    /// identity and a matching stage count. Ties are impossible (lengths differ); live-chain ties prefer the
++    /// chain (no upload) at the call site. Null when nothing matches. A successful restore MUST call
++    /// note_use() on the returned item so the LRU clock counts mounts, not just inserts.
++    const SavedItem* find_best(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
++                               bool cvec) const;
++    /// E2 mounts through the item find_best() returned: advances its last_use to now. False for null or foreign
++    /// pointers (never fabricates freshness).
++    bool note_use(const SavedItem* it);
++    /// S2 DELETE: drop all non-pinned items. Returns how many tips were dropped.
++    size_t drop_non_pinned();
++    /// S2 GET: roots then tips.
++    std::vector<InventoryEntry> inventory() const;
++    void clear();
++
++  private:
++    static bool same_key(const SavedItem& a, const SavedItem& b) {
++        return a.ids == b.ids && a.imgs == b.imgs && a.cvec == b.cvec;
++    }
++    void evict_tips();   // LRU among tips while tip_bytes_ > tip_budget_
++
++    std::vector<SavedItem> roots_;
++    std::vector<SavedItem> tips_;
++    uint64_t tip_budget_ = (uint64_t)(kDefaultTipCacheGib * 1073741824.0);
++    uint64_t tip_bytes_ = 0;
++    uint64_t clock_ = 0;
++    int n_stages_ = 1;
++};
++
++}  // namespace strata::program::saved_state
+diff --git a/serve/server.py b/serve/server.py
+index 70a9b3a..7a5efae 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -285,6 +285,10 @@ class StrataEngine:
+                 v = tune.get(k)
+                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
+                     keys += f" {k}={float(v)!r}"
++        # E1/S1: aux side requests (titles) ride as `aux=1`: the engine may resume them from a main tip but
++        # never snapshots or evicts one, so aux traffic never costs the main path anything.
++        if sampling.get("strata_aux") is True:
++            keys += " aux=1"
+         return keys + StrataEngine.projection_key(sampling)
+ 
+     @staticmethod
+@@ -299,7 +303,9 @@ class StrataEngine:
+         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
+         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+         self.progress = None
+-        head = f"GENI {int(max_new)}{self.projection_key(sampling or {})} {embeddings}" if embeddings else \
++        # E1/S1: aux side requests ride as `aux=1` (sampling_keys covers GEN; GENI needs it appended).
++        auxkey = " aux=1" if (sampling or {}).get("strata_aux") is True else ""
++        head = f"GENI {int(max_new)}{self.projection_key(sampling or {})}{auxkey} {embeddings}" if embeddings else \
+             f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
+         try:
+             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+@@ -1311,6 +1317,9 @@ def make_handler(svc: Service):
+             messages, tools, kw = openai_to_messages(req)
+             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+             aux = is_aux_request(req, tools)      # decided before MCP tools merge in: aux never takes the tool loop
++            if aux:
++                # E1/S1: mark the side request so the engine snapshots no tip for it (it still resumes from one).
++                req = {**req, "strata_aux": True}
+             use_mcp = not aux and req.get("strata_mcp") is True and svc.mcp is not None   # the web app's opt-in
+             own = {t.get("name") for t in tools or []}
+             if use_mcp:
+@@ -1361,6 +1370,9 @@ def make_handler(svc: Service):
+             messages, tools, kw = anthropic_to_messages(req)
+             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+             aux = is_aux_request(req, tools)      # no MCP loop on this path; aux just waits for the main request
++            if aux:
++                # E1/S1: mark the side request so the engine snapshots no tip for it (it still resumes from one).
++                req = {**req, "strata_aux": True}
+             if aux:
+                 kw = {**kw, "enable_thinking": False}
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index d731eda..5253f75 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -46,6 +46,7 @@
+ #include "strata/core/native_dense.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
++#include "strata/program/saved_state.hpp"
+ #include "strata/spec/draft_policy.hpp"
+ #include "strata/spec/suffix_drafter.hpp"
+ #include "strata/kernels/cvec.hpp"
+@@ -287,6 +288,12 @@ struct Options {
+     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
+     /// the batched path)
+     int64_t short_read = 64;
++    /// E1 (DESIGN-HERMES-CACHE.md): SavedState tips live in host RAM under this LRU byte budget (GiB, default 8).
++    /// 0 = tips off (roots still pin at the upstream system-prefix boundary).
++    /// Implemented: Muse / review: Sol.
++    double tip_cache_gib = strata::program::saved_state::kDefaultTipCacheGib;
++    /// E3's --root-dir (interface-ready in E1): parsed and validated only, persistence lands in E3.
++    std::string root_dir = strata::program::saved_state::kDefaultRootDir;
+     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
+     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
+     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
+@@ -367,6 +374,9 @@ void usage() {
+                  "                       of RAM each; 0 = read every prompt from the start)\n"
+                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
++                  "  --tip-cache-gib N    --serve: SavedState tips live in host RAM under this LRU budget\n"
++                  "                       in GiB (default 8, 0 = tips off; roots still pin)\n"
++                  "  --root-dir DIR       --serve: E3 roots directory (E1: parsed only, persistence lands in E3)\n"
+                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
+                  "                       of the batched prompt path (default 64, 0 = off)\n"
+                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
+@@ -751,6 +761,116 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
+     return cudaDeviceSynchronize() == cudaSuccess;
+ }
+ 
++// ---- E1: SavedState snapshot capture (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum).
++// Implemented: Muse / review: Sol. CAPTURE ONLY: roots pin at the upstream system-prefix boundary and tips
++// snapshot after DONE is flushed (prompt + generated tokens at exactly that boundary). Restore (E2), disk
++// persistence (E3) and the per-request stats line (E4) consume saved_state.hpp's interface; they are not here.
++//
++// The positional cells below a snapshot are the live session's (exactly as for ConvCheckpoint); the payloads
++// below are self-contained host copies: with --kv-resident the authoritative host ranges are copied (no D2H),
++// fully resident pools are copied D2H. A failed snapshot is non-fatal: the caller keeps the request's answer
++// and stores nothing (never silently corrupt the cache).
++namespace saved = strata::program::saved_state;
++
++inline int saved_kv_format(const strata::core::QsaState& st) {
++    return st.kv_q4 ? saved::kKvQ4 : st.kv_int8 ? saved::kKvInt8 : saved::kKvF16;
++}
++
++/// Copies `n` bytes from one page-contiguous pool. `from_host` reads the (device-mapped, pinned) host copy.
++inline bool saved_copy_bytes(const uint8_t* src, uint8_t* dst, size_t n, bool from_host) {
++    if (n == 0) return true;
++    if (src == nullptr || dst == nullptr) return false;
++    if (from_host) {
++        std::memcpy(dst, src, n);
++        return true;
++    }
++    return cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost) == cudaSuccess;
++}
++
++/// QSA KV cells [0, k) of one layer into `out`, rounded up to whole pages (page_size cells): the padding past k
++/// is stale-but-harmless (the verifier overwrites K/V cells past the accepted prefix before any query reads
++/// them), and page granularity keeps the restore a plain copy-back. With kv-resident (kv_mode 1 streamed, 2
++/// ring) the authoritative host copy - identity layout [page][kv_head][page_size] rows - is the source; fully
++/// resident (mode 0, identity page table) is copied D2H from the device pools.
++bool saved_snapshot_kv(const strata::core::QsaState& st, const strata::core::ModelGeometry& g, int64_t k,
++                       saved::KvLayerPayload& out) {
++    out = saved::KvLayerPayload{};
++    if (k <= 0) return true;
++    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++    const int64_t nH = g.n_head_kv, hd = g.head_dim, ps = qs.page_size;
++    if (nH < 1 || hd < 1 || ps < 1) return false;
++    const int64_t pages = (k + ps - 1) / ps;
++    if (pages > st.n_pages) return false;
++    const bool streamed = st.kv_mode != 0;
++    if (streamed && !st.host.present()) return false;   // no authoritative copy to read: store nothing
++    out.fmt = saved_kv_format(st);
++    out.cells = k;
++    auto page_bytes = [&](size_t row) { return (size_t) nH * (size_t) ps * row; };
++    auto copy_pool = [&](const void* dev, const void* host, size_t row, std::vector<uint8_t>& dst) -> bool {
++        const uint8_t* src = streamed ? (const uint8_t*) host : (const uint8_t*) dev;
++        if (src == nullptr) return false;
++        dst.resize(pages * page_bytes(row));
++        for (int64_t p = 0; p < pages; ++p)
++            if (!saved_copy_bytes(src + (size_t) p * page_bytes(row), dst.data() + (size_t) p * page_bytes(row),
++                                  page_bytes(row), streamed))
++                return false;
++        return true;
++    };
++    if (st.kv_q4) {
++        const size_t row = (size_t) strata::kernels::kv_q4_bytes_per_head((int) hd);
++        return copy_pool(st.k_q4, st.host.k_q4, row, out.k) && copy_pool(st.v_q4, st.host.v_q4, row, out.v);
++    }
++    if (st.kv_int8) {
++        const size_t sc = (size_t) (hd / 64) * 2;
++        return copy_pool(st.k_q, st.host.k_q, (size_t) hd, out.k) &&
++               copy_pool(st.v_q, st.host.v_q, (size_t) hd, out.v) &&
++               copy_pool(st.k_scale, st.host.k_scale, sc, out.ks) &&
++               copy_pool(st.v_scale, st.host.v_scale, sc, out.vs);
++    }
++    return copy_pool(st.k_pool, st.host.k_pool, (size_t) hd * 2, out.k) &&
++           copy_pool(st.v_pool, st.host.v_pool, (size_t) hd * 2, out.v);
++}
++
++/// The indexer's pooled block keys covering [0, k): completed blocks k/idx_block plus the spare slot row, the
++/// block cursor and the constant dead key. Pooled keys live on the device only, so this is always D2H.
++bool saved_snapshot_indexer(const strata::core::QsaState& st, const strata::core::ModelGeometry& g, int64_t k,
++                            saved::IndexerPayload& out) {
++    out = saved::IndexerPayload{};
++    if (k <= 0) return true;
++    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++    const int64_t dim = g.idx_key_dim, ib = qs.idx_block;
++    if (dim < 1 || ib < 1) return false;
++    out.pooled_rows = k / ib + 1;
++    if (out.pooled_rows > st.idx_pooled_rows) return false;
++    out.pooled.resize((size_t) out.pooled_rows * (size_t) dim * 4);
++    out.block_pos.assign(1, 0);
++    out.dead_key.resize((size_t) dim * 4);
++    return saved_copy_bytes((const uint8_t*) st.idx_pooled, out.pooled.data(), out.pooled.size(), false) &&
++           saved_copy_bytes((const uint8_t*) st.idx_block_pos, (uint8_t*) out.block_pos.data(), 4, false) &&
++           saved_copy_bytes((const uint8_t*) st.idx_dead, out.dead_key.data(), out.dead_key.size(), false);
++}
++
++/// One session's full recurrent + indexer + KV state at exactly L tokens. The caller synchronized the device
++/// (checkpoint_save's contract); stage sessions are synchronized under their own OnDevice guard by the caller.
++bool saved_snapshot_stage(const strata::core::SessionState& ss, const strata::core::ModelGeometry& g, int64_t L,
++                          saved::StagePayload& out) {
++    out = saved::StagePayload{};
++    ConvCheckpoint tmp;   // the existing recurrent copy (GDN state + conv history, PLE history, QSA tails)
++    if (!checkpoint_save(tmp, ss, g)) return false;
++    out.rec.gdn = std::move(tmp.gdn);
++    out.rec.ple = std::move(tmp.ple);
++    out.rec.tails = std::move(tmp.tails);
++    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
++        saved::KvLayerPayload kv;
++        if (!saved_snapshot_kv(ss.qsa_states[i], g, L, kv)) return false;
++        out.kv.push_back(std::move(kv));
++        saved::IndexerPayload ix;
++        if (!saved_snapshot_indexer(ss.qsa_states[i], g, L, ix)) return false;
++        out.idx.push_back(std::move(ix));
++    }
++    return true;
++}
++
+ // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
+ // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
+ // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
+@@ -999,6 +1119,8 @@ int main(int argc, char** argv) {
+         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
++        else if (a == "--tip-cache-gib") o.tip_cache_gib = std::atof(next("--tip-cache-gib"));
++        else if (a == "--root-dir") o.root_dir = next("--root-dir");
+         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
+         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
+@@ -1164,6 +1286,14 @@ int main(int argc, char** argv) {
+         return 2;
+     }
+     strata::core::qsa_set_kv_resident(o.kv_resident);
++    if (!(o.tip_cache_gib >= 0.0)) {
++        std::fprintf(stderr, "strata generate: --tip-cache-gib must be >= 0\n");
++        return 2;
++    }
++    if (o.root_dir.empty()) {
++        std::fprintf(stderr, "strata generate: --root-dir must not be empty\n");
++        return 2;
++    }
+     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
+     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
+     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
+@@ -3076,6 +3206,86 @@ int main(int argc, char** argv) {
+         bool live_ok = false;
+         std::vector<ConvCheckpoint> checks;
+         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
++        // E1: the SavedState store (DESIGN-HERMES-CACHE.md): pinned roots + byte-budget LRU tips. The live
++        // chain above is preserved untouched; roots pin at the upstream system-prefix boundary, tips snapshot
++        // after DONE is flushed. Restore (E2), disk (E3), stats (E4) and /v1/cache (S2) consume the interface.
++        saved::SavedStateStore saved_states;
++        saved_states.set_tip_budget_gib(o.tip_cache_gib);
++        saved_states.set_stage_count((int) stages.size() + 1);
++        saved::ResumeStats saved_stats;   // E4 fills per request; E1 records snapshot_ms only
++        // E1 final review: the MTP repair row R_(root_at-1) for roots. R rows are borrowed prompt-path scratch
++        // (batched chunks, verify windows), overwritten by the next chunk/window - so on_chunk/read_windows stash
++        // the boundary row inside the callback while it is valid. e1_root_at is published per request (from
++        // root_at); the row belongs to e1_root_row_L. The root hook rejects the snapshot when they disagree.
++        int64_t e1_root_at = -1;
++        std::vector<float> e1_root_row;
++        int64_t e1_root_row_L = -1;
++        // E1: a complete snapshot at exactly L tokens: ids + image/cvec identity (passed in: the keyed
++        // state lives below this point), every stage's recurrent + indexer + KV state, and the MTP draft rows.
++        // The session must be idle at the boundary (the caller synchronized); stage sessions sync under their
++        // own device guard. False = store nothing.
++        auto saved_snapshot = [&](int64_t L, const std::vector<int32_t>& ids, const std::vector<ImgKey>& all_imgs,
++                                  bool cvec, const float* brow, int64_t bhc, int64_t bnembd,
++                                  saved::SavedItem& item) -> bool {
++            if (L < 1 || (int64_t) ids.size() != L) return false;
++            if (brow == nullptr || bhc <= 0 || bnembd <= 0) return false;   // no MTP repair row, no snapshot
++            item = saved::SavedItem{};
++            item.ids = ids;
++            for (const ImgKey& k : all_imgs)
++                if (k.start < L) item.imgs.push_back({k.start, k.hash});
++            item.cvec = cvec;
++            item.n_stages = (int) stages.size() + 1;
++            // the geometry/layout these bytes were captured under: E2 validates it before any restore
++            {
++                const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++                item.geom.n_qsa_layers = g.n_qsa_layers();
++                item.geom.n_head_kv = g.n_head_kv;
++                item.geom.head_dim = g.head_dim;
++                item.geom.idx_dim = g.idx_key_dim;
++                item.geom.idx_block = qs.idx_block;
++                item.geom.page_size = qs.page_size;
++            }
++            // the MTP repair row R_(L-1) for E2's boundary pairing (Sol final review).
++            item.boundary.hc = bhc;
++            item.boundary.n_embd = bnembd;
++            item.boundary.row.assign(brow, brow + (size_t) bhc * (size_t) bnembd);
++            if (cudaDeviceSynchronize() != cudaSuccess) return false;
++            saved::StagePayload s0;
++            if (!saved_snapshot_stage(ss, g, L, s0)) return false;
++            s0.rec.ple_prev[0] = L >= 2 ? ids[(size_t) (L - 2)] : -1;
++            s0.rec.ple_prev[1] = ids[(size_t) (L - 1)];
++            item.stages.push_back(std::move(s0));
++            for (auto& st : stages) {
++                const strata::core::OnDevice on(st->dev);
++                if (cudaDeviceSynchronize() != cudaSuccess) return false;
++                saved::StagePayload sp;
++                if (!saved_snapshot_stage(st->ss, g, L, sp)) return false;
++                sp.rec.ple_prev[0] = L >= 2 ? ids[(size_t) (L - 2)] : -1;
++                sp.rec.ple_prev[1] = ids[(size_t) (L - 1)];
++                item.stages.push_back(std::move(sp));
++            }
++            // the MTP drafter's valid pairs (finding 3 - see MtpPayload's invariant): cell i pairs
++            // (R_i, tok_{i+1}), so L main tokens hold exactly L-1 real pairs - the last cell's pairing needs
++            // tok_L, which does not exist yet, and is NEVER invented. Prompt pairs are exact (on_chunk /
++            // read_windows prefill with real next tokens); decode pairs are exact over kept rows (draft()
++            // catch-up pairs kept rows with their real argmaxes; the final window gets its exact catch-up
++            // post-DONE before any snapshot runs). valid_from bounds the windowed drafter's reachable range
++            // (prefill skips cells the window can never reach; E2 repairs the boundary by re-pairing from the
++            // suffix on resume). The host copy holds the full history even for a ring, so all pairs are
++            // captured; the helper still fails safe on oversize. No indexer: the drafter has none.
++            item.mtp = saved::MtpPayload{};
++            const strata::core::QsaState& mst = mtp.kv_state();
++            const int64_t pairs = L - 1;
++            if (pairs > 0 && mst.max_cells > 0) {
++                const strata::core::OnDevice on_mtp(mtp.device());   // the drafter's own device (a split's last stage)
++                saved::KvLayerPayload kv;
++                if (!saved_snapshot_kv(mst, g, pairs, kv)) return false;
++                item.mtp.kv.push_back(std::move(kv));
++                item.mtp.cells = pairs;
++                item.mtp.valid_from = std::min(mtp.prefill_valid_from(), item.mtp.cells);
++            }
++            return true;
++        };
+         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+         Clock::time_point pp_t0 = Clock::now();
+@@ -3115,6 +3325,28 @@ int main(int argc, char** argv) {
+             std::vector<int32_t> nxt((size_t) T);
+             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
+             if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
++            // E1 final review: stash the root boundary residual R_(e1_root_at-1) - this chunk's row
++            // (e1_root_at-1-p0). R_rows is borrowed prompt-path scratch, overwritten by the next chunk, so the
++            // D2H happens here, inside on_chunk, while valid. Reporting stage is the last one when split (the
++            // drafter's rows live there). A failed copy just leaves the row unavailable: the root hook then
++            // rejects the snapshot (the chain still stands), it never fails the request.
++            if (e1_root_at > 0 && e1_root_row_L != e1_root_at && p0 <= e1_root_at - 1 && e1_root_at - 1 < p0 + T) {
++                // Sol final-review fix: the assign below can throw (allocation) - an OPTIONAL root capture
++                // must never kill the request. A failed stash only leaves the row unavailable (root rejected).
++                try {
++                    const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
++                    const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
++                    e1_root_row.assign(hcn, 0.0f);
++                    if (cudaMemcpy(e1_root_row.data(), R_rows + (size_t) (e1_root_at - 1 - p0) * hcn,
++                                   hcn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess)
++                        e1_root_row_L = e1_root_at;
++                } catch (const std::exception& ex) {
++                    std::fprintf(stderr, "strata serve: SavedState root row stash threw (%s): root skipped\n",
++                                 ex.what());
++                } catch (...) {
++                    std::fprintf(stderr, "strata serve: SavedState root row stash threw: root skipped\n");
++                }
++            }
+             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
+             const int64_t done = p0 + T;
+             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+@@ -3386,6 +3618,10 @@ int main(int argc, char** argv) {
+             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
+             int req_penalty_last_n = 0;
+             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
++            // E1/S1: aux=1 marks a side request (titles): it may resume from a main tip but snapshots nothing
++            // and evicts nothing, so it never costs the main path anything. Set by the server from its own
++            // is_aux_request() (no tools + response_format); unknown to older servers, defaulting to main.
++            bool req_aux = false;
+             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
+             // the missed experts and the draft-probability floor, for this request only
+             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+@@ -3401,6 +3637,7 @@ int main(int argc, char** argv) {
+                     const std::string key = tok.substr(0, eq);
+                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
+                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
++                    else if (key == "aux") req_aux = std::atoi(tok.c_str() + eq + 1) != 0;
+                     else if (geni) {}   // image requests decode greedily
+                     else if (key == "temperature") req_temperature = fv;
+                     else if (key == "top_p") req_top_p = fv;
+@@ -3662,6 +3899,28 @@ int main(int argc, char** argv) {
+                         return false;
+                     }
+                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
++                    // E1 final review: stash the root boundary residual R_(e1_root_at-1) - this window's row
++                    // (e1_root_at-1-q) of final_R. The rows are verify scratch, reused by the next window, so the
++                    // D2H happens here, before it. final_R_all is the last stage's on a split. A failed copy only
++                    // leaves the row unavailable (root hook rejects the snapshot); the request proceeds.
++                    if (e1_root_at > 0 && e1_root_row_L != e1_root_at && q <= e1_root_at - 1 &&
++                        e1_root_at - 1 < q + T) {
++                        // Sol final-review fix: see on_chunk - an allocation fault here must not fail the request.
++                        try {
++                            const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
++                            const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
++                            e1_root_row.assign(hcn, 0.0f);
++                            if (cudaMemcpy(e1_root_row.data(),
++                                           ver.final_R_all() + (size_t) (e1_root_at - 1 - q) * hcn,
++                                           hcn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess)
++                                e1_root_row_L = e1_root_at;
++                        } catch (const std::exception& ex) {
++                            std::fprintf(stderr, "strata serve: SavedState root row stash threw (%s): root skipped\n",
++                                         ex.what());
++                        } catch (...) {
++                            std::fprintf(stderr, "strata serve: SavedState root row stash threw: root skipped\n");
++                        }
++                    }
+                     q += T;
+                 }
+                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+@@ -3758,6 +4017,12 @@ int main(int argc, char** argv) {
+                         if (i >= o.prompt_cache_root) root_at = i;
+                         break;
+                     }
++            // E1 final review: publish the root boundary for the R-row stash (on_chunk/read_windows above) and
++            // reset any previous request's row. The stash fires at most once: only the segment ending at root_at
++            // covers row root_at-1.
++            e1_root_at = root_at;
++            e1_root_row.clear();
++            e1_root_row_L = -1;
+             int64_t at = read_from;
+             for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+                 if (to <= at) continue;
+@@ -3792,6 +4057,35 @@ int main(int argc, char** argv) {
+                     std::printf("ERR saving a conversation checkpoint failed\n");
+                     return 1;
+                 }
++                if (to == root_at && root_at > 0) {
++                    // E1: pin the upstream system-prefix root at its exact boundary (never evicted by traffic).
++                    // Sol final review: the snapshot needs the MTP repair row R_(root_at-1) stashed from the
++                    // authoritative prompt source above - reject it when unavailable (never invent it).
++                    // Never fatal (finding 5): snapshot/insert failures - including allocation faults - only drop
++                    // the root; the chain checkpoint above still stands. insert_root also rejects incomplete
++                    // payloads (SavedItem::complete).
++                    try {
++                        saved::SavedItem root;
++                        const std::vector<int32_t> rids(cur.begin(), cur.begin() + root_at);
++                        const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
++                        const bool have_row =
++                            e1_root_row_L == root_at && e1_root_row.size() == hcn && hcn > 0;
++                        if (!have_row) {
++                            std::fprintf(stderr, "strata serve: SavedState root snapshot at %lld tokens skipped "
++                                                 "(boundary residual unavailable; chain still stands)\n",
++                                         (long long) root_at);
++                        } else if (!saved_snapshot(root_at, rids, req_imgs, cvec_cached, e1_root_row.data(),
++                                                   g.hc, g.n_embd, root) ||
++                                   !saved_states.insert_root(std::move(root)))
++                            std::fprintf(stderr, "strata serve: SavedState root snapshot at %lld tokens failed "
++                                                 "(the chain checkpoint above still stands)\n", (long long) root_at);
++                    } catch (const std::exception& ex) {
++                        std::fprintf(stderr, "strata serve: SavedState root snapshot threw (%s): skipped\n",
++                                     ex.what());
++                    } catch (...) {
++                        std::fprintf(stderr, "strata serve: SavedState root snapshot threw: skipped\n");
++                    }
++                }
+             }
+             if (!refill(err)) {
+                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+@@ -3814,6 +4108,13 @@ int main(int argc, char** argv) {
+             bool first_window = true;
+             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+             int64_t draft_offered = 0, draft_accepted = 0;
++            // E1 exact emitted boundary (Sol review finding 2): the last token actually SENT and its absolute
++            // position, plus the final window's (pos0, kept rows) for the post-DONE MTP catch-up. Updated ONLY
++            // for tokens the client received (the emit loop), never for speculative or accepted-but-unemitted
++            // rows: eos breaks before x/p update and a truncated window's tail is never emitted.
++            int32_t emit_last = 0;
++            int64_t emit_pos = -1, emit_win_q = 0;
++            int emit_win_e = 0;
+             // what the session holds once this request is done: the prompt read so far, then every committed token
+             std::vector<int32_t> consumed;
+             consumed.reserve((size_t) (n + max_new + S));
+@@ -3880,13 +4181,32 @@ int main(int argc, char** argv) {
+                 bool adapt_ok = true;
+                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+-                if (!ver.commit(a + 1, err)) {
++                // E1 exact boundary (Sol review finding 2): commit ONLY the rows that feed emitted picks.
++                // The accepted window (a+1 rows) can exceed the emitted range when eos or max_new stops the
++                // emission loop below early; committing those un-emitted drafts would put tokens the client never
++                // saw into `consumed`/live, breaking the tip's transcript identity (a forked child's prompt is
++                // the parent prompt + the EMITTED message). e in 1..a+1: rows [0,e) feed outv[0..e-1] exactly;
++                // rows [e,a] stay speculative under the same machinery as rejected drafts (K/V overwritten,
++                // tail slots re-appended on reprocessing - and a truncated window always ends the loop, so they
++                // never feed a next window).
++                int e = 0;
++                {
++                    const int remain = (int) (max_new - produced_n);   // >= 1: the loop condition guarantees it
++                    while (e <= a && e < remain) {
++                        ++e;
++                        if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) (e - 1)]) !=
++                            o.eos_ids.end())
++                            break;   // the eos token itself is emitted, then the turn ends
++                    }
++                }
++                if (!ver.commit(e, err)) {
+                     if (adapt_thr.joinable()) adapt_thr.join();
+                     std::printf("ERR %s\n", err.c_str());
+                     return 1;
+                 }
+-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
+-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
++                // the window's first e inputs are in the session now (the last EMITTED output is not: the
++                // post-DONE flush feeds it after DONE is flushed)
++                for (int i = 0; i < e; ++i) consumed.push_back(window[(size_t) i]);
+                 draft_offered += T - 1;
+                 draft_accepted += a;
+                 first_window = false;
+@@ -3895,9 +4215,13 @@ int main(int argc, char** argv) {
+                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                     strata::core::progress_beat();
+                     ++produced_n;
++                    emit_last = outv[(size_t) i];   // exact sent boundary (finding 2: independent of x/p)
++                    emit_pos = p + i + 1;            // outv[i] is the pick AFTER row i, i.e. position p+i+1
+                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
+                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                 }
++                emit_win_q = p;   // the final window's cells for the post-DONE MTP catch-up
++                emit_win_e = e;
+                 std::fflush(stdout);
+                 ++rounds;
+                 const bool drafted = eos || produced_n >= max_new ||
+@@ -3916,19 +4240,30 @@ int main(int argc, char** argv) {
+                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                 if (eos) { finish = "stop"; break; }
+                 if (stop_req.load()) { finish = "cancel"; break; }
+-                x = outv[(size_t) a];
+-                p += a + 1;
++                x = outv[(size_t) (e - 1)];   // the last EMITTED pick, not the last accepted one (finding 2)
++                p += e;
+             }
+             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+-            if (!cancelled) {
+-                // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
+-                // (the checkpoints taken while reading it are still good)
++            // E1 (Sol review findings 1, 2, 4): NO extra token processing before DONE. `consumed` is exactly
++            // prompt + EMITTED inputs (the loop commits only rows that feed emitted picks); `boundary_ok` says
++            // state == consumed, independent of the chain (`live_ok` additionally needs --prompt-cache, so tips
++            // work with cache 0). A prompt-stop or mid-decode STOP leaves the session between two commits: swap
++            // nothing usable (live keeps its stale content with live_ok=false, like the pre-existing
++            // prompt-cancel path) and suppress the tip. The final emitted token is still unfed (an output, not
++            // yet an input); the post-DONE flush feeds it after DONE is flushed.
++            bool boundary_ok = false;
++            if (!cancelled && !stop_req.load()) {
+                 live.swap(consumed);
+                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
+                 live_ok = o.prompt_cache > 0;
++                boundary_ok = true;
+             }
+-            static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
+-            if (state_hash && live_ok) {
++            // E1 finding 1: the boundary diagnostics are DEFINED here (every name is in scope) but CALLED
++            // after DONE below, once the post-DONE flush has brought live+state to the exact tip boundary the
++            // fingerprint covers. The guard reads boundary_ok at CALL time (by reference).
++            auto state_hash_dump = [&]() {
++                static const bool on = std::getenv("STRATA_STATE_HASH") != nullptr;
++                if (!on || !boundary_ok) return;
+                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
+                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
+                 cudaDeviceSynchronize();
+@@ -4004,7 +4339,7 @@ int main(int argc, char** argv) {
+                              (unsigned long long) h_gdn, (unsigned long long) h_ple, (unsigned long long) h_tail,
+                              (unsigned long long) h_pool, (unsigned long long) h_kv, (unsigned long long) h_mtp,
+                              (unsigned long long) h_stale, ss.ple_prev[0], ss.ple_prev[1]);
+-            }
++            };
+             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
+             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
+             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
+@@ -4012,6 +4347,106 @@ int main(int argc, char** argv) {
+                         decode_ms, finish, (long long) draft_accepted, (long long) draft_offered, (long long) resume,
+                         (long long) req_hits, (long long) req_look);
+             std::fflush(stdout);
++            // E1 findings 1-3, 5: ALL extra end-of-turn work runs AFTER DONE is flushed - the reply never
++            // waits for it. (a) MTP exact catch-up for the final window (its draft() was skipped on eos/length/
++            // stop): pair kept cells [q,q+e) with (R row, real next token). R rows + window/outv are still valid
++            // - nothing ran since the final ver.run. Drafter-only: a failure suppresses the tip (mtp_ok) but
++            // keeps live/chain. (b) Final-token flush: feed the last EMITTED token (emit_last at emit_pos -
++            // tracked independently because eos breaks before x/p update and the accepted window can exceed the
++            // emitted range) through run+commit with head sampling off, extending the exact boundary by one.
++            // max_context is safe by the admission margin (L+8 <= max_context) and re-checked below. Any
++            // failure - or a STOP landing post-DONE - invalidates live (live_ok/boundary_ok=false) and suppresses
++            // the tip; the served answer and earlier checkpoints are untouched. Allocation faults are caught
++            // (finding 5), never fatal.
++            bool mtp_ok = true;
++            // E1 final review: the tip's MTP repair row R_(L-1), D2H'd from the flush residual below (last
++            // stage on a split). A tip without it is rejected - E2 cannot repair pair L-1 without R_(L-1).
++            std::vector<float> flush_R;
++            try {
++                if (stop_req.load()) { live_ok = false; boundary_ok = false; }
++                if (boundary_ok && mtp_ok && produced_n > 0 && emit_win_e > 0) {
++                    std::vector<int32_t> fnxt((size_t) emit_win_e);
++                    for (int t = 0; t < emit_win_e; ++t)
++                        fnxt[(size_t) t] = t + 1 < emit_win_e ? window[(size_t) (t + 1)] : emit_last;
++                    std::string me;
++                    if (!mtp.prefill(ver.final_R_all(), fnxt.data(), emit_win_e, emit_win_q, me)) {
++                        std::fprintf(stderr, "strata serve: SavedState MTP final catch-up failed: %s\n", me.c_str());
++                        mtp_ok = false;
++                    }
++                }
++                // (b) final-token flush. Skipped (leaving the coherent pre-flush boundary) when no tip can come
++                // of it anyway (aux lines, budget off): aux must not advance the shared session either.
++                if (boundary_ok && !stop_req.load() && produced_n > 0 && emit_pos >= 0 &&
++                    emit_pos + 1 <= o.max_context && o.tip_cache_gib > 0.0 && !req_aux) {
++                    struct FlushNoHead {
++                        strata::core::Verifier& v;
++                        explicit FlushNoHead(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
++                        ~FlushNoHead() { v.set_head_sampling(true); }
++                    } no_head(ver);
++                    int32_t win1 = emit_last, out1 = 0;
++                    drive.d.layers = 0;
++                    drive.d.experts = 0;
++                    drive.d.failed = false;
++                    std::string fe;
++                    if (!ver.run(1, &win1, emit_pos, win_pool_fn, win_pool_user, &out1, fe) || drive.d.failed) {
++                        if (drive.d.failed && drive.d.fail) fe = drive.d.fail;
++                        std::fprintf(stderr, "strata serve: SavedState final-token flush failed: %s\n", fe.c_str());
++                        live_ok = false;
++                        boundary_ok = false;
++                    } else if (!ver.commit(1, fe)) {
++                        std::fprintf(stderr, "strata serve: SavedState final-token commit failed: %s\n", fe.c_str());
++                        live_ok = false;
++                        boundary_ok = false;
++                    } else {
++                        // Sol final-review fix: the commit above advanced main state for emit_last, so live
++                        // advances INDEPENDENTLY of the repair-row copy below - otherwise live_ok would claim
++                        // the old length for advanced state. A failed row copy only suppresses the tip.
++                        live.push_back(emit_last);
++                        live_imgs = imgs_below(req_imgs, (int64_t) live.size());
++                        // the MTP repair row R_(L-1) = this flush residual's row 0 (last stage on a split),
++                        // copied NOW - the verifier rows are scratch.
++                        const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
++                        const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
++                        flush_R.assign(hcn, 0.0f);
++                        if (hcn == 0 ||
++                            cudaMemcpy(flush_R.data(), ver.final_R_all(), hcn * sizeof(float),
++                                       cudaMemcpyDeviceToHost) != cudaSuccess) {
++                            std::fprintf(stderr, "strata serve: SavedState boundary residual copy failed: "
++                                                 "tip suppressed (live still advanced)\n");
++                            flush_R.clear();
++                        }
++                    }
++                }
++                // (c) boundary diagnostics on the exact tip boundary (finding 1).
++                state_hash_dump();
++                // (d) tip snapshot (finding 3: MTP rows are the L-1 real pairs; finding 4: live_ok is NOT
++                // required, so tips work with --prompt-cache 0; final review: the boundary repair row is
++                // required - a tip without R_(L-1) leaves E2 unable to pair cell L-1. Finding 5: failures only
++                // drop the tip).
++                if (boundary_ok && mtp_ok && !flush_R.empty() && !req_aux && o.tip_cache_gib > 0.0 &&
++                    !live.empty()) {
++                    const auto snap0 = Clock::now();
++                    saved::SavedItem tip;
++                    if (saved_snapshot((int64_t) live.size(), live, live_imgs, cvec_cached, flush_R.data(),
++                                       g.hc, g.n_embd, tip)) {
++                        saved_states.insert_tip(std::move(tip), false);
++                        saved_stats.snapshot_ms =
++                            std::chrono::duration<double, std::milli>(Clock::now() - snap0).count();
++                    } else {
++                        std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
++                                     (long long) live.size());
++                    }
++                }
++            } catch (const std::exception& ex) {
++                std::fprintf(stderr, "strata serve: SavedState post-DONE work threw (%s): live invalidated\n",
++                             ex.what());
++                live_ok = false;
++                boundary_ok = false;
++            } catch (...) {
++                std::fprintf(stderr, "strata serve: SavedState post-DONE work threw: live invalidated\n");
++                live_ok = false;
++                boundary_ok = false;
++            }
+             const int64_t fresh = n - resume;
+             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
+                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+new file mode 100644
+index 0000000..5478c5b
+--- /dev/null
++++ b/src/program/saved_state.cpp
+@@ -0,0 +1,117 @@
++// src/program/saved_state.cpp - E1: the SavedState store policy (CPU-only, no CUDA).
++//
++// Implemented: Muse / review: Sol. See saved_state.hpp for the design contract.
++#include "strata/program/saved_state.hpp"
++
++namespace strata::program::saved_state {
++
++SavedStateStore::SavedStateStore() = default;
++
++void SavedStateStore::set_stage_count(int n) {
++    if (n < 1) n = 1;
++    if (n == n_stages_) return;
++    // A new stage layout invalidates every saved byte: clear rather than risk a cross-layout restore.
++    n_stages_ = n;
++    clear();
++}
++
++bool SavedStateStore::insert_root(SavedItem item) {
++    if ((int)item.stages.size() != n_stages_ || item.n_stages != n_stages_) return false;
++    if (!item.complete()) return false;   // finding 5: never store an inconsistent/incomplete payload
++    item.kind = Kind::Root;
++    item.bytes = item.payload_bytes();
++    item.last_use = ++clock_;
++    for (SavedItem& r : roots_) {
++        if (same_key(r, item)) {
++            r = std::move(item);
++            return true;
++        }
++    }
++    roots_.push_back(std::move(item));
++    return true;
++}
++
++bool SavedStateStore::insert_tip(SavedItem item, bool is_aux) {
++    if (is_aux) return false;   // S1: aux lines get no tip and never evict a main line
++    if ((int)item.stages.size() != n_stages_ || item.n_stages != n_stages_) return false;
++    if (!item.complete()) return false;   // finding 5: never store an inconsistent/incomplete payload
++    if (item.ids.empty()) return false;   // resume 0 is "read from the start": nothing to save
++    item.kind = Kind::Tip;
++    item.bytes = item.payload_bytes();
++    item.last_use = ++clock_;
++    for (SavedItem& t : tips_) {
++        if (same_key(t, item)) {
++            tip_bytes_ -= t.bytes;
++            t = std::move(item);
++            tip_bytes_ += t.bytes;
++            evict_tips();
++            return true;
++        }
++    }
++    tip_bytes_ += item.bytes;
++    tips_.push_back(std::move(item));
++    evict_tips();
++    return true;
++}
++
++const SavedItem* SavedStateStore::find_best(const std::vector<int32_t>& ids,
++                                            const std::vector<ImgKey>& imgs, bool cvec) const {
++    const SavedItem* best = nullptr;
++    auto consider = [&](const SavedItem& it) {
++        if ((int)it.stages.size() != n_stages_ || it.n_stages != n_stages_) return;
++        if (it.cvec != cvec) return;
++        if (!is_prefix(it.ids, ids)) return;
++        if (imgs_below(imgs, (int64_t)it.ids.size()) != it.imgs) return;
++        if (best == nullptr || it.ids.size() > best->ids.size()) best = &it;
++    };
++    for (const SavedItem& r : roots_) consider(r);
++    for (const SavedItem& t : tips_) consider(t);
++    return best;
++}
++
++bool SavedStateStore::note_use(const SavedItem* it) {
++    if (it == nullptr) return false;
++    for (SavedItem& r : roots_)
++        if (&r == it) {
++            r.last_use = ++clock_;
++            return true;
++        }
++    for (SavedItem& t : tips_)
++        if (&t == it) {
++            t.last_use = ++clock_;
++            return true;
++        }
++    return false;
++}
++
++size_t SavedStateStore::drop_non_pinned() {    const size_t n = tips_.size();
++    tips_.clear();
++    tip_bytes_ = 0;
++    return n;
++}
++
++std::vector<InventoryEntry> SavedStateStore::inventory() const {
++    std::vector<InventoryEntry> out;
++    out.reserve(roots_.size() + tips_.size());
++    for (const SavedItem& r : roots_) out.push_back({Kind::Root, r.ids.size(), r.bytes, r.last_use});
++    for (const SavedItem& t : tips_) out.push_back({Kind::Tip, t.ids.size(), t.bytes, t.last_use});
++    return out;
++}
++
++void SavedStateStore::clear() {
++    roots_.clear();
++    tips_.clear();
++    tip_bytes_ = 0;
++}
++
++void SavedStateStore::evict_tips() {
++    while (!tips_.empty() && tip_bytes_ > tip_budget_) {
++        size_t v = 0;   // LRU: least recently used tip leaves first
++        for (size_t i = 1; i < tips_.size(); ++i)
++            if (tips_[i].last_use < tips_[v].last_use) v = i;
++        tip_bytes_ -= tips_[v].bytes;
++        tips_.erase(tips_.begin() + (std::ptrdiff_t)v);
++    }
++}
++
++}  // namespace strata::program::saved_state
+-- 
+2.54.0.windows.1
+

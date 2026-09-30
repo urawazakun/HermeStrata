@@ -1,0 +1,1001 @@
+From fd676d2adca9fc6092a5651551641a22feb94796 Mon Sep 17 00:00:00 2001
+From: urawa <30615262+urawazakun@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 04:48:25 +0900
+Subject: [PATCH 2/2] delegate_task: add fork mode for cache-prefix parity on
+ the single-slot backend
+
+tasks[] items accept "fork": true (default from delegation.fork_default).
+A fork child inherits the parent's cached system prompt + ephemeral prompt,
+tools[] (same order, nothing stripped) and transcript prefix verbatim, so its
+first request is the parent's last request extended at the END and reuses the
+warm KV prefix. Restrictions move to call time (fork_child_block_message in
+the executor chokepoint); delegate_task at depth == max refuses with a
+do-it-yourself error. Preflight compaction is deferred until the first
+provider response so request #1 is a warm cache read. Non-fork path
+unchanged. Tests: tests/tools/test_delegate_fork.py (12 tests).
+---
+ agent/agent_init.py               |   4 +
+ agent/tool_executor.py            |  11 +
+ agent/turn_tool_round.py          |   4 +
+ tests/tools/test_delegate_fork.py | 362 ++++++++++++++++++++++++++++++
+ tools/delegate_tool.py            |  85 +++++--
+ tools/delegate_tool_child_run.py  |  10 +
+ tools/delegate_tool_config.py     |   8 +
+ tools/delegate_tool_fork.py       | 315 ++++++++++++++++++++++++++
+ 8 files changed, 786 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tools/test_delegate_fork.py
+ create mode 100644 tools/delegate_tool_fork.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index cd36a64b..88b67fd4 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -598,6 +598,10 @@ _SESSION_STATE: Dict[str, Any] = {
+     # True on the background review fork: never persist or publish session lifecycle hooks,
+     # so its harness turn can't hijack or appear under the live session.
+     "_persist_disabled": False,
++    # Staged transcript (prefix + current assistant tool-call message) for
++    # delegate_task fork children, refreshed every tool round; None until the
++    # first tool round of the session.
++    "_fork_prefix_snapshot": None,
+ }
+ 
+ # Streaming delivery state.
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 518b714f..44b99227 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -622,6 +622,17 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
+ def _pre_tool_block(agent, ref: _ToolCallRef):
+     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
+     hook-modified args applied. Hook failures never block."""
++    # Fork-child restriction (delegate_task fork mode): blocked tools stay
++    # advertised for tools[] cache parity and refuse here, at call time.
++    # Agent-attribute check (not thread-local) so worker threads see it.
++    try:
++        from tools.delegate_tool_fork import fork_child_block_message
++
++        _fork_block = fork_child_block_message(agent, ref.name)
++        if _fork_block is not None:
++            return _fork_block, ref.args
++    except Exception:
++        pass
+     try:
+         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+ 
+diff --git a/agent/turn_tool_round.py b/agent/turn_tool_round.py
+index daa009ac..a3468504 100644
+--- a/agent/turn_tool_round.py
++++ b/agent/turn_tool_round.py
+@@ -97,6 +97,10 @@ def run_tool_round(
+         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
+     )
+     append_message(messages, assistant_msg)
++    # Fork-delegation prefix: a forked child replays the parent's last request
++    # extended at the end (prompt-cache parity). Snapshot the staged transcript
++    # — prefix + this assistant tool-call message, before any tool result lands.
++    agent._fork_prefix_snapshot = list(messages)
+ 
+     # Mixed batch: error-result invalid calls and drop them from execution.
+     if _invalid_batch_calls:
+diff --git a/tests/tools/test_delegate_fork.py b/tests/tools/test_delegate_fork.py
+new file mode 100644
+index 00000000..2e4d0a25
+--- /dev/null
++++ b/tests/tools/test_delegate_fork.py
+@@ -0,0 +1,362 @@
++#!/usr/bin/env python3
++"""Tests for delegate_task fork mode (prompt-cache prefix parity).
++
++A fork task (``tasks[]`` item ``"fork": true``, default from
++``delegation.fork_default``) inherits the parent's system prompt, ``tools[]``
++and transcript prefix verbatim so its first request extends the parent's last
++request at the END. Blocked tools stay advertised and refuse at CALL time.
++
++Uses stub agents + a FakeAgent class (no network, no real model calls).
++
++Run with:  venv\\Scripts\\python.exe -m pytest tests/tools/test_delegate_fork.py -v
++"""
++
++import copy
++import datetime as _dt
++import json
++import time
++import unittest
++from unittest.mock import patch
++
++from tools.delegate_tool import DELEGATE_TASK_SCHEMA, delegate_task
++
++FORK_GOAL = "Summarize the quarterly report figures"
++FORK_CONTEXT = "The report lives at /tmp/q3.txt; keep the summary under 200 words."
++PARENT_SYSTEM = "PARENT-SYSTEM-PROMPT-BYTES::v1"
++PARENT_EPHEMERAL = "PARENT-EPHEMERAL-BYTES::v1"
++
++
++def _tool_def(name):
++    return {
++        "type": "function",
++        "function": {"name": name, "description": f"{name} tool", "parameters": {"type": "object"}},
++    }
++
++
++PARENT_TOOLS = [_tool_def(n) for n in ("terminal", "read_file", "delegate_task", "memory", "clarify")]
++
++
++def _delegate_call_msg(call_id="call-1", tasks=None):
++    if tasks is None:
++        tasks = [{"goal": FORK_GOAL, "context": FORK_CONTEXT, "fork": True}]
++    return {
++        "id": call_id, "type": "function",
++        "function": {"name": "delegate_task", "arguments": json.dumps({"tasks": tasks})},
++    }
++
++
++def _parent_prefix(extra_calls=True):
++    """Parent transcript as staged for the most recent API request, plus the
++    assistant tool-call message (what turn_tool_round stashes)."""
++    tool_calls = [_delegate_call_msg()]
++    if extra_calls:
++        tool_calls.append({
++            "id": "call-2", "type": "function",
++            "function": {"name": "read_file", "arguments": json.dumps({"path": "/tmp/q3.txt"})},
++        })
++    return [
++        {"role": "user", "content": "Please summarize the quarterly report"},
++        {"role": "assistant", "content": "", "tool_calls": tool_calls},
++    ]
++
++
++class _StubParent:
++    """Minimal parent with REAL values (no MagicMock attribute fog)."""
++
++    def __init__(self, depth=0):
++        self.base_url = "https://openrouter.ai/api/v1"
++        self.api_key = "test-key"
++        self.provider = "openrouter"
++        self.api_mode = "chat_completions"
++        self.model = "anthropic/claude-sonnet-4"
++        self.platform = "cli"
++        self.session_id = "parent-sess-1"
++        self._session_db = None
++        self._delegate_depth = depth
++        self._active_children = []
++        self._print_fn = None
++        self.tool_progress_callback = None
++        self._cached_system_prompt = PARENT_SYSTEM
++        self.ephemeral_system_prompt = PARENT_EPHEMERAL
++        self.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
++        self.tools = copy.deepcopy(PARENT_TOOLS)
++        self.enabled_toolsets = ["terminal", "file", "web", "delegation", "memory", "clarify"]
++        self.disabled_toolsets = []
++        self.prefill_messages = [{"role": "system", "content": "PREFILL-BYTES"}]
++        self.reasoning_config = None
++        self.request_overrides = {}
++        self._credential_pool = None
++        self._fallback_chain = None
++        self._client_kwargs = {}
++        self.client = None
++        self.capabilities = None
++        self.acp_command = None
++        self.acp_args = []
++        self._memory_manager = None
++        self._fork_prefix_snapshot = _parent_prefix()
++        self._session_messages = copy.deepcopy(self._fork_prefix_snapshot)
++
++
++class FakeAgent:
++    """Stand-in for run_agent.AIAgent: captures construction + first turn."""
++
++    instances = []
++    final_response_text = "fork report: done"
++
++    def __init__(self, **kwargs):
++        self.kwargs = dict(kwargs)
++        for key, value in kwargs.items():
++            setattr(self, key, value)
++        self.run_conversation_calls = []
++        FakeAgent.instances.append(self)
++
++    def run_conversation(self, user_message=None, conversation_history=None,
++                         task_id=None, stream_callback=None, **kw):
++        self.run_conversation_calls.append({
++            "user_message": user_message,
++            "conversation_history": copy.deepcopy(conversation_history),
++            "task_id": task_id,
++        })
++        return {
++            "final_response": type(self).final_response_text,
++            "completed": True,
++            "api_calls": 1,
++            "messages": [
++                {"role": "user", "content": user_message},
++                {"role": "assistant", "content": type(self).final_response_text},
++            ],
++        }
++
++    def get_activity_summary(self):
++        return {
++            "api_call_count": 1, "current_tool": None,
++            "last_activity_ts": time.time(), "max_iterations": 250,
++            "last_activity_desc": "",
++        }
++
++    def close(self):
++        pass
++
++
++def _run_fork(parent, tasks, **kw):
++    """Run delegate_task with AIAgent patched; return (payload, children)."""
++    FakeAgent.instances = []
++    kw.setdefault("background", False)
++    with patch("run_agent.AIAgent", FakeAgent):
++        raw = delegate_task(tasks=tasks, parent_agent=parent, **kw)
++    return json.loads(raw), list(FakeAgent.instances)
++
++
++class TestForkFirstRequestParity(unittest.TestCase):
++    def test_system_tools_and_prefix_parity(self):
++        """Fork child's first request: system identical, tools identical
++        (json dumps equal), messages[:k] equal to the parent's last request
++        messages, followed by the assistant tool-call message + results."""
++        parent = _StubParent()
++        payload, children = _run_fork(parent, [{"goal": FORK_GOAL, "context": FORK_CONTEXT, "fork": True}])
++        self.assertEqual(len(children), 1)
++        child = children[0]
++
++        # System prompt: byte-identical, no re-render, no additions.
++        self.assertEqual(child._cached_system_prompt, PARENT_SYSTEM)
++        self.assertIs(child._cached_system_prompt, parent._cached_system_prompt)
++        self.assertEqual(child.kwargs.get("ephemeral_system_prompt"), PARENT_EPHEMERAL)
++        wire_parent = (PARENT_SYSTEM + "\n\n" + PARENT_EPHEMERAL).strip()
++        wire_child = (child._cached_system_prompt + "\n\n" + child.ephemeral_system_prompt).strip()
++        self.assertEqual(wire_child, wire_parent)
++
++        # tools[]: byte-identical, same order — blocked tools NOT removed.
++        self.assertEqual(json.dumps(child.tools), json.dumps(parent.tools))
++        child_names = [t["function"]["name"] for t in child.tools]
++        for blocked in ("delegate_task", "memory", "clarify"):
++            self.assertIn(blocked, child_names)
++
++        # First turn: prefix + verbatim assistant + per-call tool results.
++        self.assertEqual(len(child.run_conversation_calls), 1)
++        call = child.run_conversation_calls[0]
++        history = call["conversation_history"]
++        prefix = parent._fork_prefix_snapshot
++        self.assertEqual(history[: len(prefix)], prefix)
++        assistant = history[len(prefix) - 1]
++        self.assertEqual(assistant["role"], "assistant")
++        self.assertEqual(assistant, prefix[-1])  # verbatim, incl. all tool_calls
++        call_ids = [tc.get("id") for tc in assistant["tool_calls"]]
++        self.assertEqual(call_ids, ["call-1", "call-2"])
++        results = history[len(prefix):]
++        self.assertEqual(len(results), 2)
++        by_id = {m["tool_call_id"]: m for m in results}
++        self.assertEqual(set(by_id), {"call-1", "call-2"})
++        self.assertTrue(all(m["role"] == "tool" for m in results))
++        instruction = by_id["call-1"]["content"]
++        self.assertIn("[forked child, depth 1/1]", instruction)
++        self.assertIn(FORK_GOAL, instruction)
++        self.assertIn(FORK_CONTEXT, instruction)
++        self.assertIn("Your final message is your report to the parent", instruction)
++        self.assertEqual(by_id["call-2"]["content"], "(running in the parent)")
++
++        # Simulated wire messages: parent prefix, then assistant + results,
++        # then the goal turn extending at the END.
++        first_request = history + [{"role": "user", "content": call["user_message"]}]
++        self.assertEqual(first_request[: len(prefix)], prefix)
++        self.assertEqual(call["user_message"], FORK_GOAL)
++
++        # Fork bookkeeping.
++        self.assertTrue(child._is_fork_child)
++        self.assertEqual(child._fork_conversation_history, history)
++        self.assertTrue(child._review_defer_compaction_before_first_response)
++        self.assertTrue(child._skip_mcp_refresh)
++        self.assertEqual(child._delegate_depth, 1)
++
++        # Prefill deep-copied (send-time sanitizers must not rewrite parent's).
++        self.assertEqual(child.kwargs.get("prefill_messages"), parent.prefill_messages)
++        self.assertIsNot(child.kwargs.get("prefill_messages"), parent.prefill_messages)
++
++        # Parent received the normal result entry (transcript NOT merged).
++        self.assertIn("results", payload)
++        self.assertEqual(payload["results"][0]["status"], "completed")
++        self.assertIn("fork report", payload["results"][0]["summary"])
++
++    def test_output_schema_rides_the_instruction(self):
++        parent = _StubParent()
++        schema = {"type": "object", "properties": {"total": {"type": "number"}}, "required": ["total"]}
++        FakeAgent.final_response_text = '{"total": 42}'
++        try:
++            payload, children = _run_fork(
++                parent, [{"goal": FORK_GOAL, "fork": True, "output_schema": schema}])
++        finally:
++            FakeAgent.final_response_text = "fork report: done"
++        history = children[0].run_conversation_calls[0]["conversation_history"]
++        by_id = {m["tool_call_id"]: m for m in history if m.get("role") == "tool"}
++        instruction = by_id["call-1"]["content"]
++        self.assertIn("matching this JSON schema", instruction)
++        self.assertIn('"total"', instruction)
++        self.assertEqual(payload["results"][0].get("schema_valid"), True)
++
++    def test_several_fork_tasks_share_prefix_with_own_instruction(self):
++        """One assistant message launching several fork tasks: each child gets
++        the same prefix and its own instruction."""
++        parent = _StubParent()
++        tasks = [
++            {"goal": "First parallel analysis tropic", "fork": True},
++            {"goal": "Second parallel analysis tropic", "fork": True},
++        ]
++        parent._fork_prefix_snapshot = [
++            {"role": "user", "content": "fan out please"},
++            {"role": "assistant", "content": "", "tool_calls": [_delegate_call_msg("call-9", tasks=tasks)]},
++        ]
++        payload, children = _run_fork(parent, tasks)
++        self.assertEqual(len(children), 2)
++        histories = [c.run_conversation_calls[0]["conversation_history"] for c in children]
++        self.assertEqual(histories[0][:2], histories[1][:2])
++        first_instructions = [h[2]["content"] for h in histories]
++        self.assertIn("First parallel analysis tropic", first_instructions[0])
++        self.assertIn("Second parallel analysis tropic", first_instructions[1])
++        self.assertNotIn("Second parallel analysis tropic", first_instructions[0])
++        self.assertNotIn("First parallel analysis tropic", first_instructions[1])
++
++    def test_fork_default_config(self):
++        """delegation.fork_default: true makes flag-less tasks fork."""
++        parent = _StubParent()
++        with patch("tools.delegate_tool._load_config",
++                   return_value={"fork_default": True, "max_iterations": 250}):
++            payload, children = _run_fork(parent, [{"goal": "Unflagged but defaulted task here"}])
++        self.assertEqual(len(children), 1)
++        self.assertTrue(children[0]._is_fork_child)
++
++    def test_explicit_fork_false_opts_out(self):
++        parent = _StubParent()
++        with patch("tools.delegate_tool._load_config",
++                   return_value={"fork_default": True, "max_iterations": 250}):
++            payload, children = _run_fork(
++                parent, [{"goal": "Explicitly isolated task here", "fork": False}])
++        self.assertEqual(len(children), 1)
++        self.assertFalse(getattr(children[0], "_is_fork_child", False))
++
++    def test_schema_advertises_fork(self):
++        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
++        self.assertIn("fork", props)
++        self.assertEqual(props["fork"]["type"], "boolean")
++
++
++class TestForkCallTimeRestrictions(unittest.TestCase):
++    def _fork_child(self):
++        child = FakeAgent(model="m")
++        child._is_fork_child = True
++        return child
++
++    def test_blocked_tools_refuse_at_call_time(self):
++        from tools.delegate_tool_fork import fork_child_block_message
++
++        child = self._fork_child()
++        for tool in ("clarify", "memory", "send_message", "cronjob_manage"):
++            raw = fork_child_block_message(child, tool)
++            self.assertIsNotNone(raw, tool)
++            parsed = json.loads(raw)
++            self.assertIn("not available to a forked child", parsed["error"])
++        # Allowed tools pass through (None), including delegate_task itself:
++        # its own depth budget decides.
++        for tool in ("terminal", "read_file", "delegate_task", "execute_code"):
++            self.assertIsNone(fork_child_block_message(child, tool))
++
++    def test_non_fork_children_unaffected(self):
++        from tools.delegate_tool_fork import fork_child_block_message
++
++        plain = FakeAgent(model="m")
++        self.assertIsNone(fork_child_block_message(plain, "memory"))
++        self.assertIsNone(fork_child_block_message(object(), "memory"))
++
++    def test_executor_pre_tool_block_enforces_fork_guard(self):
++        """The agent-loop dispatch chokepoint refuses blocked fork tools."""
++        from agent.tool_executor import _ToolCallRef, _pre_tool_block
++
++        child = self._fork_child()
++        message, _ = _pre_tool_block(child, _ToolCallRef("memory", {}, "t", "c", []))
++        self.assertIsNotNone(message)
++        self.assertIn("not available to a forked child", json.loads(message)["error"])
++        message, _ = _pre_tool_block(child, _ToolCallRef("terminal", {}, "t", "c", []))
++        self.assertIsNone(message)
++
++    def test_depth_limit_refusal_for_fork(self):
++        parent = _StubParent(depth=1)  # default max_spawn_depth == 1
++        parent._is_fork_child = True
++        with patch("run_agent.AIAgent", FakeAgent):
++            raw = delegate_task(
++                tasks=[{"goal": FORK_GOAL, "fork": True}],
++                parent_agent=parent, background=False,
++            )
++        parsed = json.loads(raw)
++        self.assertIn("error", parsed)
++        self.assertIn("delegation depth limit reached (1/1)", parsed["error"])
++        self.assertIn("do this work yourself", parsed["error"])
++
++    def test_depth_limit_unchanged_for_non_fork(self):
++        parent = _StubParent(depth=2)
++        with patch("tools.delegate_tool._get_max_spawn_depth", return_value=2):
++            with patch("run_agent.AIAgent", FakeAgent):
++                raw = delegate_task(goal="test", parent_agent=parent)
++        parsed = json.loads(raw)
++        self.assertIn("error", parsed)
++        self.assertIn("depth limit", parsed["error"].lower())
++        self.assertNotIn("do this work yourself", parsed["error"])
++
++
++class TestNonForkPathUnchanged(unittest.TestCase):
++    def test_normal_child_has_no_fork_state(self):
++        parent = _StubParent()
++        payload, children = _run_fork(parent, [{"goal": "A normal isolated task here"}])
++        child = children[0]
++        self.assertFalse(getattr(child, "_is_fork_child", False))
++        self.assertFalse(hasattr(child, "_fork_conversation_history"))
++        # Focused task prompt, not the parent's cached system prompt.
++        ephemeral = child.kwargs.get("ephemeral_system_prompt") or ""
++        self.assertIn("YOUR TASK", ephemeral)
++        self.assertNotEqual(
++            getattr(child, "_cached_system_prompt", None), parent._cached_system_prompt)
++        # Normal path starts a fresh conversation (no inherited history).
++        call = child.run_conversation_calls[0]
++        self.assertIsNone(call["conversation_history"])
++        self.assertEqual(payload["results"][0]["status"], "completed")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index b47e2fd7..5947d8d1 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -28,13 +28,17 @@ from tools.delegate_tool_child_run import (  # noqa: F401
+     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
+ )
+ from tools.delegate_tool_config import (  # noqa: F401
+-    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
+-    _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
+-    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
+-    _resolve_child_runtime, _resolve_delegation_credentials,
++    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_fork_default, _get_max_async_children,
++    _get_max_concurrent_children, _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback,
++    _get_worktree_isolation, _inherit_parent_capabilities, _load_config, _merge_request_overrides,
++    _resolve_child_credential_pool, _resolve_child_runtime, _resolve_delegation_credentials,
+     _subagent_auto_approve, _subagent_auto_deny,
+ )
+ from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
++from tools.delegate_tool_fork import (  # noqa: F401
++    apply_fork_parity, build_fork_conversation_history, build_fork_instruction, fork_depth_error,
++    fork_parent_toolsets, resolve_task_fork, tasks_request_fork,
++)
+ from tools.delegate_tool_progress import (  # noqa: F401
+     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
+     _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
+@@ -176,6 +180,13 @@ def _build_child_agent(
+     routing_cfg: Optional[Dict[str, Any]] = None,
+     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
+     role: str = "leaf",
++    # Fork mode: inherit the parent's system prompt / tools[] / transcript prefix
++    # verbatim for prompt-cache prefix parity (see tools/delegate_tool_fork.py).
++    # fork_schema feeds the fork instruction; fork_tool_call_id pins the spawning
++    # call (else resolved by goal-matching against the assistant message).
++    fork: bool = False,
++    fork_schema: Optional[Dict[str, Any]] = None,
++    fork_tool_call_id: Optional[str] = None,
+ ):
+     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
+     inheritance so children can run on a different provider:model pair."""
+@@ -197,11 +208,28 @@ def _build_child_agent(
+     # global. Only fallback policy follows the owner of a per-call route such
+     # as auxiliary.review.
+     delegation_cfg = _load_config()
+-    child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+-    child_prompt = _build_child_system_prompt(
+-        goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+-        max_spawn_depth=max_spawn, child_depth=child_depth,
+-    )
++    if fork:
++        # No re-render, no child-specific additions: the parent's exact toolset
++        # pair (restriction moves to call time) and the parent's ephemeral
++        # prompt (appended at API time, never cached) keep the wire bytes
++        # identical. The task instruction rides the tool result instead.
++        child_toolsets, child_disabled_toolsets = fork_parent_toolsets(parent_agent)
++        child_prompt = getattr(parent_agent, "ephemeral_system_prompt", None)
++        fork_instruction = build_fork_instruction(
++            goal=goal, context=context, child_depth=child_depth, max_spawn_depth=max_spawn,
++            output_schema=fork_schema,
++        )
++        fork_history = build_fork_conversation_history(
++            parent_agent, task_goal=goal, instruction=fork_instruction,
++            spawn_tool_call_id=fork_tool_call_id,
++        )
++    else:
++        child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
++        child_prompt = _build_child_system_prompt(
++            goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
++            max_spawn_depth=max_spawn, child_depth=child_depth,
++        )
++        fork_history = None
+     parent_api_key = getattr(parent_agent, "api_key", None)
+     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
+         parent_api_key = parent_agent._client_kwargs.get("api_key")
+@@ -227,12 +255,25 @@ def _build_child_agent(
+         request_overrides = dict(override_request_overrides)
+     else:
+         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
++    if fork and (delegation_cfg.get("reasoning_effort") or delegation_cfg.get("reasoning_effort") is False):
++        # A pinned delegation.reasoning_effort would namespace the child onto
++        # a cold cache (Anthropic keys on thinking presence); parity wins.
++        logger.debug("fork child: ignoring delegation.reasoning_effort pin for cache parity")
++        rt["reasoning_config"] = getattr(parent_agent, "reasoning_config", None)
++    # Prefill sits right after the system message: a fork child deep-copies the
++    # parent's so send-time sanitizers cannot rewrite the parent's bytes
++    # in place (same hazard background_review guards against).
++    parent_prefill = getattr(parent_agent, "prefill_messages", None)
++    if fork and isinstance(parent_prefill, list):
++        import copy as _copy
++
++        parent_prefill = _copy.deepcopy(parent_prefill)
+     parent_sid = getattr(parent_agent, "session_id", None)
+     child_session_db = _open_child_session_db(parent_agent)
+     with delegated_child_context():
+         try:
+             child = AIAgent(
+-                **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
++                **rt, max_iterations=max_iterations, prefill_messages=parent_prefill,
+                 enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
+                 ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
+                 skip_context_files=True, skip_memory=True, clarify_callback=None,
+@@ -253,6 +294,12 @@ def _build_child_agent(
+             raise
+     child._print_fn = getattr(parent_agent, "_print_fn", None)
+     _apply_child_cache_ttl(child)
++    if fork:
++        # Byte-identical system prompt / tools[] / reasoning pins (see
++        # tools/delegate_tool_fork.apply_fork_parity); restrictions move to
++        # call time so the advertised schema keeps the prefix cache warm.
++        apply_fork_parity(child, parent_agent)
++        child._fork_conversation_history = fork_history
+     if child_session_db is not None:
+         child._owns_session_db = True  # released by the child's close(), never by the parent
+     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
+@@ -360,7 +407,7 @@ def _run_single_child(
+ def _build_children(
+     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
+     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
+-    live_deleg_id: Optional[str], live_writers: list,
++    live_deleg_id: Optional[str], live_writers: list, fork_flags: Optional[List[bool]] = None,
+ ) -> tuple[List[tuple], Optional[str]]:
+     """Build every child on the main thread (construction is not thread-safe);
+     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
+@@ -380,12 +427,14 @@ def _build_children(
+         _child_context = t.get("context")
+         if _task_schema is not None:
+             _child_context = append_output_contract(_child_context, _task_schema)
++        _fork = bool(fork_flags[i]) if fork_flags and i < len(fork_flags) else False
+         try:
+             child = _build_child_preserving_parent_tools(
+                 task_index=i, goal=t["goal"], context=_child_context,
+                 toolsets=None,  # always inherit the parent's toolsets
+                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
++                fork=_fork, fork_schema=_task_schema,
+             )
+         except ValueError as exc:
+             return [], str(exc)
+@@ -438,16 +487,18 @@ def delegate_task(
+     # that joins on every child and re-enters as a single consolidated message.
+     background = is_truthy_value(background, default=False) if background is not None else False
+ 
++    cfg = _load_config()
+     depth = getattr(parent_agent, "_delegate_depth", 0)
+     max_spawn = _get_max_spawn_depth()
+     if depth >= max_spawn:
++        if tasks_request_fork(tasks, goal, cfg):
++            return fork_depth_error(depth, max_spawn)
+         return tool_error(
+             f"Delegation depth limit reached (depth={depth}, max_spawn_depth={max_spawn}). Raise "
+             f"delegation.max_spawn_depth in config.yaml if deeper nesting is required (no hard ceiling, but each level "
+             f"multiplies API cost)."
+         )
+ 
+-    cfg = _load_config()
+     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+     # Caller-supplied max_iterations is ignored: the config value is authoritative
+     # so budgets stay predictable (kwarg kept for internal callers/tests).
+@@ -472,6 +523,7 @@ def delegate_task(
+         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
+     if err:
+         return tool_error(err)
++    fork_flags = [resolve_task_fork(t, _get_fork_default()) for t in task_list]
+ 
+     overall_start = time.monotonic()
+     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
+@@ -485,7 +537,7 @@ def delegate_task(
+ 
+     children, err = _build_children(
+         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers,
++        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, fork_flags=fork_flags,
+     )
+     if err:
+         return tool_error(err)
+@@ -641,6 +693,13 @@ DELEGATE_TASK_SCHEMA = {
+                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
+                             "order execution; if B needs A's output, dispatch B after A returns.",
+                         ),
++                        "fork": _p(
++                            "boolean",
++                            "Fork mode: this child inherits your system prompt, tools and transcript prefix verbatim "
++                            "instead of starting an isolated context, so its first request reuses your warm prompt "
++                            "cache. Blocked tools stay listed but refuse at call time. Default off unless "
++                            "delegation.fork_default is set.",
++                        ),
+                     },
+                     "required": ["goal"],
+                 },
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index 7d49038a..691e6a06 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -656,6 +656,16 @@ class _ChildRun:
+             worker_thread_holder["t"] = threading.current_thread()
+             from agent.delegation_context import delegated_child_context
+             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
++                # Fork children replay the parent's transcript prefix (system /
++                # tools parity is set at build time); the goal still lands as
++                # the turn's user message so the inherited tool results are
++                # extended at the END, keeping the parent's request a KV prefix.
++                fork_history = getattr(child, "_fork_conversation_history", None)
++                if isinstance(fork_history, list) and fork_history:
++                    return child.run_conversation(
++                        user_message=self.goal, conversation_history=fork_history,
++                        task_id=self.child_task_id, stream_callback=self.relay_text,
++                    )
+                 return child.run_conversation(
+                     user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
+                 )
+diff --git a/tools/delegate_tool_config.py b/tools/delegate_tool_config.py
+index 6fe745e7..443a1ed1 100644
+--- a/tools/delegate_tool_config.py
++++ b/tools/delegate_tool_config.py
+@@ -152,6 +152,14 @@ def _get_max_spawn_depth() -> int:
+         f"delegation.max_spawn_depth=%r is not a valid integer; using default {MAX_DEPTH}",
+     )
+ 
++def _get_fork_default() -> bool:
++    """delegation.fork_default (bool, default False): tasks without an explicit
++    ``fork`` flag inherit the parent's system prompt / tools[] / transcript
++    prefix (cheap on the single-slot local backend) instead of starting an
++    isolated context."""
++    return bool(is_truthy_value(_cfg().get("fork_default", False), default=False))
++
++
+ def _get_orchestrator_enabled() -> bool:
+     """delegation.orchestrator_enabled kill switch (default True): False forces every child to leaf."""
+     val = _cfg().get("orchestrator_enabled", True)
+diff --git a/tools/delegate_tool_fork.py b/tools/delegate_tool_fork.py
+new file mode 100644
+index 00000000..075dc8c8
+--- /dev/null
++++ b/tools/delegate_tool_fork.py
+@@ -0,0 +1,315 @@
++"""``delegate_task`` fork mode: cheap subagents via prompt-cache prefix parity.
++
++The backend is ONE local engine slot that reuses the KV of the longest
++previously-seen token prefix. A forked child is cheap only if its first request
++is the parent's last request extended at the END — any byte change earlier
++(system prompt, tools[], message order) costs a full re-read of 12K-100K
++tokens.
++
++A fork task (``tasks[]`` item ``"fork": true``, default from
++``delegation.fork_default``) therefore inherits, verbatim:
++
++- the parent's cached system prompt (no re-render, no child additions) plus the
++  parent's ``ephemeral_system_prompt`` (appended at API time, never cached);
++- the parent's ``tools[]`` list, same order — child-blocked tools stay
++  advertised and are refused at CALL time instead (see
++  :func:`fork_child_block_message`);
++- the parent's transcript prefix: the parent's messages exactly as staged for
++  the most recent API request (``agent._fork_prefix_snapshot``, stashed by the
++  tool round after the assistant tool-call message is appended), plus that
++  assistant message verbatim, plus one tool-result message per tool_call id —
++  the spawning call's result carries the fork instruction, every other call
++  gets ``"(running in the parent)"``.
++
++This module is stdlib-only so ``agent/tool_executor.py`` can call the
++call-time guard without an import cycle.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++import logging
++from typing import Any, Dict, List, Optional, Tuple
++
++logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
++
++# Stashed by the tool round (agent/turn_tool_round.py) right after the assistant
++# tool-call message is appended: prefix + assistant message, pre-tool-results.
++_FORK_PREFIX_ATTR = "_fork_prefix_snapshot"
++
++# Placeholder content for tool calls that are still running in the parent when
++# the fork child is built. Keeps every tool_call id paired with exactly one
++# result so the orphan sweep never fires on the child's first request.
++_FORK_SIBLING_PLACEHOLDER = "(running in the parent)"
++
++# Synthesized assistant tool-call id for direct callers (no staged snapshot):
++# identical for every child of one call so siblings share one prefix.
++_FORK_SYNTH_CALL_ID = "fork-delegate-call"
++
++# Tools that stay ADVERTISED on a fork child (tools[] parity) but refuse at
++# call time. ``delegate_task`` is not listed: it stays callable and is gated by
++# the normal depth budget instead (depth == max refuses inside delegate_task).
++_FORK_BLOCKED_TOOL_REASONS = {
++    "clarify": "no user interaction from a forked child",
++    "memory": "no writes to shared MEMORY.md from a forked child",
++    "send_message": "no cross-platform side effects from a forked child",
++    "cronjob_manage": "no scheduling more work in the parent's name from a forked child",
++}
++
++_SCHEMA_JSON_CAP = 4000
++
++
++def resolve_task_fork(task: Any, default: bool = False) -> bool:
++    """Per-task fork flag: explicit ``task["fork"]`` wins, else ``default``.
++    ``None``/missing means "no opinion" and falls back to the default."""
++    if not isinstance(task, dict) or task.get("fork") is None:
++        return bool(default)
++    try:
++        from utils import is_truthy_value
++        return bool(is_truthy_value(task.get("fork"), default=default))
++    except Exception:
++        return bool(default)
++
++
++def tasks_request_fork(tasks: Any, goal: Any, cfg: Optional[Dict[str, Any]]) -> bool:
++    """Lightweight peek used by the depth-limit gate: True when this call would
++    spawn at least one fork child. Handles the JSON-string ``tasks`` shape the
++    same way ``_normalize_task_list`` does."""
++    default = False
++    try:
++        from utils import is_truthy_value
++        default = bool(is_truthy_value((cfg or {}).get("fork_default", False), default=False))
++    except Exception:
++        pass
++    effective = tasks
++    if isinstance(tasks, str):
++        try:
++            from tools.delegate_tool_tasks import _recover_tasks_from_json_string
++            recovered, _ = _recover_tasks_from_json_string(tasks)
++            if recovered is not None:
++                effective = recovered
++        except Exception:
++            pass
++    if isinstance(effective, list) and effective:
++        return any(resolve_task_fork(t, default) for t in effective)
++    if isinstance(goal, str) and goal.strip():
++        return default
++    return False
++
++
++def fork_depth_error(depth: int, max_spawn: int) -> str:
++    """Tool error for a fork spawn refused by the depth budget."""
++    return json.dumps(
++        {"error": f"delegation depth limit reached ({depth}/{max_spawn}): do this work yourself"},
++        ensure_ascii=False,
++    )
++
++
++def build_fork_instruction(
++    *, goal: str, context: Optional[str], child_depth: int, max_spawn_depth: int,
++    output_schema: Optional[Dict[str, Any]] = None,
++) -> str:
++    """The fork instruction: this task's tool-result content in the child's
++    inherited prefix. Ends the prefix; the child extends it with its own turns."""
++    text = (
++        f"[forked child, depth {child_depth}/{max_spawn_depth}] "
++        f"You are a copy of the agent above, now working ONLY on this task: {goal}"
++    )
++    if context and str(context).strip():
++        text += f"\n{context}"
++    text += " Do it yourself; delegate only clearly separable sub-work."
++    tail = " Your final message is your report to the parent"
++    if isinstance(output_schema, dict):
++        try:
++            schema_json = json.dumps(output_schema, ensure_ascii=False)
++        except (TypeError, ValueError):
++            schema_json = str(output_schema)
++        if len(schema_json) > _SCHEMA_JSON_CAP:
++            schema_json = schema_json[:_SCHEMA_JSON_CAP] + " ...[truncated]"
++        tail += f", matching this JSON schema: {schema_json}"
++    return text + tail + "."
++
++
++def _snapshot_prefix(parent_agent: Any) -> List[Dict[str, Any]]:
++    """Deep copy of the parent's staged prefix (prefix + assistant tool-call
++    message), or of ``_session_messages`` when no snapshot was stashed (direct
++    callers, tests). Never a live reference: the child loop mutates history."""
++    snap = getattr(parent_agent, _FORK_PREFIX_ATTR, None)
++    if isinstance(snap, list) and snap and all(isinstance(m, dict) for m in snap):
++        return copy.deepcopy(snap)
++    hist = getattr(parent_agent, "_session_messages", None)
++    if isinstance(hist, list) and hist and all(isinstance(m, dict) for m in hist):
++        return copy.deepcopy(hist)
++    return []
++
++
++def _assistant_tool_calls(prefix: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
++    """``(assistant_msg, tool_calls)`` from the prefix tail, or ``(None, [])``
++    when the prefix does not end on an assistant tool-call message."""
++    if not prefix:
++        return None, []
++    assistant_msg = prefix[-1]
++    if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
++        return None, []
++    tool_calls = assistant_msg.get("tool_calls") or []
++    if not isinstance(tool_calls, list) or not tool_calls:
++        return None, []
++    return assistant_msg, [tc for tc in tool_calls if isinstance(tc, dict)]
++
++
++def _synthesized_assistant(goal: str) -> Dict[str, Any]:
++    """Minimal assistant tool-call message for direct callers without a staged
++    snapshot: one ``delegate_task`` call carrying this task's goal."""
++    try:
++        args = json.dumps({"tasks": [{"goal": goal}]}, ensure_ascii=False)
++    except (TypeError, ValueError):
++        args = "{}"
++    return {
++        "role": "assistant",
++        "content": "",
++        "tool_calls": [{
++            "id": _FORK_SYNTH_CALL_ID, "type": "function",
++            "function": {"name": "delegate_task", "arguments": args},
++        }],
++    }
++
++
++def _tool_call_id(tc: Dict[str, Any]) -> Optional[str]:
++    for key in ("id", "call_id", "tool_call_id"):
++        value = tc.get(key)
++        if isinstance(value, str) and value.strip():
++            return value.strip()
++    return None
++
++
++def _tool_call_name(tc: Dict[str, Any]) -> str:
++    fn = tc.get("function")
++    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
++        return fn["name"]
++    name = tc.get("name")
++    return name if isinstance(name, str) else ""
++
++
++def _spawning_call_id(
++    tool_calls: List[Dict[str, Any]], task_goal: str, explicit_id: Optional[str] = None,
++) -> Optional[str]:
++    """Which tool_call id spawned this fork child. An explicit id (wired
++    through when available) wins; otherwise the ``delegate_task`` call whose
++    arguments carry this task's goal; else the single ``delegate_task`` call;
++    else the first tool call. ``None`` only when ``tool_calls`` is empty."""
++    if explicit_id is not None:
++        return explicit_id
++    ids = [(_tool_call_id(tc), _tool_call_name(tc), tc) for tc in tool_calls]
++    delegate_ids = [cid for cid, name, _ in ids if cid and name == "delegate_task"]
++    if len(delegate_ids) == 1:
++        return delegate_ids[0]
++    for cid, name, tc in ids:
++        if not cid or name != "delegate_task":
++            continue
++        try:
++            args = (tc.get("function") or {}).get("arguments")
++            parsed = json.loads(args) if isinstance(args, str) else args
++        except (TypeError, ValueError):
++            continue
++        if not isinstance(parsed, dict):
++            continue
++        goals = [t.get("goal") for t in parsed.get("tasks", []) if isinstance(t, dict)]
++        if task_goal in goals or parsed.get("goal") == task_goal:
++            return cid
++    if delegate_ids:
++        return delegate_ids[0]
++    return ids[0][0] if ids else None
++
++
++def build_fork_conversation_history(
++    parent_agent: Any, *, task_goal: str, instruction: str,
++    spawn_tool_call_id: Optional[str] = None,
++) -> List[Dict[str, Any]]:
++    """Full initial history for one fork child: parent prefix + verbatim
++    assistant tool-call message + one tool result per tool_call id (this
++    task's result carries ``instruction``)."""
++    prefix = _snapshot_prefix(parent_agent)
++    assistant_msg, tool_calls = _assistant_tool_calls(prefix)
++    if assistant_msg is None:
++        assistant_msg = _synthesized_assistant(task_goal)
++        prefix = prefix + [assistant_msg]
++        tool_calls = assistant_msg["tool_calls"]
++    spawn_id = _spawning_call_id(tool_calls, task_goal, spawn_tool_call_id)
++    history = list(prefix)
++    for tc in tool_calls:
++        cid = _tool_call_id(tc)
++        if not cid:
++            continue
++        content = instruction if cid == spawn_id else _FORK_SIBLING_PLACEHOLDER
++        history.append({
++            "role": "tool", "name": _tool_call_name(tc) or "delegate_task",
++            "tool_name": _tool_call_name(tc) or "delegate_task",
++            "content": content, "tool_call_id": cid,
++        })
++    return history
++
++
++def fork_parent_toolsets(parent_agent: Any) -> Tuple[Any, Any]:
++    """``(enabled_toolsets, disabled_toolsets)`` for a fork child: the parent's
++    own pair, verbatim — restriction moves to call time so ``tools[]`` stays
++    byte-identical."""
++    return getattr(parent_agent, "enabled_toolsets", None), getattr(parent_agent, "disabled_toolsets", None)
++
++
++def apply_fork_parity(child: Any, parent_agent: Any) -> None:
++    """Post-construction parity for a fork child (mirrors
++    ``agent.background_review.build_cache_parity_fork``): inherit the parent's
++    cached system prompt verbatim (no re-render), pin ``session_start`` so any
++    re-render stays byte-identical, advertise the parent's exact ``tools[]``
++    (frozen snapshot generation so refreshes cannot rebuild it), skip the
++    between-turns MCP refresh for the same reason, and defer preflight
++    compaction until after the first provider response so request #1 is a warm
++    cache read. Marks the child ``_is_fork_child`` for the call-time guard."""
++    from agent.background_review import _inherit_parent_tool_surface
++
++    system = getattr(parent_agent, "_cached_system_prompt", None)
++    if isinstance(system, str) and system:
++        child._cached_system_prompt = system
++    else:
++        logger.warning(
++            "fork child: parent has no cached system prompt; the child prompt "
++            "was built fresh and the first request will miss the prefix cache",
++        )
++    try:
++        import datetime as _dt
++        parent_start = getattr(parent_agent, "session_start", None)
++        if isinstance(parent_start, _dt.datetime):
++            child.session_start = parent_start
++    except Exception:
++        pass
++    parent_tools = getattr(parent_agent, "tools", None)
++    if (isinstance(parent_tools, list) and parent_tools
++            and all(isinstance(t, dict) for t in parent_tools)):
++        _inherit_parent_tool_surface(child, parent_agent)
++    else:
++        logger.warning(
++            "fork child: parent tools[] is not a concrete list; keeping the "
++            "constructed toolsets and the first request may miss the cache",
++        )
++    child._skip_mcp_refresh = True
++    # Same deferral the background-review fork uses: preflight compaction must
++    # not rewrite the inherited prefix before the first response (spec §6).
++    # Consumed generically by agent/turn_context._review_fork_first_request_pending.
++    child._review_defer_compaction_before_first_response = True
++    child._is_fork_child = True
++
++
++def fork_child_block_message(agent: Any, tool_name: str) -> Optional[str]:
++    """Call-time restriction for fork children: ``None`` to proceed, else the
++    tool-error text. ``delegate_task`` always passes through here — its own
++    depth budget decides (depth == max refuses inside ``delegate_task``)."""
++    if not getattr(agent, "_is_fork_child", False):
++        return None
++    reason = _FORK_BLOCKED_TOOL_REASONS.get(tool_name)
++    if reason is None:
++        return None
++    return json.dumps(
++        {"error": f"not available to a forked child: {reason} ({tool_name})"},
++        ensure_ascii=False,
++    )
+-- 
+2.54.0.windows.1
+

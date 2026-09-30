@@ -1,0 +1,934 @@
+From 9308291e4be7f90ef69a893f93b99ef5da2b9995 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 06:19:37 +0900
+Subject: [PATCH 06/16] feat(cache): restore longest validated saved prefix
+
+Implemented: Muse / reviewed: Sol. E2 includes MTP boundary repair and candidate-selection CPU regression.
+---
+ CMakeLists.txt                         |   4 +
+ include/strata/program/saved_state.hpp |  11 +
+ src/program/generate.cpp               | 558 ++++++++++++++++++++++++-
+ src/program/saved_state.cpp            |  29 ++
+ src/program/saved_state_test.cpp       | 151 +++++++
+ 5 files changed, 748 insertions(+), 5 deletions(-)
+ create mode 100644 src/program/saved_state_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2b22e42..e80fce1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -475,6 +475,10 @@ if(STRATA_BUILD_TESTS)
+   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
+   target_include_directories(conv_cache_test PRIVATE include)
+   add_test(NAME conv_cache_test COMMAND conv_cache_test)
++  # E2 (DESIGN-HERMES-CACHE.md): SavedState eligibility walk + exact-length lookup (CPU-only)
++  add_executable(saved_state_test src/program/saved_state_test.cpp)
++  target_link_libraries(saved_state_test PRIVATE strata_spec)
++  add_test(NAME saved_state_test COMMAND saved_state_test)
+ endif()
+ 
+ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 72f220b..3fc0614 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -352,6 +352,17 @@ class SavedStateStore {
+     /// note_use() on the returned item so the LRU clock counts mounts, not just inserts.
+     const SavedItem* find_best(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                                bool cvec) const;
++    /// E2 eligibility filter (Sol review): longest match excluding every previously rejected candidate, so
++    /// the call site can walk longest-first with an accumulating skip set. Skipping one pointer loops forever
++    /// with two invalid candidates (A skipped -> B invalid -> A returned again); the vector cannot. No store
++    /// mutation between calls: pointers stay valid. CPU-testable (see saved_state_test.cpp).
++    const SavedItem* find_best_except(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
++                                      bool cvec, const std::vector<const SavedItem*>& skip) const;
++    /// E2b exact-length prefix lookup: the item with ids.size()==k whose ids/cvec/images match, even when a
++    /// longer tip also matches (find_best would hide it). Null when none. No-upload MTP boundary repair needs
++    /// exactly this length. CPU-testable.
++    const SavedItem* find_exact(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
++                                int64_t k) const;
+     /// E2 mounts through the item find_best() returned: advances its last_use to now. False for null or foreign
+     /// pointers (never fabricates freshness).
+     bool note_use(const SavedItem* it);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 5253f75..277824b 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -38,6 +38,7 @@
+ #include "strata/kernels/native_rope.hpp"
+ #include "strata/kernels/mrope.hpp"
+ #include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_stream.hpp"
+ #include "strata/kernels/qsa.hpp"
+ #include "strata/core/native_head.hpp"
+ #include "strata/core/verify.hpp"
+@@ -871,6 +872,306 @@ bool saved_snapshot_stage(const strata::core::SessionState& ss, const strata::co
+     return true;
+ }
+ 
++// ---- E2: SavedState restore (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum).
++// Implemented: Muse / review: Sol. Longest exact-prefix live-chain/tip/root match (chain wins ties);
++// roots/tips are independent of chain pruning and --prompt-cache. ALL validation (geometry, payload sizes,
++// MTP reachable valid_from) runs BEFORE any GPU state is touched; any failure at any stage takes the cold
++// path (session_zero on ALL stages, chain cleared, resume 0) - never a stale chain after overwritten KV,
++// never silently consuming corrupted state.
++//
++// E2 REVIEW MAP (for Sol) - where each repair lives:
++//   KV repair:    saved_restore_kv() per layer: host copy for kv-resident streamed/ring layouts, device pools
++//                 + identity page table when fully resident. Streamed slots are invalidated via kv_stream_reset
++//                 so the next resolve reloads from the restored host (never a stale slot under a remapped block).
++//   MTP repair:   saved_restore_mtp() restores the L-1 real pairs, the shared mtp.kv_restore(k) refills the ring,
++//                 and the boundary block pairs saved R_(k-1) with request.ids[k] BEFORE the suffix prefill (the
++//                 suffix still starts at k; k==n is rejected - the decoder would double-feed the last token).
++//                 Chain/live mounts get the same k-1 repair from the retained live row or a same-length saved
++//                 boundary (no upload; chain preference kept).
++//   Recurrent:    saved_restore_stage() reuses checkpoint_restore for GDN/PLE/tails (+ple_prev from ids) and
++//                 restores the indexer pooled keys/cursor/dead-key per layer. Every byte size, pointer and
++//                 capacity is validated BEFORE any mutation (validate_for_restore).
++//   Split fallback: per-stage uploads run under that stage's OnDevice guard with its stream; ANY exception or
++//                 upload/boundary failure after a mount was attempted cold-resets ALL stages (checked) and the
++//                 MTP via prefill-from-0 - never a stale chain over overwritten KV. A failed reset fails the
++//                 request outright (no coherent fallback exists). Fork parent tips survive: the store is never
++//                 pruned by traffic, and a successful mount calls note_use.
++/// Device staging buffer that frees on every exit path, including exceptions (blocker 4). Declared
++/// AFTER the OnDevice guard at each use site so cudaFree runs on the right device on a split.
++struct CudaFreeDel {
++    void operator()(void* p) const noexcept { if (p != nullptr) cudaFree(p); }
++};
++
++/// Blocker 5 review: every pool a KV upload dereferences - device pools always, the authoritative host
++/// pools on kv-resident layouts. Used for main stages and the MTP drafter alike.
++bool saved_kv_ptrs_ok(const strata::core::QsaState& st, std::string& why) {
++    if (st.kv_q4) {
++        if (st.k_q4 == nullptr || st.v_q4 == nullptr) { why = "KV pointers missing"; return false; }
++        if (st.kv_mode != 0 && (st.host.k_q4 == nullptr || st.host.v_q4 == nullptr)) {
++            why = "KV host pointers missing";
++            return false;
++        }
++    } else if (st.kv_int8) {
++        if (st.k_q == nullptr || st.v_q == nullptr || st.k_scale == nullptr || st.v_scale == nullptr) {
++            why = "KV pointers missing";
++            return false;
++        }
++        if (st.kv_mode != 0 && (st.host.k_q == nullptr || st.host.v_q == nullptr ||
++                                st.host.k_scale == nullptr || st.host.v_scale == nullptr)) {
++            why = "KV host pointers missing";
++            return false;
++        }
++    } else {
++        if (st.k_pool == nullptr || st.v_pool == nullptr) { why = "KV pointers missing"; return false; }
++        if (st.kv_mode != 0 && (st.host.k_pool == nullptr || st.host.v_pool == nullptr)) {
++            why = "KV host pointers missing";
++            return false;
++        }
++    }
++    return true;
++}
++inline saved::SnapshotGeom saved_live_geom(const strata::core::ModelGeometry& g) {
++    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++    saved::SnapshotGeom gm;
++    gm.n_qsa_layers = g.n_qsa_layers();
++    gm.n_head_kv = g.n_head_kv;
++    gm.head_dim = g.head_dim;
++    gm.idx_dim = g.idx_key_dim;
++    gm.idx_block = qs.idx_block;
++    gm.page_size = qs.page_size;
++    return gm;
++}
++
++/// One layer's QSA KV cells [0, cells) from a snapshot payload. Mode 0 (fully resident): H2D into the device
++/// pools + identity page table. Mode 1 (streamed): memcpy into the authoritative host copy + kv_stream_reset
++/// so resolve refills slots from the restored host. Mode 2 (ring): memcpy into the host copy; the caller
++/// refills the ring (mtp.kv_restore). `st` is const: every destination is a mutable pool through it.
++bool saved_restore_kv(const strata::core::QsaState& st, const strata::core::ModelGeometry& g,
++                       const saved::KvLayerPayload& pay, int64_t cells, void* stream, std::string& e) {
++    if (pay.cells != cells || cells < 1) { e = "KV cell count mismatch"; return false; }
++    if (pay.fmt != saved_kv_format(st)) { e = "KV format changed"; return false; }
++    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++    const int64_t nH = g.n_head_kv, hd = g.head_dim, ps = qs.page_size;
++    if (nH < 1 || hd < 1 || ps < 1) { e = "bad KV geometry"; return false; }
++    const int64_t pages = (cells + ps - 1) / ps;
++    if (pages > st.n_pages) { e = "KV pages exceed capacity"; return false; }
++    if (!saved::kv_blob_ok(pay, cells, saved_live_geom(g))) { e = "KV blob size mismatch"; return false; }
++    const size_t page_row = (size_t) nH * (size_t) ps;   // rows per page; times the per-row bytes below
++    auto copy_dev = [&](const std::vector<uint8_t>& src, void* dev, size_t row) -> bool {
++        if (src.size() != (size_t) pages * page_row * row || dev == nullptr) return false;
++        return cudaMemcpy(dev, src.data(), src.size(), cudaMemcpyHostToDevice) == cudaSuccess;
++    };
++    auto copy_host = [&](const std::vector<uint8_t>& src, const void* host, size_t row) -> bool {
++        if (src.size() != (size_t) pages * page_row * row || host == nullptr) return false;
++        std::memcpy(const_cast<void*>(host), src.data(), src.size());
++        return true;
++    };
++    if (st.kv_mode == 0) {
++        bool ok = false;
++        if (st.kv_q4) {
++            const size_t row = (size_t) strata::kernels::kv_q4_bytes_per_head((int) hd);
++            ok = copy_dev(pay.k, st.k_q4, row) && copy_dev(pay.v, st.v_q4, row);
++        } else if (st.kv_int8) {
++            const size_t sc = (size_t) (hd / strata::kernels::KV_Q8_GROUP) * 2;
++            ok = copy_dev(pay.k, st.k_q, (size_t) hd) && copy_dev(pay.v, st.v_q, (size_t) hd) &&
++                 copy_dev(pay.ks, st.k_scale, sc) && copy_dev(pay.vs, st.v_scale, sc);
++        } else {
++            ok = copy_dev(pay.k, st.k_pool, (size_t) hd * 2) && copy_dev(pay.v, st.v_pool, (size_t) hd * 2);
++        }
++        if (!ok) { e = "fully-resident KV upload failed"; return false; }
++        // fully resident identity restore: the table is static in mode 0, rewrite it anyway (cheap, exact).
++        std::vector<int32_t> tab((size_t) st.n_pages);
++        for (int64_t i = 0; i < st.n_pages; ++i) tab[(size_t) i] = (int32_t) i;
++        if (cudaMemcpy(st.page_table, tab.data(), tab.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
++            cudaSuccess) {
++            e = "page table restore failed";
++            return false;
++        }
++        return true;
++    }
++    if (!st.host.present()) { e = "no authoritative host copy"; return false; }
++    bool ok = false;
++    if (st.kv_q4) {
++        const size_t row = (size_t) strata::kernels::kv_q4_bytes_per_head((int) hd);
++        ok = copy_host(pay.k, st.host.k_q4, row) && copy_host(pay.v, st.host.v_q4, row);
++    } else if (st.kv_int8) {
++        const size_t sc = (size_t) (hd / strata::kernels::KV_Q8_GROUP) * 2;
++        ok = copy_host(pay.k, st.host.k_q, (size_t) hd) && copy_host(pay.v, st.host.v_q, (size_t) hd) &&
++             copy_host(pay.ks, st.host.k_scale, sc) && copy_host(pay.vs, st.host.v_scale, sc);
++    } else {
++        ok = copy_host(pay.k, st.host.k_pool, (size_t) hd * 2) &&
++             copy_host(pay.v, st.host.v_pool, (size_t) hd * 2);
++    }
++    if (!ok) { e = "host KV upload failed"; return false; }
++    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);   // slots refill from restored host
++    return true;   // mode 2 (ring): the caller refills via kv_ring_restore / mtp.kv_restore
++}
++
++/// One layer's indexer state: pooled block keys, block cursor, constant dead key. Device-only, always H2D.
++bool saved_restore_indexer(const strata::core::QsaState& st, const strata::core::ModelGeometry& g,
++                            const saved::IndexerPayload& pay, std::string& e) {
++    const int64_t dim = g.idx_key_dim;
++    if (dim < 1) { e = "bad indexer geometry"; return false; }
++    if (pay.pooled_rows > st.idx_pooled_rows) { e = "indexer rows exceed capacity"; return false; }
++    if ((int64_t) pay.pooled.size() != pay.pooled_rows * dim * 4) { e = "indexer pooled size"; return false; }
++    if ((int64_t) pay.dead_key.size() != dim * 4) { e = "indexer dead-key size"; return false; }
++    if (pay.block_pos.size() != 1) { e = "indexer cursor size"; return false; }
++    if (cudaMemcpy(st.idx_pooled, pay.pooled.data(), pay.pooled.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
++        cudaMemcpy(st.idx_block_pos, pay.block_pos.data(), sizeof(int32_t), cudaMemcpyHostToDevice) !=
++            cudaSuccess ||
++        cudaMemcpy(st.idx_dead, pay.dead_key.data(), pay.dead_key.size(), cudaMemcpyHostToDevice) !=
++            cudaSuccess) {
++        e = "indexer upload failed";
++        return false;
++    }
++    return true;
++}
++
++/// One session's full state at L tokens: recurrent (via the checkpoint contract) + indexer + KV per layer.
++/// The caller holds the stage's OnDevice guard; the caller syncs the device after (orders kv_stream_reset).
++bool saved_restore_stage(strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
++                          const saved::StagePayload& sp, const std::vector<int32_t>& ids, int64_t L, void* stream,
++                          std::string& e) {
++    if ((int64_t) sp.kv.size() != g.n_qsa_layers() || (int64_t) sp.idx.size() != g.n_qsa_layers()) {
++        e = "stage layer count changed";
++        return false;
++    }
++    ConvCheckpoint tmp;   // the checkpoint contract for GDN/PLE/tails (+ple_prev from ids, as at capture)
++    tmp.ids = ids;
++    tmp.gdn = sp.rec.gdn;
++    tmp.ple = sp.rec.ple;
++    tmp.tails = sp.rec.tails;
++    if (!checkpoint_restore(tmp, ss, g)) { e = "recurrent restore failed"; return false; }
++    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
++        if (!saved_restore_indexer(ss.qsa_states[i], g, sp.idx[(size_t) i], e)) return false;
++        if (!saved_restore_kv(ss.qsa_states[i], g, sp.kv[(size_t) i], L, stream, e)) return false;
++    }
++    return true;
++}
++
++/// The drafter's L-1 real pairs into its K/V (either resident mode). Ring refill is the caller's
++/// (shared mtp.kv_restore); the boundary cell is the boundary block's, after the refill.
++bool saved_restore_mtp(strata::core::MtpDrafter& mtp, const strata::core::ModelGeometry& g,
++                        const saved::MtpPayload& m, std::string& e) {
++    if (m.kv.empty()) return true;
++    if (m.kv.size() != 1) { e = "MTP layer count"; return false; }
++    const strata::core::OnDevice on_mtp(mtp.device());   // the drafter's own device (a split's last stage)
++    if (cudaDeviceSynchronize() != cudaSuccess) { e = "MTP device not idle"; return false; }
++    return saved_restore_kv(mtp.kv_state(), g, m.kv[0], m.cells, nullptr, e);
++}
++
++/// CPU-ONLY validation for one restore candidate: geometry, every payload size, every live pointer and
++/// capacity the upload dereferences, and the MTP reachable valid_from. True = the upload may start; nothing
++/// below touches the GPU. In particular checkpoint_restore memcpys its inputs blindly, so the recurrent sizes
++/// (GDN, tails, PLE exactly as the live session holds them, ple_prev equal to the ids' last two) are gated
++/// here - a truncated payload must fail here, never mid-upload. `mtp`'s prompt length must already be the new
++/// request's (the call site sets it before the chain scan), so prefill_valid_from() is the new window's.
++bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<int32_t>& ids32,
++                                 const std::vector<saved::ImgKey>& req_simgs, bool cvec, int64_t n,
++                                 const strata::core::ModelGeometry& g, const strata::core::SessionState& ss,
++                                 const std::vector<std::unique_ptr<GpuStage>>& stages,
++                                 strata::core::MtpDrafter& mtp, std::string& why) {
++    const int64_t L = (int64_t) it.ids.size();
++    if (!it.complete()) { why = "incomplete payload"; return false; }
++    if (it.n_stages != (int) stages.size() + 1 || (int) it.stages.size() != it.n_stages) {
++        why = "stage count changed";
++        return false;
++    }
++    if (L < 1 || L > n) { why = "not a prefix of this request"; return false; }
++    if (!saved::is_prefix(it.ids, ids32)) { why = "ids not a prefix"; return false; }
++    if (it.cvec != cvec) { why = "control-vector identity changed"; return false; }
++    if (saved::imgs_below(req_simgs, L) != it.imgs) { why = "image identity changed"; return false; }
++    const saved::SnapshotGeom livegeom = saved_live_geom(g);
++    if (it.geom != livegeom) { why = "geometry changed"; return false; }
++    if (!it.boundary.complete() || it.boundary.hc != g.hc || it.boundary.n_embd != g.n_embd) {
++        why = "boundary row incomplete";
++        return false;
++    }
++    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++    const int64_t pages = (L + qs.page_size - 1) / qs.page_size;
++    const int64_t prow = L / qs.idx_block + 1;
++    const ConvStateSizes z = conv_state_sizes(g);
++    const size_t tails_exp = z.tail * (size_t) g.n_qsa_layers();
++    for (size_t s = 0; s < it.stages.size(); ++s) {
++        const strata::core::SessionState& ls = (s == 0) ? ss : stages[s - 1]->ss;
++        if (ls.qsa_states == nullptr) { why = "no live QSA states"; return false; }
++        if (L > ls.max_cells) { why = "exceeds max_cells"; return false; }
++        const saved::StagePayload& sp = it.stages[s];
++        if ((int64_t) sp.kv.size() != g.n_qsa_layers() || (int64_t) sp.idx.size() != g.n_qsa_layers()) {
++            why = "stage layer count changed";
++            return false;
++        }
++        // blocker 3: the exact recurrent sizes checkpoint_restore assumes (ple matches the live session's
++        // own presence bit, ple_prev the ids' last two) - gated before any copy starts.
++        if (sp.rec.gdn.size() != z.gdn) { why = "GDN state size"; return false; }
++        if (sp.rec.tails.size() != tails_exp) { why = "QSA tails size"; return false; }
++        if (ls.ple_hist != nullptr) {
++            if (sp.rec.ple.size() != z.ple) { why = "PLE history size"; return false; }
++        } else if (!sp.rec.ple.empty()) {
++            why = "PLE payload but no live PLE state";
++            return false;
++        }
++        if (sp.rec.ple_prev[0] != (L >= 2 ? it.ids[(size_t) (L - 2)] : -1) ||
++            sp.rec.ple_prev[1] != it.ids[(size_t) (L - 1)]) {
++            why = "ple_prev window";
++            return false;
++        }
++        for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
++            const strata::core::QsaState& q = ls.qsa_states[i];
++            // blocker 3: every pointer the upload dereferences, on every layer of every stage.
++            if (q.page_table == nullptr || q.idx_pooled == nullptr || q.idx_tail == nullptr ||
++                q.idx_dead == nullptr || q.idx_block_pos == nullptr) {
++                why = "indexer pointers missing";
++                return false;
++            }
++            if (q.n_pages < pages) { why = "KV pages exceed capacity"; return false; }
++            if (q.idx_pooled_rows < prow) { why = "indexer rows exceed capacity"; return false; }
++            if (!saved_kv_ptrs_ok(q, why)) return false;
++            if (saved_kv_format(q) != sp.kv[(size_t) i].fmt) { why = "KV format changed"; return false; }
++            if (!saved::kv_blob_ok(sp.kv[(size_t) i], L, livegeom)) { why = "KV blob size"; return false; }
++            const saved::IndexerPayload& ix = sp.idx[(size_t) i];
++            if (ix.pooled_rows != prow) { why = "indexer pooled rows"; return false; }
++            if ((int64_t) ix.pooled.size() != prow * livegeom.idx_dim * 4) {
++                why = "indexer pooled size";
++                return false;
++            }
++            if ((int64_t) ix.dead_key.size() != livegeom.idx_dim * 4) {
++                why = "indexer dead-key size";
++                return false;
++            }
++            if (ix.block_pos.size() != 1) { why = "indexer cursor size"; return false; }
++            // the cursor is write-only device scratch (a readable record of the last rotation position):
++            // positions always sit below max_cells (image-shifted too), so that bound catches corruption
++            // without false-rejecting real records.
++            if (ix.block_pos[0] < 0 || (int64_t) ix.block_pos[0] >= ls.max_cells) {
++                why = "indexer cursor out of bounds";
++                return false;
++            }
++        }
++    }
++    const strata::core::QsaState& mst = mtp.kv_state();
++    if (mst.max_cells <= 0) {
++        if (!it.mtp.kv.empty()) { why = "drafter off but snapshot has MTP rows"; return false; }
++    } else if (L > 1) {
++        if (it.mtp.kv.size() != 1 || it.mtp.cells != L - 1) { why = "MTP pair count"; return false; }
++        if (it.mtp.kv[0].fmt != saved_kv_format(mst)) { why = "MTP format changed"; return false; }
++        const int64_t mp = (it.mtp.cells + qs.page_size - 1) / qs.page_size;
++        if (mp > mst.n_pages || it.mtp.cells > mst.max_cells) { why = "MTP capacity"; return false; }
++        if (mst.page_table == nullptr) { why = "MTP page table missing"; return false; }
++        if (!saved_kv_ptrs_ok(mst, why)) return false;
++        if (!saved::kv_blob_ok(it.mtp.kv[0], it.mtp.cells, livegeom)) { why = "MTP blob size"; return false; }
++        // blocker 1 (Sol review): the new request's drafter window reaching BELOW the snapshot's first real
++        // pair resumes under unwritten zeros (garbage) - reject. Reaching ABOVE it is safe: the request
++        // simply needs a subset of the saved real pairs. prefill_valid_from() is the conservative
++        // (window+margin) lower bound of what the new request reaches.
++        if (mtp.prefill_valid_from() < it.mtp.valid_from) {
++            why = "MTP window reaches below valid_from";
++            return false;
++        }
++    }
++    return true;
++}
++
+ // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
+ // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
+ // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
+@@ -3220,6 +3521,18 @@ int main(int argc, char** argv) {
+         int64_t e1_root_at = -1;
+         std::vector<float> e1_root_row;
+         int64_t e1_root_row_L = -1;
++        // E2b (blocker 5): the retained live boundary row R_(live_bdry_L-1). The post-DONE flush feeds the
++        // last emitted token through the main model only, so a chain/live mount at k == live size would
++        // otherwise leave MTP cell k-1 unpaired (the live residual scratch is long overwritten). Valid iff
++        // live_bdry_L >= 0; invalidated with live everywhere below. Lets chain/live mounts repair k-1
++        // without any upload. live_bdry_hash is the FNV-1a of the live ids at retention: the row belongs to
++        // one transcript, and a same-length different transcript must never pair from it. live_bdry_vf is the
++        // drafter's valid_from at retention: a shorter new request whose window reaches below it must not
++        // reuse the row (reject/cold) - same rule as saved items.
++        std::vector<float> live_bdry;
++        int64_t live_bdry_L = -1;
++        uint64_t live_bdry_hash = 0;
++        int64_t live_bdry_vf = 0;
+         // E1: a complete snapshot at exactly L tokens: ids + image/cvec identity (passed in: the keyed
+         // state lives below this point), every stage's recurrent + indexer + KV state, and the MTP draft rows.
+         // The session must be idle at the boundary (the caller synchronized); stage sessions sync under their
+@@ -3316,11 +3629,29 @@ int main(int argc, char** argv) {
+                 stamps.reserve(checks.size());
+                 for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
+                 const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
+-                                                                                   o.prompt_cache);
++                                                                                    o.prompt_cache);
+                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+             }
+             return true;
+         };
++        // E2 (blocker 4): the full reset after ANY attempted mount failed (upload, boundary repair, or an
++        // exception mid-mount). session_zero is async-enqueued; the stream syncs surface its errors, so a
++        // false return means NO coherent fallback exists - the caller must fail the request, never serve
++        // from the half-reset state. MTP has no zero: its coherence comes from the cold suffix prefill
++        // from 0, which rewrites every reachable cell (writers always write host + slot/ring; skipped
++        // unreachable cells are never read back) - identical to a normal cold start.
++        auto cold_reset_all = [&]() -> bool {
++            strata::core::session_zero(ss, g, nullptr, main_cs);
++            if (cudaStreamSynchronize(main_stream) != cudaSuccess) return false;
++            for (auto& st : stages) {
++                const strata::core::OnDevice on(st->dev);
++                strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
++                if (cudaStreamSynchronize(st->stream) != cudaSuccess) return false;
++            }
++            checks.clear();
++            live_bdry_L = -1;
++            return true;
++        };
+         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+             std::vector<int32_t> nxt((size_t) T);
+             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
+@@ -3784,12 +4115,15 @@ int main(int argc, char** argv) {
+                 if (want != cvec_cached) {
+                     live_ok = false;
+                     checks.clear();
++                    live_bdry_L = -1;   // the live line is abandoned: its retained boundary row with it
+                     cvec_cached = want;
+                 }
+                 strata::kernels::cvec_set_enabled(want);
+             }
+             int64_t resume = 0;
+             bool from_live = false;
++            mtp.set_prompt_len(n);   // E2: the new request's length before resume selection - the restore
++                                     // validation reads prefill_valid_from() (the new drafter window) from it
+             if (o.prompt_cache > 0) {
+                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
+                 for (const ConvCheckpoint& c : checks)
+@@ -3798,6 +4132,104 @@ int main(int argc, char** argv) {
+                         from_live = false;
+                     }
+             }
++            // E2: the SavedState lookup (DESIGN-HERMES-CACHE.md section 1 resume rule). Independent of chain
++            // pruning and --prompt-cache (finding 4: tips work with cache 0). Eligibility filter BEFORE the
++            // longest choice (blocker 2): walk longest-first, skipping k>=n (the decoder starts at p=n-1 with
++            // n-1 consumed inputs - mounting n cells would double-feed the last prompt token) and anything
++            // failing validation, so a shorter valid root/tip wins over cold. The first valid candidate mounts
++            // once; a failed UPLOAD goes cold (the GPU may be partially written - the chain is never retried
++            // over overwritten KV). Ties and shorter candidates stay on the live chain (no upload).
++            bool from_saved = false;
++            const saved::SavedItem* saved_hit = nullptr;
++            std::vector<int32_t> ids32;
++            ids32.reserve((size_t) n);
++            for (int64_t t : ids) ids32.push_back((int32_t) t);
++            std::vector<saved::ImgKey> req_simgs;
++            req_simgs.reserve(req_imgs.size());
++            for (const ImgKey& k : req_imgs) req_simgs.push_back({k.start, k.hash});
++            try {
++                // accumulating skip set (blocker 5 review): each rejected candidate joins, so the walk is
++                // longest-first without revisit and always terminates (cand==nullptr ends it).
++                std::vector<const saved::SavedItem*> cand_skip;
++                for (;;) {
++                    const saved::SavedItem* cand =
++                        saved_states.find_best_except(ids32, req_simgs, cvec_cached, cand_skip);
++                    if (cand == nullptr) break;
++                    const int64_t sk = (int64_t) cand->ids.size();
++                    if (sk <= resume) break;   // chain wins ties and beats shorter saved: nothing more to try
++                    if (sk >= n) {
++                        std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens skipped "
++                                             "(at/past the request end)\n",
++                                     (long long) sk);
++                        cand_skip.push_back(cand);
++                        continue;
++                    }
++                    std::string why;
++                    if (!saved_validate_for_restore(*cand, ids32, req_simgs, cvec_cached, n, g, ss, stages,
++                                                    mtp, why)) {
++                        std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens ineligible "
++                                             "(%s): trying shorter\n",
++                                     (long long) sk, why.c_str());
++                        cand_skip.push_back(cand);
++                        continue;
++                    }
++                    bool ok = cudaDeviceSynchronize() == cudaSuccess;
++                    if (!ok) why = "device not idle";
++                    if (ok && !saved_restore_stage(ss, g, cand->stages[0], cand->ids, sk, main_cs, why))
++                        ok = false;
++                    for (size_t i = 0; ok && i < stages.size(); ++i) {
++                        const strata::core::OnDevice on(stages[i]->dev);
++                        if (!saved_restore_stage(stages[i]->ss, g, cand->stages[i + 1], cand->ids, sk,
++                                                 (void*) stages[i]->stream, why))
++                            ok = false;
++                    }
++                    if (ok && !saved_restore_mtp(mtp, g, cand->mtp, why)) ok = false;
++                    if (ok) {   // order the streamed-slot resets before any later resolve reads them
++                        if (cudaDeviceSynchronize() != cudaSuccess) { why = "restore sync failed"; ok = false; }
++                        for (size_t i = 0; ok && i < stages.size(); ++i) {
++                            const strata::core::OnDevice on(stages[i]->dev);
++                            if (cudaDeviceSynchronize() != cudaSuccess) {
++                                why = "stage sync failed";
++                                ok = false;
++                            }
++                        }
++                    }
++                    if (!ok) {
++                        std::fprintf(stderr, "strata serve: SavedState restore at %lld tokens failed (%s): "
++                                             "cold prefill\n",
++                                     (long long) sk, why.c_str());
++                        if (!cold_reset_all()) {
++                            std::printf("ERR SavedState cold reset failed after a failed mount\n");
++                            return 1;
++                        }
++                        resume = 0;
++                    } else {
++                        resume = sk;
++                        from_saved = true;
++                        saved_hit = cand;
++                        live_bdry_L = -1;   // the session now holds the snapshot's line, not the old live one
++                    }
++                    break;
++                }
++            } catch (const std::exception& ex) {
++                std::fprintf(stderr, "strata serve: SavedState selection threw (%s): cold prefill\n", ex.what());
++                if (!cold_reset_all()) {
++                    std::printf("ERR SavedState cold reset failed after an exception\n");
++                    return 1;
++                }
++                resume = 0;
++                from_saved = false;
++                saved_hit = nullptr;
++            } catch (...) {
++                std::fprintf(stderr, "strata serve: SavedState selection threw: cold prefill\n");
++                if (!cold_reset_all()) {
++                    std::printf("ERR SavedState cold reset failed after an exception\n");
++                    return 1;
++                }
++                resume = 0;
++                from_saved = false;
++                saved_hit = nullptr;
++            }
+             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
+             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+@@ -3814,7 +4246,8 @@ int main(int argc, char** argv) {
+                     cudaStreamSynchronize(st->stream);
+                 }
+                 checks.clear();
+-            } else if (!from_live) {
++                live_bdry_L = -1;
++            } else if (!from_live && !from_saved) {
+                 ConvCheckpoint* c = nullptr;
+                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
+                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
+@@ -3833,6 +4266,7 @@ int main(int argc, char** argv) {
+                         cudaStreamSynchronize(st->stream);
+                     }
+                     reread_to = resume;
++                    live_bdry_L = -1;
+                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
+                                          "restoring\n", (long long) resume);
+                 } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+@@ -3848,10 +4282,110 @@ int main(int argc, char** argv) {
+                 }
+             }
+             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
+-            // host copies and slots are always current (every writer writes both), so they need nothing
++            // host copies and slots are always current (every writer writes both), so they need nothing.
++            // After a saved mount this refills the ring from the RESTORED host rows (saved_restore_mtp put them
++            // there) - so the boundary pairing below runs after it, overwriting cell k-1 with the real pair.
+             if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+             tr("request", n, geni ? 1 : 0);
+-            mtp.set_prompt_len(n);
++            // E2 boundary repair (MtpPayload invariant: cell i pairs R_i with tok_{i+1}): the snapshot holds
++            // pairs [0, k-1) and R_(k-1); pair cell k-1 with the first suffix token BEFORE the suffix prefill.
++            // The suffix still starts at k. k==n never reaches here (rejected in selection: the decoder would
++            // double-feed the last prompt token), so tok_k always exists.
++            if (from_saved && reread_to <= 0 && resume < n) {
++                const saved::BoundaryRow& b = saved_hit->boundary;
++                const int32_t btok = (int32_t) ids[(size_t) resume];
++                const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
++                std::string be;
++                bool bok = b.row.size() == hcn && hcn > 0;
++                try {
++                    const strata::core::OnDevice on_row(mtp.device());
++                    std::unique_ptr<float, CudaFreeDel> bdev;   // after the guard: freed on this device
++                    float* raw = nullptr;
++                    if (bok && cudaMalloc(&raw, hcn * sizeof(float)) == cudaSuccess) {
++                        bdev.reset(raw);
++                        if (cudaMemcpy(bdev.get(), b.row.data(), hcn * sizeof(float),
++                                       cudaMemcpyHostToDevice) == cudaSuccess)
++                            bok = mtp.prefill(bdev.get(), &btok, 1, resume - 1, be);
++                        else
++                            bok = false;
++                    } else {
++                        bok = false;
++                    }
++                } catch (const std::exception& ex) {
++                    bok = false;
++                    be = ex.what();
++                } catch (...) { bok = false; }
++                if (!bok) {
++                    std::fprintf(stderr, "strata serve: SavedState boundary repair at %lld failed (%s): "
++                                         "cold prefill\n",
++                                 (long long) resume, be.empty() ? "staging failed" : be.c_str());
++                    if (!cold_reset_all()) {
++                        std::printf("ERR SavedState cold reset failed after a failed repair\n");
++                        return 1;
++                    }
++                    resume = 0;
++                    from_saved = false;
++                    saved_hit = nullptr;
++                }
++            }
++            // E2b (Sol final review): ALWAYS repair chain/live cell k-1 - no proven-older shortcut. The
++            // mounted k cells do not determine the pair: it needs tok_k, and the new request may share the
++            // first k tokens while changing tok_k (then the old pair is simply wrong). A shorter new request
++            // can also reach window-skipped old pairs the mounted line never proved. So pair (R_(k-1), tok_k)
++            // fresh from the live row (live line only - hash lineage) or a same-length saved boundary (prefix
++            // lineage, no upload; find_exact sees it even under a longer tip), else cold - on the repeated
++            // token correctness baseline no unknown MTP bytes are accepted. Both sources carry a valid_from
++            // and the new window must not reach below it (reject/cold otherwise).
++            if (!from_saved && resume > 0 && reread_to <= 0 && resume < n) {
++                const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
++                const int64_t new_vf = mtp.prefill_valid_from();
++                const float* bdry_src = nullptr;
++                if (from_live && live_bdry_L == resume && live_bdry.size() == hcn && hcn > 0 &&
++                    live_bdry_hash == fnv1a(live.data(), live.size() * sizeof(int32_t)) &&
++                    new_vf >= live_bdry_vf) {
++                    bdry_src = live_bdry.data();
++                } else if (!from_live) {
++                    const saved::SavedItem* exact =
++                        saved_states.find_exact(ids32, req_simgs, cvec_cached, resume);
++                    if (exact != nullptr && exact->boundary.complete() &&
++                        exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
++                        exact->boundary.row.size() == hcn && hcn > 0 &&
++                        new_vf >= exact->mtp.valid_from)
++                        bdry_src = exact->boundary.row.data();
++                }
++                    const int32_t btok = bdry_src == nullptr ? 0 : (int32_t) ids[(size_t) resume];
++                    std::string be;
++                    bool bok = bdry_src != nullptr;
++                    try {
++                        const strata::core::OnDevice on_row(mtp.device());
++                        std::unique_ptr<float, CudaFreeDel> bdev;   // after the guard: freed on this device
++                        float* raw = nullptr;
++                        if (bok && cudaMalloc(&raw, hcn * sizeof(float)) == cudaSuccess) {
++                            bdev.reset(raw);
++                            if (cudaMemcpy(bdev.get(), bdry_src, hcn * sizeof(float),
++                                           cudaMemcpyHostToDevice) == cudaSuccess)
++                                bok = mtp.prefill(bdev.get(), &btok, 1, resume - 1, be);
++                            else
++                                bok = false;
++                        } else {
++                            bok = false;
++                        }
++                    } catch (const std::exception& ex) {
++                        bok = false;
++                        be = ex.what();
++                    } catch (...) { bok = false; }
++                    if (!bok) {
++                        std::fprintf(stderr, "strata serve: MTP boundary at %lld missing/unrepaired (%s): "
++                                             "cold prefill\n",
++                                     (long long) (resume - 1), be.empty() ? "no repair source" : be.c_str());
++                        if (!cold_reset_all()) {
++                            std::printf("ERR MTP boundary cold reset failed\n");
++                            return 1;
++                        }
++                        resume = 0;
++                    }
++            }
++            if (from_saved && saved_hit != nullptr) saved_states.note_use(saved_hit);   // mounts count as use
+             const int64_t read_from = reread_to > 0 ? 0 : resume;
+             pp_total = n;
+             pp_from = read_from;
+@@ -4363,7 +4897,7 @@ int main(int argc, char** argv) {
+             // stage on a split). A tip without it is rejected - E2 cannot repair pair L-1 without R_(L-1).
+             std::vector<float> flush_R;
+             try {
+-                if (stop_req.load()) { live_ok = false; boundary_ok = false; }
++                if (stop_req.load()) { live_ok = false; boundary_ok = false; live_bdry_L = -1; }
+                 if (boundary_ok && mtp_ok && produced_n > 0 && emit_win_e > 0) {
+                     std::vector<int32_t> fnxt((size_t) emit_win_e);
+                     for (int t = 0; t < emit_win_e; ++t)
+@@ -4393,10 +4927,12 @@ int main(int argc, char** argv) {
+                         std::fprintf(stderr, "strata serve: SavedState final-token flush failed: %s\n", fe.c_str());
+                         live_ok = false;
+                         boundary_ok = false;
++                        live_bdry_L = -1;
+                     } else if (!ver.commit(1, fe)) {
+                         std::fprintf(stderr, "strata serve: SavedState final-token commit failed: %s\n", fe.c_str());
+                         live_ok = false;
+                         boundary_ok = false;
++                        live_bdry_L = -1;
+                     } else {
+                         // Sol final-review fix: the commit above advanced main state for emit_last, so live
+                         // advances INDEPENDENTLY of the repair-row copy below - otherwise live_ok would claim
+@@ -4414,6 +4950,16 @@ int main(int argc, char** argv) {
+                             std::fprintf(stderr, "strata serve: SavedState boundary residual copy failed: "
+                                                  "tip suppressed (live still advanced)\n");
+                             flush_R.clear();
++                        } else {
++                            // E2b (blocker 5): retain the live boundary row even when no tip comes of it
++                            // (aux lines, budget off): the next chain/live mount at this L repairs its
++                            // k-1 MTP cell from it without any upload. The hash pins the row to this
++                            // transcript (same length, different tokens must never pair from it). The valid_from
++                            // travels with the row for the reuse check below.
++                            live_bdry = flush_R;
++                            live_bdry_L = (int64_t) live.size();
++                            live_bdry_hash = fnv1a(live.data(), live.size() * sizeof(int32_t));
++                            live_bdry_vf = mtp.prefill_valid_from();
+                         }
+                     }
+                 }
+@@ -4442,10 +4988,12 @@ int main(int argc, char** argv) {
+                              ex.what());
+                 live_ok = false;
+                 boundary_ok = false;
++                live_bdry_L = -1;
+             } catch (...) {
+                 std::fprintf(stderr, "strata serve: SavedState post-DONE work threw: live invalidated\n");
+                 live_ok = false;
+                 boundary_ok = false;
++                live_bdry_L = -1;
+             }
+             const int64_t fresh = n - resume;
+             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index 5478c5b..c4973d7 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -56,8 +56,20 @@ bool SavedStateStore::insert_tip(SavedItem item, bool is_aux) {
+ 
+ const SavedItem* SavedStateStore::find_best(const std::vector<int32_t>& ids,
+                                             const std::vector<ImgKey>& imgs, bool cvec) const {
++    return find_best_except(ids, imgs, cvec, {});
++}
++
++const SavedItem* SavedStateStore::find_best_except(const std::vector<int32_t>& ids,
++                                                   const std::vector<ImgKey>& imgs, bool cvec,
++                                                   const std::vector<const SavedItem*>& skip) const {
+     const SavedItem* best = nullptr;
++    auto skipped = [&](const SavedItem& it) {
++        for (const SavedItem* s : skip)
++            if (s == &it) return true;
++        return false;
++    };
+     auto consider = [&](const SavedItem& it) {
++        if (skipped(it)) return;
+         if ((int)it.stages.size() != n_stages_ || it.n_stages != n_stages_) return;
+         if (it.cvec != cvec) return;
+         if (!is_prefix(it.ids, ids)) return;
+@@ -69,6 +81,23 @@ const SavedItem* SavedStateStore::find_best(const std::vector<int32_t>& ids,
+     return best;
+ }
+ 
++const SavedItem* SavedStateStore::find_exact(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
++                                             bool cvec, int64_t k) const {
++    if (k < 1 || k > (int64_t)ids.size()) return nullptr;
++    auto matches = [&](const SavedItem& it) {
++        if ((int64_t)it.ids.size() != k) return false;
++        if ((int)it.stages.size() != n_stages_ || it.n_stages != n_stages_) return false;
++        if (it.cvec != cvec) return false;
++        if (!is_prefix(it.ids, ids)) return false;
++        return imgs_below(imgs, k) == it.imgs;
++    };
++    for (const SavedItem& r : roots_)
++        if (matches(r)) return &r;
++    for (const SavedItem& t : tips_)
++        if (matches(t)) return &t;
++    return nullptr;
++}
++
+ bool SavedStateStore::note_use(const SavedItem* it) {
+     if (it == nullptr) return false;
+     for (SavedItem& r : roots_)
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+new file mode 100644
+index 0000000..f030f19
+--- /dev/null
++++ b/src/program/saved_state_test.cpp
+@@ -0,0 +1,151 @@
++// src/program/saved_state_test.cpp - E2 SavedState selection: the eligibility walk and the exact lookup.
++//
++// Sol final-review regression: skipping ONE rejected pointer loops forever with two invalid candidates
++// (A skipped -> B invalid -> A returned again). The store therefore walks with an accumulating skip set
++// (find_best_except) plus an exact-length lookup (find_exact) that sees an item even under a longer tip.
++// CPU-only (saved_state.{hpp,cpp}, no CUDA); mirrors the serve loop's selection structure with a fake
++// eligibility predicate. Termination IS the regression: every walk below must end.
++#include "strata/program/saved_state.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++namespace saved = strata::program::saved_state;
++
++namespace {
++int g_fail = 0;
++void check(bool ok, const char* what) {
++    std::printf("  %-66s %s\n", what, ok ? "ok" : "FAIL");
++    if (!ok) ++g_fail;
++}
++
++// A complete() item of length L with nesting ids (0..L-1: every shorter item is a prefix of every
++// longer one), one stage, fp16 KV. Only sizes matter here, not values.
++saved::SavedItem make_item(int L) {
++    saved::SavedItem it;
++    it.ids.resize((size_t) L);
++    for (int i = 0; i < L; ++i) it.ids[(size_t) i] = i;
++    it.cvec = true;
++    it.n_stages = 1;
++    it.geom.n_qsa_layers = 1;
++    it.geom.n_head_kv = 1;
++    it.geom.head_dim = 8;
++    it.geom.idx_dim = 4;
++    it.geom.idx_block = 4;
++    it.geom.page_size = 4;
++    saved::StagePayload sp;
++    sp.rec.gdn = {7};
++    sp.rec.tails = {8};
++    sp.rec.ple_prev[0] = L >= 2 ? L - 2 : -1;
++    sp.rec.ple_prev[1] = L - 1;
++    saved::KvLayerPayload kv;
++    kv.fmt = saved::kKvF16;
++    kv.cells = L;
++    kv.k.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, L, 1, 8, 4, false), 0);
++    kv.v.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, L, 1, 8, 4, false), 0);
++    sp.kv.push_back(std::move(kv));
++    saved::IndexerPayload ix;
++    ix.pooled_rows = L / 4 + 1;
++    ix.pooled.assign((size_t) (ix.pooled_rows * 4 * 4), 0);
++    ix.block_pos = {0};
++    ix.dead_key.assign(16, 0);
++    sp.idx.push_back(std::move(ix));
++    it.stages.push_back(std::move(sp));
++    it.boundary.hc = 2;
++    it.boundary.n_embd = 4;
++    it.boundary.row.assign(8, 0.5f);
++    if (L > 1) {
++        saved::KvLayerPayload m;
++        m.fmt = saved::kKvF16;
++        m.cells = L - 1;
++        m.k.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, L - 1, 1, 8, 4, false), 0);
++        m.v.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, L - 1, 1, 8, 4, false), 0);
++        it.mtp.kv.push_back(std::move(m));
++        it.mtp.cells = L - 1;
++        it.mtp.valid_from = 0;
++    }
++    return it;
++}
++
++std::vector<int32_t> req_ids(int n) {
++    std::vector<int32_t> v((size_t) n);
++    for (int i = 0; i < n; ++i) v[(size_t) i] = i;
++    return v;
++}
++}  // namespace
++
++int main() {
++    std::printf("saved_state_test\n");
++    const std::vector<int32_t> req = req_ids(250);
++    const std::vector<saved::ImgKey> no_imgs;
++    {
++        // two rejected prefix matches followed by an eligible shorter root: the walk tries
++        // longest-first, accumulates both rejections, terminates, and picks the root.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_item(100)), "root(100) stores");
++        check(st.insert_tip(make_item(200), false), "tip(200) stores");
++        check(st.insert_tip(make_item(150), false), "tip(150) stores");
++        check(st.find_best(req, no_imgs, true) != nullptr &&
++                  st.find_best(req, no_imgs, true)->ids.size() == 200,
++              "find_best is the longest prefix (200)");
++        std::vector<const saved::SavedItem*> skip;
++        std::vector<int> seen;
++        const saved::SavedItem* pick = nullptr;
++        for (;;) {   // the serve loop's eligibility structure; 200 and 150 "fail validation"
++            const saved::SavedItem* cand = st.find_best_except(req, no_imgs, true, skip);
++            if (cand == nullptr) break;
++            seen.push_back((int) cand->ids.size());
++            if (cand->ids.size() == 200 || cand->ids.size() == 150) {
++                skip.push_back(cand);
++                continue;
++            }
++            pick = cand;
++            break;
++        }
++        check(seen == std::vector<int>{200, 150, 100}, "walk visits 200, 150, then 100 (no revisit)");
++        check(pick != nullptr && pick->ids.size() == 100 && pick->kind == saved::Kind::Root,
++              "walk terminates picking the eligible shorter root");
++    }
++    {
++        // equal-length root+tip: both enumerate (roots first), neither hides the other.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_item(120)), "root(120) stores");
++        check(st.insert_tip(make_item(120), false), "tip(120) stores alongside");
++        std::vector<const saved::SavedItem*> skip;
++        std::vector<int> seen;
++        std::vector<saved::Kind> kinds;
++        for (;;) {
++            const saved::SavedItem* cand = st.find_best_except(req, no_imgs, true, skip);
++            if (cand == nullptr) break;
++            seen.push_back((int) cand->ids.size());
++            kinds.push_back(cand->kind);
++            skip.push_back(cand);
++        }
++        check(seen == std::vector<int>{120, 120}, "equal lengths both enumerate");
++        check(kinds.size() == 2 && kinds[0] == saved::Kind::Root && kinds[1] == saved::Kind::Tip,
++              "roots enumerate before tips");
++    }
++    {
++        // exact-length lookup sees through a longer tip: 180 has no item (null) although tip(200)
++        // prefix-matches; 100/150 hit exactly; over-long, cvec-flipped and divergent requests miss.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_item(100)), "root(100) stores");
++        check(st.insert_tip(make_item(200), false), "tip(200) stores");
++        check(st.insert_tip(make_item(150), false), "tip(150) stores");
++        const saved::SavedItem* e100 = st.find_exact(req, no_imgs, true, 100);
++        check(e100 != nullptr && e100->kind == saved::Kind::Root, "find_exact(100) hits the root");
++        const saved::SavedItem* e150 = st.find_exact(req, no_imgs, true, 150);
++        check(e150 != nullptr && e150->kind == saved::Kind::Tip, "find_exact(150) hits the tip");
++        check(st.find_exact(req, no_imgs, true, 180) == nullptr,
++              "find_exact(180) is null despite the longer prefix-matching tip");
++        check(st.find_exact(req, no_imgs, true, 300) == nullptr, "find_exact past the request is null");
++        check(st.find_exact(req, no_imgs, false, 100) == nullptr, "cvec mismatch is null");
++        std::vector<int32_t> div = req;
++        div[50] = 999;
++        check(st.find_exact(div, no_imgs, true, 100) == nullptr, "divergent ids miss");
++        check(st.find_best(div, no_imgs, true) == nullptr, "divergent ids have no best either");
++    }
++    std::printf(g_fail ? "FAIL\n" : "PASS\n");
++    return g_fail ? 1 : 0;
++}
+-- 
+2.54.0.windows.1
+

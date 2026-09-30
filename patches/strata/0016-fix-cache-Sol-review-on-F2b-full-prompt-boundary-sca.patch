@@ -1,0 +1,335 @@
+From f621c84ebdaab7cf4890408dc1d1f2d429d60bc4 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 12:27:14 +0900
+Subject: [PATCH 16/16] fix(cache): Sol review on F2b - full-prompt boundary
+ scan, checkpoint reuse, old-vs-new test, doc clarity
+
+---
+ docs/hermes-cache-acceptance.md        | 11 +++
+ include/strata/program/saved_state.hpp | 37 +++++-----
+ src/program/generate.cpp               | 95 +++++++++++++++++++-------
+ src/program/saved_state_test.cpp       | 43 +++++++-----
+ 4 files changed, 127 insertions(+), 59 deletions(-)
+
+diff --git a/docs/hermes-cache-acceptance.md b/docs/hermes-cache-acceptance.md
+index c5da5af..19c46d0 100644
+--- a/docs/hermes-cache-acceptance.md
++++ b/docs/hermes-cache-acceptance.md
+@@ -56,6 +56,17 @@ disables root-disk loading AND storing - without it a warm disk would serve the
+     DELETE dropping non-pinned tips only. Record peak host RAM and retained lines; the fork
+     budget must hold at least depth+1 intended lines.
+ 
++7. F2b turn-boundary tips (CPU-verified; GPU acceptance pending): the tip's re-renderable point
++   sits at the LAST TURN BOUNDARY inside the prompt, not the raw prompt end. CPU probe with the
++   real tokenizer + pack template (case-3 bodies): parent1 raw n=11731, boundary L=11726 (5-token
++   generation-header tail), LCP(parent1, parent2)=11730; raw-n is a prefix of neither parent2 nor
++   the fork child, L is a prefix of both. Reproduce CPU-only with
++   `python tools/probe_turn_prefix.py --tokenizer <pack>/tokenizer --body
++   <bisect-body.json> [--rep N] [--assistant1 @file]`. Owner GPU rerun still pending: c3
++   parent2_after_child / parent3_after_fork must resume from the tip at ~len(parent prompt) with
++   suffix = the new messages only, fork_child must recall the planted password; token parity is
++   explicitly NOT a criterion (known-answer + deep-prefix recall instead).
++
+ ## S2 cache API (GET/DELETE /v1/cache)
+ 
+ Same auth as `/v1/models` (Bearer or x-api-key; 401 without a valid key when configured). GET and DELETE are supported; unknown GET/DELETE paths return 404.
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 29ebf5b..022257e 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -338,32 +338,33 @@ struct SavedItem {
+ 
+ /// F2: one tip line's TWO coherent restorable points (see the file-top note).
+ ///
+-/// The prompt point is the state at exactly the LAST TURN BOUNDARY L inside the prompt (F2b: the start of
++/// The prompt point is the state at exactly the LAST TURN BOUNDARY k inside the prompt (F2b: the start of
+ /// the trailing assistant generation header - the raw prompt end n is NOT a prefix of the next request,
+ /// which re-renders that header as a history assistant turn without reasoning). The generation point
+-/// is the previous tip behaviour (prompt + generated ids at DONE).
++/// is the previous tip behaviour (prompt + generated ids at DONE, length G).
+ ///
+ /// Capture contract (E1/E2, implemented in generate.cpp; the store only gates coherence):
+ /// - The prompt's recurrent payload (GDN/PLE/tails + ple_prev over the BOUNDARY ids), indexer payloads,
+-///   MTP metadata (cells = L-1) and boundary R_(L-1) are captured at the prefill segment ending at L,
+-///   when the session holds exactly the boundary-L state and BEFORE any generated input is committed.
++///   MTP metadata (cells = k-1) and boundary R_(k-1) are captured at the prefill segment ending at k,
++///   when the session holds exactly the boundary-k state and BEFORE any generated input is committed.
+ ///   A speculative multi-row verifier state, or later decode state sliced to shorter ids, is NOT the
+-///   boundary: use a coherent exact-L snapshot mechanism. MTP rows [0, L-1) need their exact source -
++///   boundary: use a coherent exact-k snapshot mechanism. MTP rows [0, k-1) need their exact source -
+ ///   the boundary snapshot source must be retained before scratch/decode changes it.
+-/// - Post-DONE the final KV [0, L) is captured once with the generation point. The main KV prefix is
++/// - Post-DONE the final KV [0, G) is captured once with the generation point. The main KV prefix is
+ ///   immutable (decode only appends cells past the prompt), so the prompt point SHARES it: the prompt stores
+ ///   NO main-KV copy (its StagePayload::kv vectors are empty) and logically covers the shorter page range
+-///   [0, L). The drafter rows [0, L-1) are likewise immutable during decode, so the prompt shares those
+-///   too: its MtpPayload keeps its own cells/valid_from metadata (cells = L-1) with an EMPTY kv (no second
+-///   draft-KV copy); E2 restores rows [0, L-1) from the generation backing. (An owned prompt MTP copy also
++///   [0, k). The drafter rows [0, k-1) are likewise immutable during decode, so the prompt shares those
++///   too: its MtpPayload keeps its own cells/valid_from metadata (cells = k-1) with an EMPTY kv (no second
++///   draft-KV copy); E2 restores rows [0, k-1) from the generation backing. (An owned prompt MTP copy also
+ ///   validates, for tests.)
+ /// - The prompt's indexer/recurrent/boundary payloads are its own (boundary-only, never generation state).
+ ///
+-/// E2 mount recipe for a prompt point p of entry e (gen g, boundary length L, request ids P with P[L] first
+-/// suffix token): upload the KV prefix - the first kv_pool_bytes(fmt, L, gm...) bytes of each of g's layer
+-/// vectors (pages are contiguous, so the prefix is a byte-prefix) - restore recurrent/indexer from p, MTP
+-/// metadata from p with rows [0, L-1) from g (or p's own copy when present), then pair p.boundary R_(L-1)
+-/// with P[L] before the suffix prefill (same boundary block as a generation mount, at k = L).
++/// E2 mount recipe for a prompt point p of entry e (gen g of length G, boundary length k, request ids P
++/// with P[k] first suffix token): upload the KV prefix - the first kv_pool_bytes(fmt, k, gm...) bytes of
++/// each of g's layer vectors (pages are contiguous, so the prefix is a byte-prefix) - restore
++/// recurrent/indexer from p, MTP metadata from p with rows [0, k-1) from g (or p's own copy when present),
++/// then pair p.boundary R_(k-1) with P[k] before the suffix prefill (same boundary block as a generation
++/// mount, at k).
+ ///
+ /// Budget: entry bytes = gen.payload_bytes() + prompt.payload_bytes(); the shared KV is counted ONCE (it only
+ /// exists in gen), both recurrent payloads are counted. Eviction removes the pair coherently (one LRU entry).
+@@ -380,9 +381,9 @@ struct TipEntry {
+ };
+ 
+ /// F2 coherence gate: p is a valid shared-KV prompt point for generation item g. g must be complete on its
+-/// own; p must be a strict prefix line of g (ids, cvec, images below the boundary length), share its
+-/// geometry/stages, carry a complete boundary of the same shape (a DIFFERENT row: R_(L-1), not R_(gen-1)),
+-/// own exact MTP pairs [0, L-1), boundary-only recurrent/indexer state of the right sizes, and NO main-KV
++/// own; p must be a strict prefix line of g (ids, cvec, images below the boundary length k), share its
++/// geometry/stages, carry a complete boundary of the same shape (a DIFFERENT row: R_(k-1), not R_(G-1)),
++/// own exact MTP pairs [0, k-1), boundary-only recurrent/indexer state of the right sizes, and NO main-KV
+ /// copy (sharing is structural).
+ inline bool prompt_for_shared_ok(const SavedItem& p, const SavedItem& g) {
+     const int64_t n = (int64_t)p.ids.size();
+@@ -390,7 +391,7 @@ inline bool prompt_for_shared_ok(const SavedItem& p, const SavedItem& g) {
+     if (n < 1 || L < 2 || n >= L) return false;
+     if (!g.complete()) return false;
+     if (g.stages.empty() || g.stages[0].kv.empty()) return false;
+-    if (!is_prefix(p.ids, g.ids)) return false;   // exact boundary-L ids: a strict prefix of the gen line
++    if (!is_prefix(p.ids, g.ids)) return false;   // exact boundary-k ids: a strict prefix of the gen line
+     if (p.cvec != g.cvec) return false;
+     if (p.imgs != imgs_below(g.imgs, n)) return false;
+     if (p.geom != g.geom) return false;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index f8a4ca3..34e197a 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -5437,18 +5437,18 @@ int main(int argc, char** argv) {
+             e1_root_at = root_at;
+             e1_root_row.clear();
+             e1_root_row_L = -1;
+-            // F2b: the LAST TURN BOUNDARY L inside this prompt - the start of the trailing assistant
++            // F2b: the LAST TURN BOUNDARY inside this prompt - the start of the trailing assistant
+             // generation header, i.e. the preceding <|im_end|> + newline end (verified by real
+             // tokenization in tools/probe_turn_prefix.py: the raw prompt end n is NOT a prefix of the
+             // next turn - the header re-renders as a history assistant turn - but L is, for the same
+-            // line's next turn and for forked children). Same scan bounds as turn_at, but independent
+-            // of --prompt-cache (tips work with cache 0): the prefill below splits at L so the session
+-            // passes exactly through it. Main non-aux lines with tip budget only; no boundary
+-            // (turn-token disabled/absent) or L at/below the read start: skip, generation-only unless a
+-            // coherent exact saved point is reusable post-DONE.
++            // line's next turn and for forked children). f2_at scans the FULL prompt (unlike turn_at,
++            // which stops at the restored resume): the post-DONE reuse lookup needs the true last
++            // boundary even at/below resume. Fresh capture is published separately as f2_bdry_at (only
++            // past the read start, main non-aux lines with tip budget); the prefill splits at the ACTIVE
++            // position only, so aux / budget-off / cache-0 lines keep their original segmentation.
+             int64_t f2_at = -1;
+             if (o.turn_token >= 0)
+-                for (int64_t i = n - 1; i > resume; --i)
++                for (int64_t i = n - 1; i > 0; --i)
+                     if (ids[(size_t) i] == o.turn_token) { f2_at = i; break; }
+             // F2b: the prompt point of the paired tip, captured at the segment ending at f2_at below
+             // (exact boundary-L recurrent/indexer state + stashed R_(L-1); main/MTP KV shared post-DONE).
+@@ -5460,7 +5460,7 @@ int main(int argc, char** argv) {
+             f2_bdry_row.clear();
+             f2_bdry_row_L = -1;
+             int64_t at = read_from;
+-            for (const int64_t to : {reread_to, root_at, turn_at, f2_at, n - 1}) {
++            for (const int64_t to : {reread_to, root_at, turn_at, f2_bdry_at, n - 1}) {
+                 if (to <= at) continue;
+                 const bool win = windows_ok(at, to);
+                 if (win && !refill(err)) {
+@@ -5548,7 +5548,7 @@ int main(int argc, char** argv) {
+                     saved_stats.snapshot_ms +=
+                         std::chrono::duration<double, std::milli>(Clock::now() - e4_root_t0).count();
+                 }
+-                if (to == f2_at && f2_bdry_at == f2_at && !stop_req.load() && !cancelled) {
++                if (to == f2_bdry_at && f2_bdry_at > 0 && !stop_req.load() && !cancelled) {
+                     // F2b: snapshot the tip's turn-boundary point at exactly L = f2_at tokens. The session
+                     // just read [at, L), so recurrent/PLE/tails/indexer are prompt-only boundary-L state -
+                     // never later decode state sliced to shorter ids. MTP pairs [0, L-1) are exact (every
+@@ -5558,7 +5558,7 @@ int main(int argc, char** argv) {
+                     // stashed exact residual (retained for repair with the next prompt's P[L]); a missing
+                     // row skips the capture (never invented). Rec/indexer-only: no duplicate full main or
+                     // MTP KV copy. E4: the capture cost lands in snapshot_ms, success and failure alike.
+-                    const int64_t L = f2_at;
++                    const int64_t L = f2_bdry_at;
+                     const auto f2b_cap_t0 = Clock::now();
+                     try {
+                         const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
+@@ -5595,13 +5595,49 @@ int main(int argc, char** argv) {
+                             }
+                             if (cudaDeviceSynchronize() != cudaSuccess)
+                                 throw std::runtime_error("device not idle");
++                            // Sol F2b review: the chain just saved this exact boundary's running state via
++                            // checkpoint_at(turn_at) above when enabled (same session, no GPU work since -
++                            // the root block cannot run at this `to`, and nothing else mutates between).
++                            // Reuse its host gdn/ple/tails (+stage_parts) instead of a second device copy.
++                            // Gated on exact length + full ids/images match + the just-touched stamp: never a
++                            // different-length, different-transcript, or stale-cvec payload (a cvec switch
++                            // clears the chain; geometry is process-fixed). Indexer has no checkpoint home
++                            // and is always snapshotted. Any miss falls back to the device copy below.
++                            const ConvCheckpoint* f2b_ck = nullptr;
++                            if (o.prompt_cache > 0) {
++                                for (const ConvCheckpoint& cc : checks) {
++                                    if ((int64_t) cc.ids.size() != L || cc.used != check_clock) continue;
++                                    if (cc.ids != pp.ids) continue;
++                                    if (cc.imgs.size() != pp.imgs.size()) continue;
++                                    bool f2b_imgs_ok = true;
++                                    for (size_t ii = 0; ii < cc.imgs.size(); ++ii)
++                                        if (cc.imgs[ii].start != pp.imgs[ii].start ||
++                                            cc.imgs[ii].hash != pp.imgs[ii].hash) {
++                                            f2b_imgs_ok = false;
++                                            break;
++                                        }
++                                    if (!f2b_imgs_ok) continue;
++                                    if (cc.stage_parts.size() != stages.size()) continue;
++                                    f2b_ck = &cc;
++                                    break;
++                                }
++                            }
+                             auto snap_boundary_stage = [&](strata::core::SessionState& ls,
+-                                                           saved::StagePayload& out) -> bool {
+-                                ConvCheckpoint tmp;
+-                                if (!checkpoint_save(tmp, ls, g)) return false;
+-                                out.rec.gdn = std::move(tmp.gdn);
+-                                out.rec.ple = std::move(tmp.ple);
+-                                out.rec.tails = std::move(tmp.tails);
++                                                           saved::StagePayload& out,
++                                                           const std::vector<uint8_t>* r_gdn,
++                                                           const std::vector<uint8_t>* r_ple,
++                                                           const std::vector<uint8_t>* r_tails) -> bool {
++                                if (r_gdn != nullptr) {
++                                    out.rec.gdn = *r_gdn;
++                                    out.rec.ple = *r_ple;
++                                    out.rec.tails = *r_tails;
++                                } else {
++                                    ConvCheckpoint tmp;
++                                    if (!checkpoint_save(tmp, ls, g)) return false;
++                                    out.rec.gdn = std::move(tmp.gdn);
++                                    out.rec.ple = std::move(tmp.ple);
++                                    out.rec.tails = std::move(tmp.tails);
++                                }
+                                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                                     saved::IndexerPayload ix;
+                                     if (!saved_snapshot_indexer(ls.qsa_states[i], g, L, ix)) return false;
+@@ -5610,17 +5646,26 @@ int main(int argc, char** argv) {
+                                 return true;
+                             };
+                             saved::StagePayload s0;
+-                            if (!snap_boundary_stage(ss, s0))
++                            if (!snap_boundary_stage(ss, s0,
++                                                     f2b_ck != nullptr ? &f2b_ck->gdn : nullptr,
++                                                     f2b_ck != nullptr ? &f2b_ck->ple : nullptr,
++                                                     f2b_ck != nullptr ? &f2b_ck->tails : nullptr))
+                                 throw std::runtime_error("boundary state copy failed");
+                             s0.rec.ple_prev[0] = L >= 2 ? pp.ids[(size_t) (L - 2)] : -1;
+                             s0.rec.ple_prev[1] = pp.ids[(size_t) (L - 1)];
+                             pp.stages.push_back(std::move(s0));
+-                            for (auto& st : stages) {
++                            for (size_t f2b_si = 0; f2b_si < stages.size(); ++f2b_si) {
++                                auto& st = stages[f2b_si];
+                                 const strata::core::OnDevice on(st->dev);
+                                 if (cudaDeviceSynchronize() != cudaSuccess)
+                                     throw std::runtime_error("stage not idle");
+                                 saved::StagePayload sps;
+-                                if (!snap_boundary_stage(st->ss, sps))
++                                const ConvCheckpoint* f2b_part =
++                                    f2b_ck != nullptr ? &f2b_ck->stage_parts[f2b_si] : nullptr;
++                                if (!snap_boundary_stage(st->ss, sps,
++                                                         f2b_part != nullptr ? &f2b_part->gdn : nullptr,
++                                                         f2b_part != nullptr ? &f2b_part->ple : nullptr,
++                                                         f2b_part != nullptr ? &f2b_part->tails : nullptr))
+                                     throw std::runtime_error("boundary stage copy failed");
+                                 sps.rec.ple_prev[0] = L >= 2 ? pp.ids[(size_t) (L - 2)] : -1;
+                                 sps.rec.ple_prev[1] = pp.ids[(size_t) (L - 1)];
+@@ -6003,12 +6048,12 @@ int main(int argc, char** argv) {
+                 // the prefill segment ending at f2_at, sharing this generation's KV/MTP backing) and the
+                 // generation end (below). Coherence is pre-checked on CPU before either item moves; an
+                 // incoherent pair still records the generation tip alone. The pairing gate uses the ACTUAL
+-                // saved boundary length (f2_prompt.ids.size()), not n: the boundary is a strict prefix of
+-                // the generation end whenever at least one token was generated. A stop after the boundary
+-                // snapshot only (no generated tokens) leaves live == prompt: not a pair (strict prefix
+-                // required), so the single-point path records it. Without a fresh boundary capture (L at or
+-                // below the restored resume, unavailable row, failure), a coherent exact saved point at f2_at
+-                // already in the store is reused when practical - else generation-only.
++                // saved boundary length (f2_prompt.ids.size()), not n. A request with no generated tokens
++                // never pairs (strict prefix required: live == the raw prompt n, not the boundary);
++                // pairing additionally stays gated on boundary_ok and the post-DONE flush (flush_R/emit_last),
++                // so a stop/cancel records nothing. Without a fresh boundary capture (L at or below the
++                // restored resume, unavailable row, failure), a coherent exact saved point at f2_at already
++                // in the store is reused when practical - else generation-only.
+                 if (boundary_ok && mtp_ok && !flush_R.empty() && !req_aux && o.tip_cache_gib > 0.0 &&
+                     !live.empty()) {
+                     saved::SavedItem tip;
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index 69282c5..f6f55d8 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -857,7 +857,7 @@ int main() {
+               "F2 equal-bound shared pair stores");
+     }
+     {   // F2b: the prompt point sits at the LAST TURN BOUNDARY L, not the raw prompt end n. Minimal
+-        // fixture modelled on the probe (parent1 n=70, boundary L=60, 5-token generation-header tail):
++        // fixture modelled on the probe (raw n=70, boundary L=60, 10-token generation-header tail):
+         // the parent prompt's raw end can never be a prefix of the next turn (the header re-renders as
+         // a history assistant turn), while L is. The pair stores (boundary@60, gen@100); the next-turn
+         // request shares [0, 60) then diverges (re-rendered assistant + new user).
+@@ -888,21 +888,32 @@ int main() {
+         check(pe != nullptr && pe->stages[0].rec.ple_prev[0] == 58 && pe->stages[0].rec.ple_prev[1] == 59,
+               "F2b ple window is the boundary ids' last two");
+     }
+-    {   // F2b: the boundary point succeeds after unrelated child traffic (independent of the chain),
+-        // and a raw-prompt-end point is never offered (it cannot be a prefix of the re-rendered turn).
+-        saved::SavedStateStore st;
+-        check(st.insert_tip_pair(make_shared_prompt_item(60, 0), make_line(100, 0), false),
+-              "F2b parent boundary pair stores");
+-        check(st.insert_tip(make_line(75, 5000), false), "F2b unrelated child tip stores alongside");
+-        std::vector<int32_t> parent_next = req_at(0, 60);
+-        for (int i = 0; i < 10; ++i) parent_next.push_back(2000 + i);
+-        const saved::SavedItem* bp = st.find_best(parent_next, no_imgs, true);
+-        check(bp != nullptr && bp->ids.size() == 60 && bp->ids[0] == 0,
+-              "F2b parent turn still finds its boundary point after child traffic");
+-        std::vector<int32_t> raw_next = req_at(0, 70);   // a request past the boundary but raw-shaped...
+-        for (int i = 0; i < 10; ++i) raw_next.push_back(3000 + i);   // ...re-rendered past L all the same
+-        check(st.find_best(raw_next, no_imgs, true)->ids.size() == 60,
+-              "F2b longer re-rendered request still resumes at the boundary, never past it");
++    {   // F2b old-vs-new: the same next-turn request (shared [0, 60), changed header past L)
++        // against the OLD raw-end store resumes the root at 40, while the boundary store resumes tip60
++        // after unrelated child traffic. Rejection of the raw point and the improvement, together.
++        std::vector<int32_t> next = req_at(0, 60);
++        for (int i = 0; i < 20; ++i) next.push_back(4000 + i);   // re-rendered assistant + new user
++        {
++            saved::SavedStateStore old;
++            check(old.insert_root(make_line(40, 0)), "F2b-old root40 stores");
++            check(old.insert_tip_pair(make_prompt_item(70, 0), make_line(100, 0), false),
++                  "F2b-old raw70/gen100 pair stores");
++            const saved::SavedItem* b = old.find_best(next, no_imgs, true);
++            check(b != nullptr && b->ids.size() == 40 && b->kind == saved::Kind::Root,
++                  "F2b-old next turn falls back to root40 (raw70/gen100 never a prefix)");
++        }
++        {
++            saved::SavedStateStore now;
++            check(now.insert_root(make_line(40, 0)), "F2b-new root40 stores");
++            check(now.insert_tip_pair(make_shared_prompt_item(60, 0), make_line(100, 0), false),
++                  "F2b-new boundary60/gen100 pair stores");
++            check(now.insert_tip(make_line(75, 5000), false), "F2b-new child tip stores alongside");
++            const saved::SavedItem* b = now.find_best(next, no_imgs, true);
++            check(b != nullptr && b->ids.size() == 60 && b->kind == saved::Kind::Tip,
++                  "F2b-new next turn resumes tip60 after child traffic");
++            check(b != nullptr && (int64_t) next.size() - (int64_t) b->ids.size() == 20,
++                  "F2b-new suffix is the re-rendered tail only (20, not 40)");
++        }
+     }
+     {   // F2b: a boundary point with a malformed or missing MTP repair row is rejected (E2 cannot pair
+         // cell L-1 without R_(L-1)); the generation tip still stores alone.
+-- 
+2.54.0.windows.1
+

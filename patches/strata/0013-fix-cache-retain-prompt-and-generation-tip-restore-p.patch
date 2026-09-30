@@ -1,0 +1,1106 @@
+From aae1de4de5fd9103d5ae6f7b070c8ce954ae4e21 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Wed, 30 Sep 2026 11:30:55 +0900
+Subject: [PATCH 13/16] fix(cache): retain prompt and generation tip restore
+ points (F2)
+
+---
+ include/strata/program/saved_state.hpp | 176 +++++++++++++++-
+ src/program/generate.cpp               | 232 +++++++++++++++++---
+ src/program/saved_state.cpp            |  97 +++++++--
+ src/program/saved_state_test.cpp       | 280 ++++++++++++++++++++++++-
+ 4 files changed, 734 insertions(+), 51 deletions(-)
+
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 9e73475..0cc0d2a 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -26,6 +26,16 @@
+ // Section 7 (forked children): a tip covers prompt + GENERATED assistant tokens at exactly the DONE boundary,
+ // so a forked child (parent prompt + parent's generated tool-call + a short tool result) resumes with a tiny
+ // suffix. Tips are snapshotted after DONE is sent/flushed, never blocking the reply.
++//
++// F2 (BRIEF-CACHE-FIX-1): the tip's generation-end ids are prompt + generated ids (reasoning/<think> included)
++// but the next turn re-renders the assistant WITHOUT the reasoning, so the generation point is never a prefix
++// of the next prompt. One tip therefore retains TWO coherent restorable points of its line:
++//   (a) the prompt end (state + logical KV [0, n)) - always a prefix of the next turn of the same line and of
++//       a forked child's prompt (parent prompt + re-rendered assistant + tool result);
++//   (b) the generation end (previous behaviour) - used when the client echoes the generated ids verbatim.
++// Resume picks the longest valid point across both. The prompt point lives in the store (tips_), so it survives
++// an unrelated (child) request independently of the chain, which the chain does not. Roots stay single-point
++// (E3 persists roots only; paired tips are RAM-only).
+ #pragma once
+ 
+ #include "strata/kernels/kv_q4.hpp"   // authoritative q4 row formula (CPU-clean: <cstdint> + qsa.hpp only)
+@@ -250,6 +260,21 @@ inline bool kv_blob_ok(const KvLayerPayload& k, int64_t cells, const SnapshotGeo
+     return (uint64_t)k.ks.size() == sc && (uint64_t)k.vs.size() == sc;
+ }
+ 
++/// F2: prefix coverage - `src` holds at least the [0, cells) page range. Pages are written in order, so the
++/// range is a byte-prefix of the stored vectors. Lets a prompt point validate against (and E2 restore from)
++/// its generation owner's KV without any copy.
++inline bool kv_prefix_ok(const KvLayerPayload& src, int64_t cells, const SnapshotGeom& gm) {
++    if (cells < 1 || src.cells < cells) return false;
++    if (src.fmt != kKvF16 && src.fmt != kKvInt8 && src.fmt != kKvQ4) return false;
++    const uint64_t code = kv_pool_bytes(src.fmt, cells, gm.n_head_kv, gm.head_dim, gm.page_size, false);
++    if ((uint64_t)src.k.size() < code || (uint64_t)src.v.size() < code) return false;
++    if (src.fmt == kKvInt8) {
++        const uint64_t sc = kv_pool_bytes(src.fmt, cells, gm.n_head_kv, gm.head_dim, gm.page_size, true);
++        return (uint64_t)src.ks.size() >= sc && (uint64_t)src.vs.size() >= sc;
++    }
++    return src.ks.empty() && src.vs.empty();
++}
++
+ struct SavedItem {
+     Kind kind = Kind::Tip;    std::vector<int32_t> ids;             ///< the tokens this state has consumed (prompt + generated for tips)
+     std::vector<ImgKey> imgs;             ///< imgs_below(all, ids.size()) at capture
+@@ -309,6 +334,118 @@ struct SavedItem {
+     }
+ };
+ 
++/// E3's on-disk header: every field that changes numerics must match, else the file is
++/// ignored. The engine fills it per process (see generate.cpp's root_*_identity helpers); compatible_with()
++/// gates the load. Pure and CPU-testable. ids_len/ids_hash never gate compatibility: the full-ids prefix
++/// rule applies after load (never hash-only).
++/// F2: one tip line's TWO coherent restorable points (see the file-top note).
++///
++/// The prompt point is the state at exactly the prompt end n (NOT n-1, NOT a header/turn boundary): the next
++/// request re-renders the assistant turn without reasoning, so only n is a prefix of it. The generation point
++/// is the previous tip behaviour (prompt + generated ids at DONE).
++///
++/// Capture contract (E1/E2, implemented in generate.cpp; the store only gates coherence):
++/// - The prompt's recurrent payload (GDN/PLE/tails + ple_prev over the PROMPT ids), indexer payloads, MTP
++///   rows [0, n-1) and boundary R_(n-1) are captured at prompt end from the first verifier window, when only
++///   the last prompt input is consumed and BEFORE any generated input is committed. A speculative multi-row
++///   verifier state is NOT the prompt end: use a coherent 1-row first window (or an equivalent snapshot
++///   mechanism). MTP pairs [0, n-1) need their exact source - the prompt snapshot source must be retained
++///   before scratch/decode changes it.
++/// - Post-DONE the final KV [0, L) is captured once with the generation point. The main KV prefix is
++///   immutable (decode only appends cells [n, L)), so the prompt point SHARES it: the prompt stores NO main-KV
++///   copy (its StagePayload::kv vectors are empty) and logically covers the shorter page range [0, n). The
++///   drafter rows [0, n-1) are likewise immutable during decode, so the prompt shares those too: its MtpPayload
++///   keeps its own cells/valid_from metadata (cells = n-1) with an EMPTY kv (no second draft-KV copy); E2
++///   restores rows [0, n-1) from the generation backing. (An owned prompt MTP copy also validates, for tests.)
++/// - The prompt's indexer/recurrent/boundary payloads are its own (prompt-only, never generation state).
++///
++/// E2 mount recipe for a prompt point p of entry e (gen g, prompt length n, request ids P with P[n] first
++/// suffix token): upload the KV prefix - the first kv_pool_bytes(fmt, n, gm...) bytes of each of g's layer
++/// vectors (pages are contiguous, so the prefix is a byte-prefix) - restore recurrent/indexer from p, MTP
++/// metadata from p with rows [0, n-1) from g (or p's own copy when present), then pair p.boundary R_(n-1)
++/// with P[n] before the suffix prefill (same boundary block as a generation mount, at k = n).
++///
++/// Budget: entry bytes = gen.payload_bytes() + prompt.payload_bytes(); the shared KV is counted ONCE (it only
++/// exists in gen), both recurrent payloads are counted. Eviction removes the pair coherently (one LRU entry).
++struct TipEntry {
++    SavedItem prompt;        ///< prompt-end point; StagePayload::kv empty (shares gen's KV); valid iff has_prompt
++    SavedItem gen;           ///< generation-end point; owns the full shared KV [0, L)
++    bool has_prompt = false;
++    uint64_t bytes = 0;      ///< set by the store on insert (gen + prompt, shared KV once)
++    uint64_t last_use = 0;   ///< one LRU clock per LINE: a mount of either point refreshes the entry
++    uint64_t entry_bytes() const {
++        return gen.payload_bytes() + (has_prompt ? prompt.payload_bytes() : 0);
++    }
++    bool complete() const;
++};
++
++/// F2 coherence gate: p is a valid shared-KV prompt point for generation item g. g must be complete on its
++/// own; p must be a strict prefix line of g (ids, cvec, images below n), share its geometry/stages, carry a
++/// complete boundary of the same shape (a DIFFERENT row: R_(n-1), not R_(L-1)), own exact MTP pairs [0, n-1),
++/// prompt-only recurrent/indexer state of the right sizes, and NO main-KV copy (sharing is structural).
++inline bool prompt_for_shared_ok(const SavedItem& p, const SavedItem& g) {
++    const int64_t n = (int64_t)p.ids.size();
++    const int64_t L = (int64_t)g.ids.size();
++    if (n < 1 || L < 2 || n >= L) return false;
++    if (!g.complete()) return false;
++    if (g.stages.empty() || g.stages[0].kv.empty()) return false;
++    if (!is_prefix(p.ids, g.ids)) return false;   // exact prompt end n, not n-1 or a header boundary
++    if (p.cvec != g.cvec) return false;
++    if (p.imgs != imgs_below(g.imgs, n)) return false;
++    if (p.geom != g.geom) return false;
++    if (p.n_stages != g.n_stages || (int)p.stages.size() != p.n_stages) return false;
++    if (!p.boundary.complete()) return false;
++    if (p.boundary.hc != g.boundary.hc || p.boundary.n_embd != g.boundary.n_embd) return false;
++    const int64_t prow = n / p.geom.idx_block + 1;   // pooled rows covering [0, n)
++    for (const StagePayload& s : p.stages) {
++        if (s.rec.gdn.empty() || s.rec.tails.empty()) return false;
++        if (!s.kv.empty()) return false;   // NO duplicate KV: the prompt shares gen's storage
++        if ((int64_t)s.idx.size() != p.geom.n_qsa_layers) return false;
++        if (s.rec.ple_prev[0] != (n >= 2 ? p.ids[(size_t)(n - 2)] : -1) ||
++            s.rec.ple_prev[1] != p.ids[(size_t)(n - 1)])
++            return false;
++        for (const IndexerPayload& x : s.idx) {
++            if (x.pooled_rows != prow) return false;
++            if ((int64_t)x.pooled.size() != prow * p.geom.idx_dim * 4) return false;
++            if ((int64_t)x.dead_key.size() != p.geom.idx_dim * 4) return false;
++            if (x.block_pos.size() != 1) return false;
++        }
++    }
++    // MTP: exact pairs [0, n-1) (n == 1: no pair exists, mtp stays empty), same format as gen's KV. Two
++    // modes: OWNED (mtp.kv holds the prompt's own copy - tests) or SHARED (mtp.kv empty: rows [0, n-1) come
++    // from the generation backing, which decode never rewrites; only the cells/valid_from metadata is the
++    // prompt's own). Either way no full second copy of anything large exists.
++    if (n == 1) {
++        if (!p.mtp.kv.empty() || p.mtp.cells != 0) return false;
++    } else if (p.mtp.kv.empty()) {
++        if (p.mtp.cells != n - 1) return false;
++        if (p.mtp.valid_from < 0 || p.mtp.valid_from > p.mtp.cells) return false;
++        if (g.mtp.kv.empty() || g.mtp.kv.size() != 1) return false;
++        if (g.mtp.cells < p.mtp.cells) return false;   // the gen backing covers the prompt range
++        // Coverage: the prompt claims real pairs from p.mtp.valid_from, so the backing must really hold
++        // rows there - a higher owner bound means the prompt claims rows absent from the backing.
++        if (g.mtp.valid_from > p.mtp.valid_from) return false;
++        const KvLayerPayload& m = g.mtp.kv[0];
++        if (m.fmt != g.stages[0].kv[0].fmt) return false;
++        if (!kv_prefix_ok(m, p.mtp.cells, p.geom)) return false;
++    } else {
++        if (p.mtp.kv.empty() || p.mtp.kv.size() != 1) return false;
++        if (p.mtp.cells != n - 1) return false;
++        if (p.mtp.valid_from < 0 || p.mtp.valid_from > p.mtp.cells) return false;
++        const KvLayerPayload& m = p.mtp.kv[0];
++        if (m.fmt != g.stages[0].kv[0].fmt) return false;
++        if (!kv_blob_ok(m, p.mtp.cells, p.geom)) return false;
++    }
++    return true;
++}
++
++inline bool TipEntry::complete() const {
++    if (!gen.complete()) return false;
++    if (gen.ids.empty()) return false;
++    if (!has_prompt) return true;
++    return prompt_for_shared_ok(prompt, gen);
++}
++
+ /// E3's on-disk header: every field that changes numerics must match, else the file is
+ /// ignored. The engine fills it per process (see generate.cpp's root_*_identity helpers); compatible_with()
+ /// gates the load. Pure and CPU-testable. ids_len/ids_hash never gate compatibility: the full-ids prefix
+@@ -379,7 +516,6 @@ class SavedStateStore {
+     int stage_count() const { return n_stages_; }
+ 
+     size_t roots() const { return roots_.size(); }
+-    size_t tips() const { return tips_.size(); }
+     uint64_t clock() const { return clock_; }
+ 
+     /// Insert a root: pinned, never evicted by traffic. An exact-duplicate (same ids+imgs+cvec) refresh is
+@@ -389,12 +525,21 @@ class SavedStateStore {
+     /// advance - aux traffic must never cost the main path anything. Exact-duplicate ids refresh in place
+     /// (one recent tip per line for re-runs); otherwise LRU-evict tips past the byte budget.
+     ///
++    /// F2: this single-point form stays for compatibility (CPU tests, tools). The engine records paired tips
++    /// via insert_tip_pair; a single insert whose gen key matches a paired entry replaces the whole entry.
+     /// Deliberately NOT collapsing prefix-related tips of the same line: a forked child (section 7) extends
+     /// its parent's ids, and dropping the parent's tip on the child's insert would destroy the alternation
+     /// benefit. The byte budget bounds the duplication; E2 may add line collapsing once restore lands.
+     bool insert_tip(SavedItem item, bool is_aux);
+-    /// E2's resume lookup: longest item whose full ids are a prefix of `ids` with exact image and cvec
+-    /// identity and a matching stage count. Ties are impossible (lengths differ); live-chain ties prefer the
++    /// F2: insert one tip LINE with both restorable points (prompt end n + generation end L). Entry bytes =
++    /// gen + prompt with the shared KV counted once; the pair evicts coherently. Rejects incoherent pairs
++    /// (prompt_for_shared_ok), aux lines (strict no-op like insert_tip), and stage-count mismatches. An
++    /// exact-duplicate gen key replaces the entry in place (one recent tip per line for re-runs).
++    bool insert_tip_pair(SavedItem prompt, SavedItem gen, bool is_aux);
++    /// E2's resume lookup: longest POINT whose full ids are a prefix of `ids` with exact image and cvec
++    /// identity and a matching stage count. F2: every paired tip offers both its prompt and generation points;
++    /// resume picks the longest valid one across both (prompt for re-rendered turns, generation for verbatim
++    /// echoes). Ties are impossible (lengths differ); live-chain ties prefer the
+     /// chain (no upload) at the call site. Null when nothing matches. A successful restore MUST call
+     /// note_use() on the returned item so the LRU clock counts mounts, not just inserts.
+     const SavedItem* find_best(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+@@ -405,20 +550,31 @@ class SavedStateStore {
+     /// mutation between calls: pointers stay valid. CPU-testable (see saved_state_test.cpp).
+     const SavedItem* find_best_except(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                                       bool cvec, const std::vector<const SavedItem*>& skip) const;
+-    /// E2b exact-length prefix lookup: the item with ids.size()==k whose ids/cvec/images match, even when a
+-    /// longer tip also matches (find_best would hide it). Null when none. No-upload MTP boundary repair needs
++    /// E2b exact-length prefix lookup: the POINT with ids.size()==k whose ids/cvec/images match, even when a
++    /// longer tip also matches (find_best would hide it). F2: searches prompt and generation points alike.
++    /// Null when none. No-upload MTP boundary repair needs
+     /// exactly this length. CPU-testable.
+     const SavedItem* find_exact(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
+                                 int64_t k) const;
+-    /// E2 mounts through the item find_best() returned: advances its last_use to now. False for null or foreign
+-    /// pointers (never fabricates freshness).
++    /// E2 mounts through the point find_best() returned: advances its LINE's last_use to now (F2: a mount of
++    /// either point of a pair refreshes the entry AND both points' own last_use, so the pair evicts coherently
++    /// and S2 rows stay fresh). False for null or foreign pointers (never fabricates freshness).
+     bool note_use(const SavedItem* it);
+-    /// S2 DELETE: drop all non-pinned items. Returns how many tips were dropped.
++    /// F2: the generation item backing a prompt point (null unless `p` is a paired entry's prompt). E2 uses
++    /// it to validate and mount the prompt point against the shared KV/MTP backing without any copy.
++    const SavedItem* tip_gen_for(const SavedItem* p) const;
++    /// S2 DELETE: drop all non-pinned items. Returns how many tip LINES were dropped.
+     size_t drop_non_pinned();
+-    /// S2 GET: roots then tips.
++    /// S2 GET: roots then tips. F2: a paired tip lists TWO rows (prompt point, then generation point) sharing
++    /// the entry's last_use; their bytes sum to the entry bytes (shared KV counted once, in the gen row).
+     std::vector<InventoryEntry> inventory() const;
+     void clear();
+ 
++    /// Tip LINES (F2: one entry holds up to two restorable points). tip_points() counts the restorable
++    /// points (gen + prompt points).
++    size_t tips() const { return tips_.size(); }
++    size_t tip_points() const;
++
+   private:
+     static bool same_key(const SavedItem& a, const SavedItem& b) {
+         return a.ids == b.ids && a.imgs == b.imgs && a.cvec == b.cvec;
+@@ -426,7 +582,7 @@ class SavedStateStore {
+     void evict_tips();   // LRU among tips while tip_bytes_ > tip_budget_
+ 
+     std::vector<SavedItem> roots_;
+-    std::vector<SavedItem> tips_;
++    std::vector<TipEntry> tips_;
+     uint64_t tip_budget_ = (uint64_t)(kDefaultTipCacheGib * 1073741824.0);
+     uint64_t tip_bytes_ = 0;
+     uint64_t clock_ = 0;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 9a62a99..65fe3dd 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -84,6 +84,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <sstream>
++#include <stdexcept>
+ #include <string>
+ #include <set>
+ #include <vector>
+@@ -1205,24 +1206,28 @@ inline saved::SnapshotGeom saved_live_geom(const strata::core::ModelGeometry& g)
+ /// pools + identity page table. Mode 1 (streamed): memcpy into the authoritative host copy + kv_stream_reset
+ /// so resolve refills slots from the restored host. Mode 2 (ring): memcpy into the host copy; the caller
+ /// refills the ring (mtp.kv_restore). `st` is const: every destination is a mutable pool through it.
++///
++/// F2 prefix upload: `pay` may hold MORE than cells (a prompt point mounting from its generation owner's
++/// backing - pages are contiguous, so [0, cells) is a byte-prefix). Exact payloads behave exactly as before.
+ bool saved_restore_kv(const strata::core::QsaState& st, const strata::core::ModelGeometry& g,
+                        const saved::KvLayerPayload& pay, int64_t cells, void* stream, std::string& e) {
+-    if (pay.cells != cells || cells < 1) { e = "KV cell count mismatch"; return false; }
++    if (cells < 1 || pay.cells < cells) { e = "KV cell count mismatch"; return false; }
+     if (pay.fmt != saved_kv_format(st)) { e = "KV format changed"; return false; }
+     const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+     const int64_t nH = g.n_head_kv, hd = g.head_dim, ps = qs.page_size;
+     if (nH < 1 || hd < 1 || ps < 1) { e = "bad KV geometry"; return false; }
+     const int64_t pages = (cells + ps - 1) / ps;
+     if (pages > st.n_pages) { e = "KV pages exceed capacity"; return false; }
+-    if (!saved::kv_blob_ok(pay, cells, saved_live_geom(g))) { e = "KV blob size mismatch"; return false; }
++    if (!saved::kv_prefix_ok(pay, cells, saved_live_geom(g))) { e = "KV blob size mismatch"; return false; }
+     const size_t page_row = (size_t) nH * (size_t) ps;   // rows per page; times the per-row bytes below
+     auto copy_dev = [&](const std::vector<uint8_t>& src, void* dev, size_t row) -> bool {
+-        if (src.size() != (size_t) pages * page_row * row || dev == nullptr) return false;
+-        return cudaMemcpy(dev, src.data(), src.size(), cudaMemcpyHostToDevice) == cudaSuccess;
++        if (src.size() < (size_t) pages * page_row * row || dev == nullptr) return false;
++        return cudaMemcpy(dev, src.data(), (size_t) pages * page_row * row, cudaMemcpyHostToDevice) ==
++               cudaSuccess;
+     };
+     auto copy_host = [&](const std::vector<uint8_t>& src, const void* host, size_t row) -> bool {
+-        if (src.size() != (size_t) pages * page_row * row || host == nullptr) return false;
+-        std::memcpy(const_cast<void*>(host), src.data(), src.size());
++        if (src.size() < (size_t) pages * page_row * row || host == nullptr) return false;
++        std::memcpy(const_cast<void*>(host), src.data(), (size_t) pages * page_row * row);
+         return true;
+     };
+     if (st.kv_mode == 0) {
+@@ -1288,10 +1293,13 @@ bool saved_restore_indexer(const strata::core::QsaState& st, const strata::core:
+ 
+ /// One session's full state at L tokens: recurrent (via the checkpoint contract) + indexer + KV per layer.
+ /// The caller holds the stage's OnDevice guard; the caller syncs the device after (orders kv_stream_reset).
++/// F2: `kv_src` (a paired entry's generation stage) supplies the KV when `sp` carries none - the prompt point
++/// shares the owner's backing, uploaded as the [0, L) prefix (no copy, no clone). Null restores owned state.
+ bool saved_restore_stage(strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                           const saved::StagePayload& sp, const std::vector<int32_t>& ids, int64_t L, void* stream,
+-                          std::string& e) {
+-    if ((int64_t) sp.kv.size() != g.n_qsa_layers() || (int64_t) sp.idx.size() != g.n_qsa_layers()) {
++                          std::string& e, const saved::StagePayload* kv_src = nullptr) {
++    const saved::StagePayload& ksp = (kv_src != nullptr && sp.kv.empty()) ? *kv_src : sp;
++    if ((int64_t) ksp.kv.size() != g.n_qsa_layers() || (int64_t) sp.idx.size() != g.n_qsa_layers()) {
+         e = "stage layer count changed";
+         return false;
+     }
+@@ -1303,7 +1311,7 @@ bool saved_restore_stage(strata::core::SessionState& ss, const strata::core::Mod
+     if (!checkpoint_restore(tmp, ss, g)) { e = "recurrent restore failed"; return false; }
+     for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+         if (!saved_restore_indexer(ss.qsa_states[i], g, sp.idx[(size_t) i], e)) return false;
+-        if (!saved_restore_kv(ss.qsa_states[i], g, sp.kv[(size_t) i], L, stream, e)) return false;
++        if (!saved_restore_kv(ss.qsa_states[i], g, ksp.kv[(size_t) i], L, stream, e)) return false;
+     }
+     return true;
+ }
+@@ -1325,13 +1333,23 @@ bool saved_restore_mtp(strata::core::MtpDrafter& mtp, const strata::core::ModelG
+ /// (GDN, tails, PLE exactly as the live session holds them, ple_prev equal to the ids' last two) are gated
+ /// here - a truncated payload must fail here, never mid-upload. `mtp`'s prompt length must already be the new
+ /// request's (the call site sets it before the chain scan), so prefill_valid_from() is the new window's.
++/// F2: `kv_owner` (a paired entry's generation item, from tip_gen_for) validates a PROMPT point against the
++/// shared backing - recurrent/indexer/boundary/MTP-metadata from `it`, main KV as the [0, L) prefix and
++/// (when shared) MTP rows as [0, L-1). Null validates owned state exactly as before.
+ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<int32_t>& ids32,
+                                  const std::vector<saved::ImgKey>& req_simgs, bool cvec, int64_t n,
+                                  const strata::core::ModelGeometry& g, const strata::core::SessionState& ss,
+                                  const std::vector<std::unique_ptr<GpuStage>>& stages,
+-                                 strata::core::MtpDrafter& mtp, std::string& why) {
++                                 strata::core::MtpDrafter& mtp, std::string& why,
++                                 const saved::SavedItem* kv_owner = nullptr) {
+     const int64_t L = (int64_t) it.ids.size();
+-    if (!it.complete()) { why = "incomplete payload"; return false; }
++    if (kv_owner != nullptr) {
++        if (!kv_owner->complete()) { why = "owner incomplete payload"; return false; }
++        if (!saved::prompt_for_shared_ok(it, *kv_owner)) { why = "prompt/owner incoherent"; return false; }
++    } else if (!it.complete()) {
++        why = "incomplete payload";
++        return false;
++    }
+     if (it.n_stages != (int) stages.size() + 1 || (int) it.stages.size() != it.n_stages) {
+         why = "stage count changed";
+         return false;
+@@ -1356,7 +1374,21 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+         if (ls.qsa_states == nullptr) { why = "no live QSA states"; return false; }
+         if (L > ls.max_cells) { why = "exceeds max_cells"; return false; }
+         const saved::StagePayload& sp = it.stages[s];
+-        if ((int64_t) sp.kv.size() != g.n_qsa_layers() || (int64_t) sp.idx.size() != g.n_qsa_layers()) {
++        if ((int64_t) sp.idx.size() != g.n_qsa_layers()) {
++            why = "stage layer count changed";
++            return false;
++        }
++        // F2: a prompt point carries no KV of its own - the owner's layers cover [0, L) as a prefix.
++        const saved::StagePayload* ksp = &sp;
++        if (kv_owner != nullptr) {
++            if (s >= kv_owner->stages.size() ||
++                (int64_t) kv_owner->stages[s].kv.size() != g.n_qsa_layers()) {
++                why = "owner stage layer count changed";
++                return false;
++            }
++            if (!sp.kv.empty()) { why = "prompt carries a duplicate KV"; return false; }
++            ksp = &kv_owner->stages[s];
++        } else if ((int64_t) sp.kv.size() != g.n_qsa_layers()) {
+             why = "stage layer count changed";
+             return false;
+         }
+@@ -1386,8 +1418,8 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+             if (q.n_pages < pages) { why = "KV pages exceed capacity"; return false; }
+             if (q.idx_pooled_rows < prow) { why = "indexer rows exceed capacity"; return false; }
+             if (!saved_kv_ptrs_ok(q, why)) return false;
+-            if (saved_kv_format(q) != sp.kv[(size_t) i].fmt) { why = "KV format changed"; return false; }
+-            if (!saved::kv_blob_ok(sp.kv[(size_t) i], L, livegeom)) { why = "KV blob size"; return false; }
++            if (saved_kv_format(q) != ksp->kv[(size_t) i].fmt) { why = "KV format changed"; return false; }
++            if (!saved::kv_prefix_ok(ksp->kv[(size_t) i], L, livegeom)) { why = "KV blob size"; return false; }
+             const saved::IndexerPayload& ix = sp.idx[(size_t) i];
+             if (ix.pooled_rows != prow) { why = "indexer pooled rows"; return false; }
+             if ((int64_t) ix.pooled.size() != prow * livegeom.idx_dim * 4) {
+@@ -1412,13 +1444,34 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+     if (mst.max_cells <= 0) {
+         if (!it.mtp.kv.empty()) { why = "drafter off but snapshot has MTP rows"; return false; }
+     } else if (L > 1) {
+-        if (it.mtp.kv.size() != 1 || it.mtp.cells != L - 1) { why = "MTP pair count"; return false; }
+-        if (it.mtp.kv[0].fmt != saved_kv_format(mst)) { why = "MTP format changed"; return false; }
++        // F2: a prompt point with an empty mtp.kv shares the owner's rows (decode never rewrites [0, L-1));
++        // its own cells/valid_from metadata still gates the new request's window. Coverage (owner valid_from
++        // <= prompt valid_from) rides on prompt_for_shared_ok above.
++        const saved::MtpPayload* msrc = &it.mtp;
++        const saved::MtpPayload* owned_mtp = nullptr;
++        if (it.mtp.kv.empty()) {
++            if (kv_owner == nullptr || kv_owner->mtp.kv.empty()) {
++                why = "MTP pair count";
++                return false;
++            }
++            owned_mtp = &kv_owner->mtp;
++            msrc = owned_mtp;
++            if (msrc->cells < L - 1) { why = "MTP pair count"; return false; }
++        } else if (it.mtp.kv.size() != 1 || it.mtp.cells != L - 1) {
++            why = "MTP pair count";
++            return false;
++        }
++        if (msrc->kv[0].fmt != saved_kv_format(mst)) { why = "MTP format changed"; return false; }
+         const int64_t mp = (it.mtp.cells + qs.page_size - 1) / qs.page_size;
+         if (mp > mst.n_pages || it.mtp.cells > mst.max_cells) { why = "MTP capacity"; return false; }
+         if (mst.page_table == nullptr) { why = "MTP page table missing"; return false; }
+         if (!saved_kv_ptrs_ok(mst, why)) return false;
+-        if (!saved::kv_blob_ok(it.mtp.kv[0], it.mtp.cells, livegeom)) { why = "MTP blob size"; return false; }
++        if (owned_mtp != nullptr) {
++            if (!saved::kv_prefix_ok(msrc->kv[0], L - 1, livegeom)) { why = "MTP blob size"; return false; }
++        } else if (!saved::kv_blob_ok(it.mtp.kv[0], it.mtp.cells, livegeom)) {
++            why = "MTP blob size";
++            return false;
++        }
+         // blocker 1 (Sol review): the new request's drafter window reaching BELOW the snapshot's first real
+         // pair resumes under unwritten zeros (garbage) - reject. Reaching ABOVE it is safe: the request
+         // simply needs a subset of the saved real pairs. prefill_valid_from() is the conservative
+@@ -4615,8 +4668,10 @@ int main(int argc, char** argv) {
+                         std::string why;
+                         bool eligible = false;
+                         try {
++                            // F2: a prompt point validates against its generation owner's shared backing.
++                            const saved::SavedItem* owner = saved_states.tip_gen_for(cand);
+                             eligible = saved_validate_for_restore(*cand, ids32, req_simgs, cvec_cached, n, g,
+-                                                                  ss, stages, mtp, why);
++                                                                  ss, stages, mtp, why, owner);
+                         } catch (const std::exception& ex) {
+                             std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens validation "
+                                                  "threw (%s): trying shorter\n",
+@@ -4911,18 +4966,35 @@ int main(int argc, char** argv) {
+                     const int64_t sk = (int64_t) cand->ids.size();
+                     std::string why;
+                     try {
++                    // F2: a prompt point mounts from its generation owner's shared backing (main KV as the
++                    // [0, sk) prefix, shared MTP rows as [0, sk-1); recurrent/indexer/boundary/MTP-metadata
++                    // from the prompt itself).
++                    const saved::SavedItem* kv_owner = saved_states.tip_gen_for(cand);
+                     bool ok = cudaDeviceSynchronize() == cudaSuccess;
+                     if (!ok) why = "device not idle";
+-                    if (ok && !saved_restore_stage(ss, g, cand->stages[0], cand->ids, sk, main_cs,
+-                                                   why))
++                    if (ok && !saved_restore_stage(ss, g, cand->stages[0], cand->ids, sk, main_cs, why,
++                                                    kv_owner ? &kv_owner->stages[0] : nullptr))
+                         ok = false;
+                     for (size_t i = 0; ok && i < stages.size(); ++i) {
+                         const strata::core::OnDevice on(stages[i]->dev);
+-                        if (!saved_restore_stage(stages[i]->ss, g, cand->stages[i + 1],
+-                                                 cand->ids, sk, (void*)stages[i]->stream, why))
++                        if (!saved_restore_stage(stages[i]->ss, g, cand->stages[i + 1], cand->ids, sk,
++                                                 (void*) stages[i]->stream, why,
++                                                 kv_owner ? &kv_owner->stages[i + 1] : nullptr))
++                            ok = false;
++                    }
++                    if (ok && kv_owner != nullptr && cand->mtp.kv.empty()) {
++                        // F2 shared MTP rows: upload [0, sk-1) pairs from the owner (no-op when sk <= 1: no
++                        // pair exists yet). kv_restore below then refills the ring from the restored rows.
++                        if (sk <= 1) {
++                            if (cand->mtp.cells != 0) { why = "MTP pair count"; ok = false; }
++                        } else if (kv_owner->mtp.kv.empty() ||
++                                   !saved_restore_kv(mtp.kv_state(), g, kv_owner->mtp.kv[0], sk - 1, nullptr,
++                                                     why)) {
+                             ok = false;
++                        }
++                    } else if (ok && !saved_restore_mtp(mtp, g, cand->mtp, why)) {
++                        ok = false;
+                     }
+-                    if (ok && !saved_restore_mtp(mtp, g, cand->mtp, why)) ok = false;
+                     if (ok) {   // order the streamed-slot resets before any later resolve reads them
+                         if (cudaDeviceSynchronize() != cudaSuccess) { why = "restore sync failed"; ok = false; }
+                         for (size_t i = 0; ok && i < stages.size(); ++i) {
+@@ -5404,6 +5476,12 @@ int main(int argc, char** argv) {
+             int32_t emit_last = 0;
+             int64_t emit_pos = -1, emit_win_q = 0;
+             int emit_win_e = 0;
++            // F2: the prompt-end point of the paired tip - captured after the first window's commit below,
++            // before any generated input is committed. The main KV and the MTP rows are NOT copied here: they
++            // are shared with the post-DONE generation point (see TipEntry). Failures only drop the prompt
++            // point (the generation tip still records).
++            saved::SavedItem f2_prompt;
++            bool f2_prompt_ok = false;
+             // what the session holds once this request is done: the prompt read so far, then every committed token
+             std::vector<int32_t> consumed;
+             consumed.reserve((size_t) (n + max_new + S));
+@@ -5496,6 +5574,98 @@ int main(int argc, char** argv) {
+                 // the window's first e inputs are in the session now (the last EMITTED output is not: the
+                 // post-DONE flush feeds it after DONE is flushed)
+                 for (int i = 0; i < e; ++i) consumed.push_back(window[(size_t) i]);
++                // F2: the prompt-end snapshot for the paired tip. The first window (T = 1) holds ONLY the last
++                // prompt token, so after its commit the session is exactly the prompt end [0, n): no generated
++                // input is committed yet and no decode draft cell is written (mtp.draft runs below). A
++                // speculative multi-row verifier state would NOT be the prompt end - hence the e == 1 gate.
++                // Recurrent/indexer/boundary/MTP-metadata are prompt-only; KV/MTP rows come post-DONE from the
++                // shared generation backing. Finding 5: failures only drop the prompt point.
++                if (first_window && T == 1 && e == 1 && p == n - 1 && !req_aux && o.tip_cache_gib > 0.0 &&
++                    !stop_req.load()) {
++                    // E4: the prompt capture cost lands in snapshot_ms (success and failure paths alike),
++                    // next to the post-DONE root/tip cost below. Decode_ms keeps the first-window overhead.
++                    const auto f2_cap_t0 = Clock::now();
++                    try {
++                        saved::SavedItem pp;
++                        pp.ids.reserve((size_t) n);
++                        for (int64_t i = 0; i < n; ++i) pp.ids.push_back((int32_t) cur[(size_t) i]);
++                        for (const ImgKey& k : req_imgs)
++                            if (k.start < n) pp.imgs.push_back({k.start, k.hash});
++                        pp.cvec = cvec_cached;
++                        pp.n_stages = (int) stages.size() + 1;
++                        {
++                            const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++                            pp.geom.n_qsa_layers = g.n_qsa_layers();
++                            pp.geom.n_head_kv = g.n_head_kv;
++                            pp.geom.head_dim = g.head_dim;
++                            pp.geom.idx_dim = g.idx_key_dim;
++                            pp.geom.idx_block = qs.idx_block;
++                            pp.geom.page_size = qs.page_size;
++                        }
++                        pp.boundary.hc = g.hc;
++                        pp.boundary.n_embd = g.n_embd;
++                        // MTP metadata only (cells/valid_from over [0, n-1)); the rows are shared with the
++                        // post-DONE generation backing, which decode never rewrites below n.
++                        pp.mtp.cells = n > 1 ? n - 1 : 0;
++                        pp.mtp.valid_from = n > 1 ? std::min(mtp.prefill_valid_from(), n - 1) : 0;
++                        if (cudaDeviceSynchronize() != cudaSuccess)
++                            throw std::runtime_error("device not idle");
++                        // the boundary row R_(n-1): this window's single residual row (last stage on a split).
++                        {
++                            const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
++                            const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
++                            pp.boundary.row.assign(hcn, 0.0f);
++                            if (hcn == 0 ||
++                                cudaMemcpy(pp.boundary.row.data(), ver.final_R_all(),
++                                           hcn * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
++                                throw std::runtime_error("prompt boundary copy failed");
++                        }
++                        auto snap_prompt_stage = [&](strata::core::SessionState& ls,
++                                                     saved::StagePayload& out) -> bool {
++                            ConvCheckpoint tmp;
++                            if (!checkpoint_save(tmp, ls, g)) return false;
++                            out.rec.gdn = std::move(tmp.gdn);
++                            out.rec.ple = std::move(tmp.ple);
++                            out.rec.tails = std::move(tmp.tails);
++                            for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
++                                saved::IndexerPayload ix;
++                                if (!saved_snapshot_indexer(ls.qsa_states[i], g, n, ix)) return false;
++                                out.idx.push_back(std::move(ix));
++                            }
++                            return true;
++                        };
++                        saved::StagePayload s0;
++                        if (!snap_prompt_stage(ss, s0)) throw std::runtime_error("prompt state copy failed");
++                        s0.rec.ple_prev[0] = n >= 2 ? pp.ids[(size_t) (n - 2)] : -1;
++                        s0.rec.ple_prev[1] = pp.ids[(size_t) (n - 1)];
++                        pp.stages.push_back(std::move(s0));
++                        for (auto& st : stages) {
++                            const strata::core::OnDevice on(st->dev);
++                            if (cudaDeviceSynchronize() != cudaSuccess)
++                                throw std::runtime_error("stage not idle");
++                            saved::StagePayload sps;
++                            if (!snap_prompt_stage(st->ss, sps))
++                                throw std::runtime_error("prompt stage copy failed");
++                            sps.rec.ple_prev[0] = n >= 2 ? pp.ids[(size_t) (n - 2)] : -1;
++                            sps.rec.ple_prev[1] = pp.ids[(size_t) (n - 1)];
++                            pp.stages.push_back(std::move(sps));
++                        }
++                        f2_prompt = std::move(pp);
++                        f2_prompt_ok = true;
++                    } catch (const std::exception& ex) {
++                        std::fprintf(stderr, "strata serve: SavedState prompt snapshot at %lld tokens failed "
++                                             "(%s): generation tip only\n",
++                                     (long long) n, ex.what());
++                        f2_prompt_ok = false;
++                    } catch (...) {
++                        std::fprintf(stderr, "strata serve: SavedState prompt snapshot at %lld tokens failed: "
++                                             "generation tip only\n",
++                                     (long long) n);
++                        f2_prompt_ok = false;
++                    }
++                    saved_stats.snapshot_ms +=
++                        std::chrono::duration<double, std::milli>(Clock::now() - f2_cap_t0).count();
++                }
+                 draft_offered += T - 1;
+                 draft_accepted += a;
+                 first_window = false;
+@@ -5731,12 +5901,26 @@ int main(int argc, char** argv) {
+                 // required, so tips work with --prompt-cache 0; final review: the boundary repair row is
+                 // required - a tip without R_(L-1) leaves E2 unable to pair cell L-1. Finding 5: failures only
+                 // drop the tip).
++                // F2: one tip LINE holds both restorable points - the prompt end (snapshotted after the first
++                // window's commit, sharing this generation's KV/MTP backing) and the generation end (below).
++                // Coherence is pre-checked on CPU before either item moves; an incoherent pair still records
++                // the generation tip alone. A stop after the prompt snapshot only (no generated tokens) leaves
++                // live == prompt: not a pair (strict prefix required), so the single-point path records it.
+                 if (boundary_ok && mtp_ok && !flush_R.empty() && !req_aux && o.tip_cache_gib > 0.0 &&
+                     !live.empty()) {
+                     saved::SavedItem tip;
+                     if (saved_snapshot((int64_t) live.size(), live, live_imgs, cvec_cached, flush_R.data(),
+                                        g.hc, g.n_embd, tip)) {
+-                        saved_states.insert_tip(std::move(tip), false);
++                        if (f2_prompt_ok && (int64_t) live.size() > n &&
++                            saved::prompt_for_shared_ok(f2_prompt, tip)) {
++                            if (!saved_states.insert_tip_pair(std::move(f2_prompt), std::move(tip), false))
++                                std::fprintf(stderr, "strata serve: SavedState paired tip at %lld+%lld tokens "
++                                                     "rejected\n",
++                                             (long long) n, (long long) live.size());
++                        } else if (!saved_states.insert_tip(std::move(tip), false)) {
++                            std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
++                                         (long long) live.size());
++                        }
+                     } else {
+                         std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
+                                      (long long) live.size());
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index a1bc600..e2ba27c 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -57,24 +57,68 @@ bool SavedStateStore::insert_tip(SavedItem item, bool is_aux) {
+     if ((int)item.stages.size() != n_stages_ || item.n_stages != n_stages_) return false;
+     if (!item.complete()) return false;   // finding 5: never store an inconsistent/incomplete payload
+     if (item.ids.empty()) return false;   // resume 0 is "read from the start": nothing to save
+-    item.kind = Kind::Tip;
+-    item.bytes = item.payload_bytes();
+-    item.last_use = ++clock_;
+-    for (SavedItem& t : tips_) {
+-        if (same_key(t, item)) {
++    TipEntry e;
++    e.gen = std::move(item);
++    e.gen.kind = Kind::Tip;
++    e.has_prompt = false;
++    e.bytes = e.entry_bytes();
++    e.last_use = ++clock_;
++    e.gen.bytes = e.gen.payload_bytes();   // the store sets point metadata (single-point entry: entry == gen)
++    e.gen.last_use = e.last_use;
++    for (TipEntry& t : tips_) {
++        if (same_key(t.gen, e.gen)) {
+             tip_bytes_ -= t.bytes;
+-            t = std::move(item);
++            t = std::move(e);
+             tip_bytes_ += t.bytes;
+             evict_tips();
+             return true;
+         }
+     }
+-    tip_bytes_ += item.bytes;
+-    tips_.push_back(std::move(item));
++    tip_bytes_ += e.bytes;
++    tips_.push_back(std::move(e));
+     evict_tips();
+     return true;
+ }
+ 
++bool SavedStateStore::insert_tip_pair(SavedItem prompt, SavedItem gen, bool is_aux) {
++    if (is_aux) return false;   // S1: aux lines get no tip and never evict a main line
++    if ((int)gen.stages.size() != n_stages_ || gen.n_stages != n_stages_) return false;
++    if ((int)prompt.stages.size() != n_stages_ || prompt.n_stages != n_stages_) return false;
++    if (gen.ids.empty() || prompt.ids.empty()) return false;   // resume 0 reads from the start
++    TipEntry e;
++    e.prompt = std::move(prompt);
++    e.gen = std::move(gen);
++    e.prompt.kind = Kind::Tip;
++    e.gen.kind = Kind::Tip;
++    e.has_prompt = true;
++    if (!e.complete()) return false;   // F2 gate: incoherent pairs (incl. duplicate-KV prompts) never store
++    e.bytes = e.entry_bytes();   // shared KV/MTP rows counted once (they only exist in gen); both recs counted
++    e.last_use = ++clock_;
++    e.gen.bytes = e.gen.payload_bytes();   // the store sets each point's own metadata consistently
++    e.gen.last_use = e.last_use;
++    e.prompt.bytes = e.prompt.payload_bytes();
++    e.prompt.last_use = e.last_use;
++    for (TipEntry& t : tips_) {
++        if (same_key(t.gen, e.gen)) {
++            tip_bytes_ -= t.bytes;
++            t = std::move(e);
++            tip_bytes_ += t.bytes;
++            evict_tips();
++            return true;
++        }
++    }
++    tip_bytes_ += e.bytes;
++    tips_.push_back(std::move(e));
++    evict_tips();
++    return true;
++}
++
++size_t SavedStateStore::tip_points() const {
++    size_t n = 0;
++    for (const TipEntry& t : tips_) n += t.has_prompt ? 2 : 1;
++    return n;
++}
++
+ const SavedItem* SavedStateStore::find_best(const std::vector<int32_t>& ids,
+                                             const std::vector<ImgKey>& imgs, bool cvec) const {
+     return find_best_except(ids, imgs, cvec, {});
+@@ -98,7 +142,12 @@ const SavedItem* SavedStateStore::find_best_except(const std::vector<int32_t>& i
+         if (best == nullptr || it.ids.size() > best->ids.size()) best = &it;
+     };
+     for (const SavedItem& r : roots_) consider(r);
+-    for (const SavedItem& t : tips_) consider(t);
++    // F2: every paired tip offers BOTH points; resume takes the longest valid one across both. The skip set
++    // holds sub-item pointers (prompt or gen members); each retires independently, so the F1 walk terminates.
++    for (const TipEntry& t : tips_) {
++        consider(t.gen);
++        if (t.has_prompt) consider(t.prompt);
++    }
+     return best;
+ }
+ 
+@@ -114,8 +163,10 @@ const SavedItem* SavedStateStore::find_exact(const std::vector<int32_t>& ids, co
+     };
+     for (const SavedItem& r : roots_)
+         if (matches(r)) return &r;
+-    for (const SavedItem& t : tips_)
+-        if (matches(t)) return &t;
++    for (const TipEntry& t : tips_) {
++        if (t.has_prompt && matches(t.prompt)) return &t.prompt;
++        if (matches(t.gen)) return &t.gen;
++    }
+     return nullptr;
+ }
+ 
+@@ -126,14 +177,25 @@ bool SavedStateStore::note_use(const SavedItem* it) {
+             r.last_use = ++clock_;
+             return true;
+         }
+-    for (SavedItem& t : tips_)
+-        if (&t == it) {
++    // F2: a mount of either point refreshes the LINE and both points' metadata, so the pair evicts
++    // coherently and inventory rows stay fresh.
++    for (TipEntry& t : tips_)
++        if (&t.gen == it || (t.has_prompt && &t.prompt == it)) {
+             t.last_use = ++clock_;
++            t.gen.last_use = t.last_use;
++            if (t.has_prompt) t.prompt.last_use = t.last_use;
+             return true;
+         }
+     return false;
+ }
+ 
++const SavedItem* SavedStateStore::tip_gen_for(const SavedItem* p) const {
++    if (p == nullptr) return nullptr;
++    for (const TipEntry& t : tips_)
++        if (t.has_prompt && &t.prompt == p) return &t.gen;
++    return nullptr;
++}
++
+ size_t SavedStateStore::drop_non_pinned() {    const size_t n = tips_.size();
+     tips_.clear();
+     tip_bytes_ = 0;
+@@ -142,9 +204,14 @@ size_t SavedStateStore::drop_non_pinned() {    const size_t n = tips_.size();
+ 
+ std::vector<InventoryEntry> SavedStateStore::inventory() const {
+     std::vector<InventoryEntry> out;
+-    out.reserve(roots_.size() + tips_.size());
++    out.reserve(roots_.size() + tip_points());
+     for (const SavedItem& r : roots_) out.push_back({Kind::Root, r.ids.size(), r.bytes, r.last_use});
+-    for (const SavedItem& t : tips_) out.push_back({Kind::Tip, t.ids.size(), t.bytes, t.last_use});
++    // F2: a paired tip lists both points (prompt, then generation); their stored bytes sum to the entry
++    // bytes (the shared KV/MTP rows sit in the gen row only).
++    for (const TipEntry& t : tips_) {
++        if (t.has_prompt) out.push_back({Kind::Tip, t.prompt.ids.size(), t.prompt.bytes, t.prompt.last_use});
++        out.push_back({Kind::Tip, t.gen.ids.size(), t.gen.bytes, t.gen.last_use});
++    }
+     return out;
+ }
+ 
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index aceae6d..7f2debe 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -24,6 +24,11 @@
+ // test's working directory (inside the workspace build tree): the real default root dir is never
+ // touched here.
+ //
++// F2 (BRIEF-CACHE-FIX-1): one tip line holds TWO coherent restorable points - the prompt end (exact n, for
++// re-rendered next turns and forked children) and the generation end (for verbatim echoes). The prompt point
++// shares the generation KV (no duplicate copy) with prompt-only recurrent/indexer/boundary/MTP payloads; the
++// entry counts both recs + the shared KV once and evicts coherently. CPU store tests only, no parity asserts.
++//
+ // Implemented: Muse / reviewed: Sol.
+ #include "strata/program/saved_state.hpp"
+ 
+@@ -35,6 +40,7 @@
+ #include <functional>
+ #include <string>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ namespace saved = strata::program::saved_state;
+@@ -162,8 +168,8 @@ saved::SavedItem make_line(int L, int base) {
+     saved::StagePayload sp;
+     sp.rec.gdn = {7, 9};
+     sp.rec.tails = {8};
+-    sp.rec.ple_prev[0] = L >= 2 ? L - 2 : -1;
+-    sp.rec.ple_prev[1] = L - 1;
++    sp.rec.ple_prev[0] = L >= 2 ? base + L - 2 : -1;
++    sp.rec.ple_prev[1] = base + L - 1;
+     const size_t code = (size_t) ((L + 3) / 4) * 64;   // ceil(L/4) pages * 64 B
+     saved::KvLayerPayload kv;
+     kv.fmt = saved::kKvF16;
+@@ -200,6 +206,8 @@ saved::SavedItem make_int8_line(int L, int base) {
+     sp.rec.gdn = {7};
+     sp.rec.ple = {1, 2, 3};
+     sp.rec.tails = {8};
++    sp.rec.ple_prev[0] = L >= 2 ? base + L - 2 : -1;
++    sp.rec.ple_prev[1] = base + L - 1;
+     const size_t pages = (size_t) ((L + 7) / 8);
+     saved::KvLayerPayload kv;
+     kv.fmt = saved::kKvInt8;
+@@ -239,6 +247,8 @@ saved::SavedItem make_q4_line(int L, int base) {
+     saved::StagePayload sp;
+     sp.rec.gdn = {7};
+     sp.rec.tails = {8};
++    sp.rec.ple_prev[0] = L >= 2 ? base + L - 2 : -1;
++    sp.rec.ple_prev[1] = base + L - 1;
+     const size_t pages = (size_t) ((L + 7) / 8);
+     saved::KvLayerPayload kv;
+     kv.fmt = saved::kKvQ4;
+@@ -269,6 +279,40 @@ std::vector<int32_t> req_at(int base, int n) {
+     return v;
+ }
+ 
++// ---- F2 fixtures -----------------------------------------------------------
++//
++// A prompt-end point for the first n ids of a gen line (same base, so it is a strict prefix of the gen ids):
++// own recurrent/indexer/boundary/MTP payloads (prompt-only, marker-filled to prove no aliasing with the
++// generation state), EMPTY main KV (it shares the generation storage - no duplicate copy).
++saved::SavedItem make_prompt_item(int n, int base) {
++    saved::SavedItem it = make_line(n, base);
++    for (saved::StagePayload& s : it.stages) s.kv.clear();   // shared: the prompt stores no KV copy
++    for (saved::StagePayload& s : it.stages) {
++        if (!s.rec.gdn.empty()) s.rec.gdn[0] = 0xA1;
++        if (!s.rec.tails.empty()) s.rec.tails[0] = 0xA2;
++        for (saved::IndexerPayload& x : s.idx) {
++            if (!x.pooled.empty()) x.pooled[0] = 0xA3;
++            if (!x.dead_key.empty()) x.dead_key[0] = 0xA4;
++        }
++    }
++    if (!it.boundary.row.empty()) it.boundary.row[0] = 1.5f;   // R_(n-1), not the generation row
++    if (!it.mtp.kv.empty()) {
++        if (!it.mtp.kv[0].k.empty()) it.mtp.kv[0].k[0] = 0xA5;   // own exact [0, n-1) pairs
++        if (!it.mtp.kv[0].v.empty()) it.mtp.kv[0].v[0] = 0xA6;
++    }
++    return it;
++}
++
++// F2 shared-MTP prompt: the engine keeps no second draft-KV copy - rows [0, n-1) come from the generation
++// backing (immutable during decode); only cells/valid_from metadata is the prompt's own.
++saved::SavedItem make_shared_prompt_item(int n, int base) {
++    saved::SavedItem it = make_prompt_item(n, base);
++    it.mtp.kv.clear();
++    it.mtp.cells = n - 1;
++    it.mtp.valid_from = 0;
++    return it;
++}
++
+ // A mutated copy must fail complete() AND be refused by insert_tip (the store's structural gate).
+ void rejects(saved::SavedItem good, const std::function<void(saved::SavedItem&)>& mut, const char* what,
+              const char* what_ins) {
+@@ -627,6 +671,238 @@ int main() {
+         check(st.find_best(req_at(0, 45), no_imgs, true)->kind == saved::Kind::Root,
+               "short request still finds the root");
+     }
++    {   // F2: a re-rendered assistant turn resumes at the prompt point, suffix = rendered assistant + new
++        // user only. Parent line: prompt 60 + 40 generated (reasoning) = gen 100. The next request renders
++        // the assistant WITHOUT the reasoning (diverges at 60), so the generation point is not a prefix.
++        saved::SavedStateStore st;
++        check(saved::prompt_for_shared_ok(make_prompt_item(60, 0), make_line(100, 0)),
++              "F2 prompt/gen pair is coherent");
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 paired tip stores");
++        check(st.tips() == 1 && st.tip_points() == 2, "F2 one line holds two restorable points");
++        std::vector<int32_t> next = req_at(0, 60);
++        for (int i = 0; i < 20; ++i) next.push_back(1000 + i);   // re-rendered assistant + new user
++        const saved::SavedItem* b = st.find_best(next, no_imgs, true);
++        check(b != nullptr && b->ids.size() == 60, "F2 re-rendered turn resumes at the prompt point (60)");
++        check(b != nullptr && (int64_t) next.size() - (int64_t) b->ids.size() == 20,
++              "F2 suffix is the rendered assistant + new user only");
++        check(st.find_exact(next, no_imgs, true, 100) == nullptr,
++              "F2 generation point is not a prefix of the re-rendered prompt");
++        const saved::SavedItem* pe = st.find_exact(next, no_imgs, true, 60);
++        check(pe != nullptr && pe->ids.size() == 60, "F2 prompt point exact-addressable at 60");
++        check(pe != nullptr && pe->stages[0].kv.empty(), "F2 prompt stores no KV copy (shared)");
++        check(pe != nullptr && !pe->boundary.row.empty() && pe->boundary.row[0] == 1.5f,
++              "F2 prompt boundary is prompt-only R_(n-1), not the generation row");
++        check(pe != nullptr && pe->stages[0].rec.gdn[0] == 0xA1 && pe->stages[0].rec.tails[0] == 0xA2,
++              "F2 prompt recurrent state is prompt-only (no aliasing)");
++        check(pe != nullptr && pe->mtp.cells == 59, "F2 prompt MTP covers the exact [0, n-1) pairs");
++    }
++    {   // F2: a verbatim echo of the generated ids takes the LONGER generation point (longest valid
++        // point across both). Its boundary/recurrent state are the generation's own.
++        saved::SavedStateStore st;
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 paired tip stores");
++        const saved::SavedItem* b = st.find_best(req_at(0, 120), no_imgs, true);
++        check(b != nullptr && b->ids.size() == 100, "F2 verbatim echo resumes at the generation point (100)");
++        check(b != nullptr && !b->boundary.row.empty() && b->boundary.row[0] == 0.5f,
++              "F2 generation point keeps its own boundary row");
++        check(b != nullptr && !b->stages[0].kv.empty(), "F2 generation point owns the shared KV");
++    }
++    {   // F2: the prompt point survives an unrelated child line (store-level, independent of the chain).
++        saved::SavedStateStore st;
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 parent pair stores");
++        check(st.insert_tip(make_line(75, 5000), false), "F2 unrelated child tip stores alongside");
++        check(st.tips() == 2 && st.tip_points() == 3, "F2 lines and points coexist");
++        std::vector<int32_t> parent_next = req_at(0, 60);
++        for (int i = 0; i < 10; ++i) parent_next.push_back(2000 + i);
++        const saved::SavedItem* bp = st.find_best(parent_next, no_imgs, true);
++        check(bp != nullptr && bp->ids.size() == 60 && bp->ids[0] == 0,
++              "F2 parent turn still finds its prompt point after child traffic");
++        const saved::SavedItem* bc = st.find_best(req_at(5000, 90), no_imgs, true);
++        check(bc != nullptr && bc->ids.size() == 75 && bc->ids[0] == 5000, "F2 child line finds its own tip");
++    }
++    {   // F2: shared-KV accounting and coherent eviction. Entry bytes = gen + prompt (KV once, both recs);
++        // budget pressure evicts the whole LINE - neither point survives alone.
++        saved::SavedStateStore st;
++        saved::SavedItem pr = make_prompt_item(60, 0);
++        saved::SavedItem gn = make_line(100, 0);
++        for (const saved::StagePayload& s : pr.stages) check(s.kv.empty(), "F2 prompt holds no KV copy");
++        const uint64_t expect = gn.payload_bytes() + pr.payload_bytes();
++        check(st.insert_tip_pair(std::move(pr), std::move(gn), false), "F2 paired tip stores");
++        check(st.tip_bytes() == expect, "F2 entry bytes are gen + prompt (shared KV once)");
++        check(st.tip_bytes() < 2 * make_line(100, 0).payload_bytes(), "F2 shared KV is not duplicated");
++        auto inv = st.inventory();
++        check(inv.size() == 2 && inv[0].ids_len == 60 && inv[1].ids_len == 100,
++              "F2 inventory lists both points (prompt, then generation)");
++        check(inv[0].bytes + inv[1].bytes == st.tip_bytes(), "F2 inventory bytes sum to the entry bytes");
++        st.set_tip_budget_bytes(st.tip_bytes());   // exactly full with line A
++        check(st.insert_tip_pair(make_prompt_item(40, 5000), make_line(80, 5000), false), "F2 line B stores");
++        check(st.tips() == 1, "F2 pressure evicts the whole older line");
++        std::vector<int32_t> a_next = req_at(0, 60);
++        a_next.push_back(9999);
++        check(st.find_best(a_next, no_imgs, true) == nullptr, "F2 evicted prompt point is gone");
++        check(st.find_best(req_at(0, 100), no_imgs, true) == nullptr,
++              "F2 evicted generation point is gone too (coherent)");
++        const saved::SavedItem* bb = st.find_best(req_at(5000, 90), no_imgs, true);
++        check(bb != nullptr && bb->ids.size() == 80, "F2 surviving line B resumes at its generation point");
++    }
++    {   // F2: mounting the PROMPT point refreshes the line (LRU counts mounts, not just inserts) - the pair
++        // survives together while the stale line is the victim.
++        saved::SavedStateStore st;
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 line A stores");
++        check(st.insert_tip(make_line(40, 5000), false), "F2 line B stores");
++        st.set_tip_budget_bytes(st.tip_bytes());   // exactly full
++        std::vector<int32_t> a_next = req_at(0, 60);
++        a_next.push_back(7777);
++        const saved::SavedItem* pa = st.find_best(a_next, no_imgs, true);
++        check(pa != nullptr && pa->ids.size() == 60 && st.note_use(pa),
++              "F2 mounting the prompt point refreshes its line");
++        check(st.insert_tip(make_line(30, 9000), false), "F2 line C stores under the full budget");
++        check(st.find_best(a_next, no_imgs, true) != nullptr, "F2 refreshed prompt point survives");
++        check(st.find_exact(req_at(0, 110), no_imgs, true, 100) != nullptr,
++              "F2 generation point survives with its prompt");
++        check(st.find_best(req_at(5000, 60), no_imgs, true) == nullptr, "F2 stale B is the LRU victim");
++    }
++    {   // F2: kv_prefix_ok - exact, longer backing (prompt prefix of generation), and rejections.
++        const saved::SavedItem gen = make_line(100, 0);   // fp16 gA: k/v ceil(100/4)*64 = 1600 B
++        const saved::KvLayerPayload& kv = gen.stages[0].kv[0];
++        check(saved::kv_prefix_ok(kv, 100, gen.geom), "F2 prefix_ok holds exactly");
++        check(saved::kv_prefix_ok(kv, 60, gen.geom), "F2 prefix_ok holds for the shorter prompt range");
++        check(saved::kv_prefix_ok(kv, 1, gen.geom), "F2 prefix_ok holds for one cell");
++        check(!saved::kv_prefix_ok(kv, 101, gen.geom), "F2 prefix past the backing rejected");
++        check(!saved::kv_prefix_ok(kv, 0, gen.geom), "F2 zero cells rejected");
++        saved::KvLayerPayload short_kv = kv;
++        short_kv.k.pop_back();
++        check(!saved::kv_prefix_ok(short_kv, 100, gen.geom), "F2 truncated backing rejected");
++        saved::KvLayerPayload bad_fmt = kv;
++        bad_fmt.fmt = 7;
++        check(!saved::kv_prefix_ok(bad_fmt, 60, gen.geom), "F2 unknown format rejected");
++        const saved::SavedItem i8 = make_int8_line(9, 0);
++        check(saved::kv_prefix_ok(i8.stages[0].kv[0], 9, i8.geom), "F2 int8 prefix_ok holds exactly");
++        saved::KvLayerPayload noscale = i8.stages[0].kv[0];
++        noscale.ks.clear();
++        check(!saved::kv_prefix_ok(noscale, 9, i8.geom), "F2 int8 without scales rejected");
++    }
++    {   // F2 shared-MTP pair (the engine form): the prompt keeps cells/valid_from metadata only, rows come
++        // from the generation backing - entry bytes drop by the second MTP copy, both points still restore.
++        saved::SavedStateStore st;
++        saved::SavedItem gen = make_line(100, 0);
++        saved::SavedItem shr = make_shared_prompt_item(60, 0);
++        check(shr.mtp.kv.empty() && shr.mtp.cells == 59, "F2 shared prompt carries MTP metadata only");
++        check(saved::prompt_for_shared_ok(shr, gen), "F2 shared-MTP pair is coherent");
++        const uint64_t owned_bytes = make_prompt_item(60, 0).payload_bytes() + gen.payload_bytes();
++        check(st.insert_tip_pair(std::move(shr), std::move(gen), false), "F2 shared-MTP pair stores");
++        check(st.tip_bytes() < owned_bytes, "F2 shared MTP rows are not copied twice");
++        std::vector<int32_t> next = req_at(0, 60);
++        for (int i = 0; i < 20; ++i) next.push_back(1000 + i);
++        const saved::SavedItem* b = st.find_best(next, no_imgs, true);
++        check(b != nullptr && b->ids.size() == 60 && b->mtp.kv.empty() && b->mtp.cells == 59,
++              "F2 re-rendered turn resumes at the shared-MTP prompt point");
++        check(st.find_best(req_at(0, 120), no_imgs, true)->ids.size() == 100,
++              "F2 verbatim echo still takes the generation point");
++        // owner accessor: prompt -> gen; gen/root/foreign -> null.
++        const saved::SavedItem* ge = st.find_exact(req_at(0, 120), no_imgs, true, 100);
++        check(ge != nullptr && st.tip_gen_for(b) == ge, "F2 tip_gen_for maps prompt to its owner");
++        check(st.tip_gen_for(ge) == nullptr, "F2 tip_gen_for(null) for a generation point");
++        check(st.tip_gen_for(nullptr) == nullptr, "F2 tip_gen_for(null) is null");
++        saved::SavedItem foreign = make_line(60, 0);
++        check(st.tip_gen_for(&foreign) == nullptr, "F2 tip_gen_for(foreign) is null");
++        // a shared prompt with wrong metadata still rejected (cells must be exactly n-1).
++        saved::SavedItem bad = make_shared_prompt_item(60, 0);
++        bad.mtp.cells = 58;
++        check(!st.insert_tip_pair(std::move(bad), make_line(100, 0), false) && st.tips() == 1,
++              "F2 shared prompt with short cells rejected");
++    }
++    {   // F2 shared-MTP coverage: the backing must really hold every row the prompt claims - an owner
++        // valid_from above the prompt's means the prompt claims rows absent from the backing.
++        saved::SavedItem gen = make_line(100, 0);
++        check(gen.complete(), "F2 coverage fixture itself is complete");
++        gen.mtp.valid_from = 5;
++        saved::SavedItem shr = make_shared_prompt_item(60, 0);   // valid_from 0 < owner 5
++        check(!saved::prompt_for_shared_ok(shr, gen), "F2 owner bound above prompt rejected");
++        saved::SavedItem shr_eq = make_shared_prompt_item(60, 0);
++        shr_eq.mtp.valid_from = 5;   // equal backing bound accepted
++        check(saved::prompt_for_shared_ok(shr_eq, gen), "F2 equal backing bound accepted");
++        saved::SavedItem shr_lo = make_shared_prompt_item(60, 0);
++        shr_lo.mtp.valid_from = 9;   // lower backing bound (owner covers more) accepted
++        check(saved::prompt_for_shared_ok(shr_lo, gen), "F2 lower backing bound accepted");
++        saved::SavedStateStore st;
++        check(st.insert_tip_pair(std::move(shr_eq), std::move(gen), false),
++              "F2 equal-bound shared pair stores");
++    }
++    {   // F2 point metadata: the store sets each point's bytes/last_use (prior API contract); note_use
++        // refreshes the entry AND both points together.
++        saved::SavedStateStore st;
++        check(st.insert_tip_pair(make_shared_prompt_item(60, 0), make_line(100, 0), false),
++              "F2 pair stores");
++        const saved::SavedItem* pe = st.find_exact(req_at(0, 70), no_imgs, true, 60);
++        const saved::SavedItem* ge = st.find_exact(req_at(0, 120), no_imgs, true, 100);
++        check(pe != nullptr && ge != nullptr, "F2 both points addressable");
++        check(pe->bytes == pe->payload_bytes() && ge->bytes == ge->payload_bytes(),
++              "F2 store sets each point's bytes");
++        check(pe->last_use > 0 && ge->last_use > 0 && pe->last_use == ge->last_use,
++              "F2 store sets both points' last_use consistently");
++        check(pe->bytes + ge->bytes == st.tip_bytes(), "F2 point bytes sum to the entry bytes");
++        check(st.note_use(pe), "F2 note_use(prompt) succeeds");
++        check(pe->last_use == ge->last_use && pe->last_use == st.clock(),
++              "F2 note_use refreshes both points plus the entry clock");
++    }
++    {   // F2 x F1: the retry walk composes with pairs - longest-first over gen, prompt, then the root, with
++        // each sub-point retiring independently so the walk always terminates on the eligible root.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_line(40, 0)), "F2 root(40) stores");
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 pair(60,100) stores");
++        std::vector<const saved::SavedItem*> skip;
++        std::vector<int> seen;
++        for (;;) {
++            const saved::SavedItem* cand = st.find_best_except(req, no_imgs, true, skip);
++            if (cand == nullptr) break;
++            seen.push_back((int) cand->ids.size());
++            skip.push_back(cand);
++        }
++        check(seen == std::vector<int>{100, 60, 40}, "F2 walk visits gen, prompt, then root (no revisit)");
++    }
++    {   // F2: incoherent pairs never store; aux pair inserts are a strict no-op (clock frozen); exact
++        // duplicates replace in place; a single insert over a paired gen key replaces the whole entry.
++        saved::SavedStateStore st;
++        {
++            saved::SavedItem bad = make_line(60, 0);   // a full KV copy is NOT shared storage
++            check(!st.insert_tip_pair(std::move(bad), make_line(100, 0), false) && st.tips() == 0,
++                  "F2 duplicate-KV prompt rejected");
++        }
++        {
++            saved::SavedItem bad = make_prompt_item(60, 0);
++            bad.ids[59] = 9999;   // prompt is not the exact prompt end of the gen line
++            check(!st.insert_tip_pair(std::move(bad), make_line(100, 0), false) && st.tips() == 0,
++                  "F2 non-prefix prompt rejected");
++        }
++        check(!st.insert_tip_pair(make_prompt_item(100, 0), make_line(100, 0), false) && st.tips() == 0,
++              "F2 prompt == gen length rejected (strict prefix required)");
++        {
++            saved::SavedItem bad = make_prompt_item(60, 0);
++            bad.mtp.cells = 99;   // MTP range disagrees with the prompt end
++            check(!st.insert_tip_pair(std::move(bad), make_line(100, 0), false) && st.tips() == 0,
++                  "F2 wrong-range prompt MTP rejected");
++        }
++        {
++            saved::SavedItem bad = make_prompt_item(60, 0);
++            bad.stages[0].idx[0].pooled_rows += 1;   // indexer sized for generation, not the prompt
++            check(!st.insert_tip_pair(std::move(bad), make_line(100, 0), false) && st.tips() == 0,
++                  "F2 generation-sized prompt indexer rejected");
++        }
++        saved::SavedStateStore st2;
++        check(st2.clock() == 0, "F2 fresh clock is 0");
++        check(!st2.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), true),
++              "F2 aux pair insert returns false");
++        check(st2.tips() == 0 && st2.clock() == 0, "F2 aux pair stores nothing and freezes the clock");
++        saved::SavedStateStore st3;
++        check(st3.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 pair stores");
++        const uint64_t b0 = st3.tip_bytes();
++        check(st3.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false),
++              "F2 duplicate pair returns true");
++        check(st3.tips() == 1 && st3.tip_points() == 2 && st3.tip_bytes() == b0,
++              "F2 duplicate pair replaces in place (no growth)");
++        check(st3.insert_tip(make_line(100, 0), false), "F2 single over the paired gen key returns true");
++        check(st3.tips() == 1 && st3.tip_points() == 1, "F2 single replaces the pair (downgrade)");
++    }
+     {   // E5: exact-duplicate replacement refreshes in place (one recent tip per line for re-runs).
+         saved::SavedStateStore st;
+         check(st.insert_tip(make_line(50, 1000), false), "tip stores");
+-- 
+2.54.0.windows.1
+

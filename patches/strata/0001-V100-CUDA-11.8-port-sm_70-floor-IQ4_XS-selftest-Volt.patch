@@ -1,0 +1,645 @@
+From 324934909836d1ea0d8e7949268cf62a115ce278 Mon Sep 17 00:00:00 2001
+From: Muse <muse@local>
+Date: Tue, 29 Sep 2026 17:05:58 +0900
+Subject: [PATCH 01/16] V100/CUDA 11.8 port: sm_70 floor, IQ4_XS selftest,
+ Volta setup path, Windows compile fixes
+
+- CMake: allow sm_70+ (was sm_80+), CUDA C++17 for nvcc 11.8, shared
+  cudart (fixes LNK2005), enable_testing so ctest parity works,
+  native_expert_parity --selftest registered.
+- Kernels: IQ4_XS (type 23) synthetic --selftest in
+  native_expert_parity (no GGUF needed); sm_70 QSA fallback path.
+- setup.py: per-GPU CUDA selection (cu11 wheels / driver 452+ /
+  toolkit 11.8 on Volta, upstream cu13 otherwise), nvidia-smi
+  fallback for old drivers without compute_cap query.
+- Windows/CUDA 11.8 compile fixes: 5-arg cudaGraphInstantiate,
+  cudaSetDeviceFlags instead of cudaInitDevice (remote_experts),
+  device arch floor message.
+---
+ CMakeLists.txt                        |  31 +++++--
+ include/strata/kernels/iq_kernels.hpp |   2 +-
+ setup.py                              | 113 ++++++++++++++++++------
+ src/core/device.cu                    |  14 +--
+ src/core/mtp.cpp                      |   2 +-
+ src/core/remote_experts.cpp           |   5 ++
+ src/core/session.cpp                  |   4 +-
+ src/core/verify.cpp                   |   4 +-
+ src/kernels/elementwise_parity.cpp    |   2 +-
+ src/kernels/native_expert_parity.cpp  | 121 +++++++++++++++++++++++++-
+ src/kernels/qsa_parity.cpp            |   4 +-
+ 11 files changed, 248 insertions(+), 54 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1e876dd..e6b8d9b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,12 +4,15 @@
+ # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
+ # claim something the tree does not have, which is worse than an absent target.
+ #
+-# CUDA targets arrive in Phase 2 and this build REJECTS any architecture other than 120: the engine is
+-# written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
+-# binary that runs and is wrong about its own performance, which is the worst of both outcomes.
++# CUDA targets arrive in Phase 2 and this build REJECTS anything below sm_70: the engine is developed
++# against sm_120 (RTX 5000 / Blackwell), and silently building for an older arch would produce a binary
++# that runs and is wrong about its own performance, which is the worst of both outcomes.
+ cmake_minimum_required(VERSION 3.24)
+ project(strata VERSION 0.1.21 LANGUAGES CXX)
+ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
++# The parity/selftest add_test() calls are unconditional, so enable ctest even when the (unpublished)
++# tests/ suite is absent: `ctest -R parity` must work from a source checkout.
++enable_testing()
+ # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
+ # be read back to the exact source line
+ if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
+@@ -28,6 +31,12 @@ endif()
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
++# CUDA 11.8's nvcc accepts at most -std=c++17, and CMake propagates the project
++# CXX standard (CUDA20) to NVCC.  Host C++ stays C++20; device code builds as
++# C++17 (verified the .cu TUs use no C++20-only constructs).
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_EXTENSIONS OFF)
+ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+ endif()
+@@ -43,6 +52,10 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
+ 
+ if(STRATA_ENABLE_CUDA)
+   enable_language(CUDA)
++  # The MMQ static lib needs a device link, and CMake's device link pulls the runtime from
++  # CMAKE_CUDA_RUNTIME_LIBRARY (default: static) while every target here links CUDA::cudart (shared):
++  # both runtimes on one link line is LNK2005.  Shared is also what setup.py ships (pip's cudart DLLs).
++  set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
+   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
+   find_package(CUDAToolkit REQUIRED)
+@@ -51,14 +64,15 @@ if(STRATA_ENABLE_CUDA)
+   endif()
+   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
+-    # Plan v0.3 P6: developed and measured on sm_120 (RTX 50); the kernels need sm_80 or newer (tf32 mma in
+-    # the attention scorer, bf16 math), so RTX 30 (86) and RTX 40 (89) build too.  Older cards are refused.
++    # Plan v0.3 P6: developed and measured on sm_120 (RTX 50).  The kernels are plain CUDA everywhere except
++    # the QSA scorer, which uses ldmatrix + tf32 MMA only on sm_80+ (a warp-FMA fallback covers sm_70/sm_75), so
++    # RTX 30 (86) / 40 (89) build and so do Volta cards (70, e.g. Tesla V100).  Older cards are refused.
+     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
+       continue()
+     endif()
+-    if(_base LESS 80 AND NOT STRATA_EXPERIMENTAL_SM75)   # the A/B of a Turing card as a layer-split stage
++    if(_base LESS 70)
+       message(FATAL_ERROR
+-        "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
++        "Strata needs an NVIDIA GPU of compute capability 7.0 or newer (Volta or newer, e.g. Tesla V100), but "
+         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
+     endif()
+   endforeach()
+@@ -113,7 +127,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
+ 
+ # ---- strata_core (CUDA, Phase 2) ------------------------------------------
+ # Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit.  The arch
+-# guard above has already refused anything but sm_120 by the time this runs.
++# guard above has already refused anything below sm_70 by the time this runs.
+ if(STRATA_ENABLE_CUDA)
+   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
+                                src/core/layout.cpp)
+@@ -559,6 +573,7 @@ if(STRATA_NATIVE_EXPERTS)
+     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
+     target_include_directories(native_expert_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact CUDA::cudart)
++    add_test(NAME native_expert_parity COMMAND native_expert_parity --selftest)
+   endif()
+ endif()
+ 
+diff --git a/include/strata/kernels/iq_kernels.hpp b/include/strata/kernels/iq_kernels.hpp
+index 020d78d..0562bbc 100644
+--- a/include/strata/kernels/iq_kernels.hpp
++++ b/include/strata/kernels/iq_kernels.hpp
+@@ -1,5 +1,5 @@
+ // include/strata/kernels/iq_kernels.hpp - the i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+-// IQ4_NL) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files.
++// IQ4_NL, IQ4_XS) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files.
+ //
+ // The block layouts, codebook grids and dot products are llama.cpp's (ggml-common.h, ggml-cuda/vecdotq.cuh,
+ // ggml-cuda/dequantize.cuh; MIT, see third_party/ggml/LICENSE and VERSION.txt), so a weight means exactly what it
+diff --git a/setup.py b/setup.py
+index 11f66af..2d72dba 100644
+--- a/setup.py
++++ b/setup.py
+@@ -54,9 +54,13 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
+ # "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
+ PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
+ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
+-# the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
++# the CUDA libraries the ready-made engine loads (the same CUDA it is built with), from NVIDIA's pip packages.
++# sm_80+ keeps upstream's CUDA 13; Volta (sm_70) builds locally with CUDA 11.8 (nvcc 11.8 is the last one emitting
++# sm_70, and the V100 box runs driver 472) - cuda_wheels()/min_driver()/need_cuda() below pick per GPU.
+ CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
++CUDA_WHEELS_CU11 = ["nvidia-cublas-cu11==11.11.3.6", "nvidia-cuda-runtime-cu11==11.8.89"]
+ MIN_DRIVER = 580                       # CUDA 13.0
++MIN_DRIVER_CU11 = 452                  # CUDA 11.x minor-version compatibility (an 11.8 build runs on 452.39+)
+ MIN_ENGINE = (0, 1, 21)                # v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
+ PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
+ 
+@@ -270,12 +274,57 @@ def gpus():
+                           "driver": drv})
+         except ValueError:
+             continue
++    if not found:
++        # Drivers older than ~510 have no compute_cap query field (the query above fails): these are the
++        # Volta/Turing cards they commonly run.
++        s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version", "--format=csv,noheader,nounits"])
++        for line in s.strip().splitlines():
++            try:
++                idx, name, mem, drv = [x.strip() for x in line.split(",")]
++            except ValueError:
++                continue
++            cc = next((v for k, v in CC_BY_NAME.items() if k in name.upper()), "0")
++            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc,
++                          "driver": drv})
+     return found
+ 
+ 
++# Drivers older than ~510 have no compute_cap query field; these are the Volta/Turing cards they commonly run.
++CC_BY_NAME = {"V100": "70", "TITAN V": "70", "GV100": "70", "T4": "75", "RTX 20": "75", "TITAN RTX": "75"}
++
++
+ GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
+ 
+ 
++def is_volta(gpu) -> bool:
++    """True when this GPU needs the Volta/CUDA 11.8 path (sm_70): upstream's CUDA 13 toolchain cannot target it."""
++    try:
++        return int(gpu["arch"]) < 80
++    except (KeyError, TypeError, ValueError):
++        return False
++
++
++def cuda_wheels(gpu):
++    """The pip CUDA libraries matching this GPU's engine: cu11 for a sm_70 local build, upstream's cu13 otherwise
++    (a ready-made engine is accepted only for a compatible arch, so the GPU selects correctly for both)."""
++    return CUDA_WHEELS_CU11 if is_volta(gpu) else CUDA_WHEELS
++
++
++def min_driver(gpu):
++    """The oldest NVIDIA driver this GPU's engine runs on."""
++    return MIN_DRIVER_CU11 if is_volta(gpu) else MIN_DRIVER
++
++
++def need_cuda(gpu):
++    """The minimum CUDA toolkit compiling for this GPU: 11.8 on Volta, upstream's ladder otherwise."""
++    return (11, 8) if is_volta(gpu) else ((12, 8) if int(gpu["arch"]) >= 120 else (12, 0))
++
++
++def cuda_variant(gpu):
++    """'cu11' for a sm_70 local build, 'cu13' otherwise: which library set to look for on disk."""
++    return "cu11" if is_volta(gpu) else "cu13"
++
++
+ def gpu_info(pick=None):
+     """The GPU Strata runs on: `pick` (nvidia-smi's number) if given, else the one with the most VRAM (ties: the
+     lower number).  None when there is no NVIDIA GPU.  The dict also says how many there are ("count")."""
+@@ -292,7 +341,7 @@ def gpu_info(pick=None):
+     return {**g, "count": len(found)}
+ 
+ 
+-def find_nvcc():
++def find_nvcc(only_major=None):
+     cands = [shutil.which("nvcc")]
+     if os.environ.get("CUDA_PATH"):
+         cands.append(str(Path(os.environ["CUDA_PATH"]) / "bin" / ("nvcc.exe" if WIN else "nvcc")))
+@@ -304,10 +353,11 @@ def find_nvcc():
+         cands += [str(p / "bin" / "nvcc") for p in sorted(Path("/usr/local").glob("cuda*"), reverse=True)]
+         cands += [str(p / "bin" / "nvcc") for p in sorted(Path("/opt").glob("cuda*"), reverse=True)]   # Arch (#46)
+     best = (None, None)
+-    for c in dict.fromkeys(cands):                     # every toolkit found; the newest wins
++    for c in dict.fromkeys(cands):                     # every matching toolkit found; the newest wins
+         if c and Path(c).exists():
+             v = re.search(r"release (\d+)\.(\d+)", out([c, "--version"]))
+-            if v and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
++            if v and (only_major is None or int(v.group(1)) == only_major) and \
++                    (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
+                 best = (c, (int(v.group(1)), int(v.group(2))))
+     return best
+ 
+@@ -451,14 +501,18 @@ def pip_install(packages, what):
+     ok(f"{what} installed")
+ 
+ 
+-def cuda_lib_dirs():
+-    """Where pip put NVIDIA's CUDA libraries (nvidia/cu13/bin/x86_64 on Windows, nvidia/cu13/lib on Linux)."""
+-    pattern = "cublas64_13.dll" if WIN else "libcublas.so.13*"
++def cuda_lib_dirs(variant=None):
++    """Where pip put NVIDIA's CUDA libraries (nvidia/cu13/bin/x86_64 on Windows, nvidia/cu13/lib on Linux;
++    nvidia/cublas/bin and nvidia/cuda_runtime/bin for the cu11 set).  variant is "cu11"/"cu13" (None: both)."""
++    pats = {"cu11": ["cublas64_11.dll", "cudart64_110.dll"] if WIN else ["libcublas.so.11*", "libcudart.so.11*"],
++            "cu13": ["cublas64_13.dll"] if WIN else ["libcublas.so.13*"]}
++    patterns = pats.get(variant, pats["cu11"] + pats["cu13"])
+     dirs = []
+     for sp in {Path(p) for p in sys.path if p.endswith("site-packages")}:
+-        for hit in (sp / "nvidia").rglob(pattern) if (sp / "nvidia").is_dir() else []:
+-            if hit.parent not in dirs:
+-                dirs.append(hit.parent)
++        for pattern in patterns:
++            for hit in (sp / "nvidia").rglob(pattern) if (sp / "nvidia").is_dir() else []:
++                if hit.parent not in dirs:
++                    dirs.append(hit.parent)
+     return [str(d) for d in dirs]
+ 
+ 
+@@ -583,20 +637,21 @@ def update_installed_engine(url_base) -> None:
+             info.write_text(meta_text)                 # get_prebuilt drops it before downloading: put it back
+         warn(f"could not update the engine: starting the installed {meta.get('version')}")
+         return
+-    pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
++    pip_install(cuda_wheels(gpu), "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
+ 
+ 
+ def install_build_tools(gpu, yes):
+     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
+-    nvcc, cuda_v = find_nvcc()
+-    need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
++    nvcc, cuda_v = find_nvcc(only_major=11 if is_volta(gpu) else None)
++    need = need_cuda(gpu)                              # (11, 8) on Volta, upstream's (12, 0)/(12, 8) otherwise
++    want = f"{need[0]}.{need[1]}"
+     vcvars = find_vcvars() if WIN else None
+     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
+     missing = []
+     if not have_cc:
+         missing.append("Visual Studio 2022 Build Tools (C++)" if WIN else "the C++ compiler (build-essential)")
+-    if nvcc is None or cuda_v < need_cuda:
+-        missing.append("the NVIDIA CUDA Toolkit 13.0")
++    if nvcc is None or cuda_v < need:
++        missing.append(f"the NVIDIA CUDA Toolkit {want}")
+     if not missing:
+         ok(f"build tools present (CUDA {cuda_v[0]}.{cuda_v[1]})")
+         return nvcc, vcvars
+@@ -615,8 +670,8 @@ def install_build_tools(gpu, yes):
+             run([*wg, "--id", "Microsoft.VisualStudio.2022.BuildTools", "--override",
+                  "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
+                 check=False)
+-        if nvcc is None or cuda_v < need_cuda:
+-            run([*wg, "--id", "Nvidia.CUDA", "--version", "13.0"], check=False)
++        if nvcc is None or cuda_v < need:
++            run([*wg, "--id", "Nvidia.CUDA", "--version", want], check=False)
+         vcvars = find_vcvars()
+     else:
+         apt = shutil.which("apt-get")
+@@ -626,7 +681,7 @@ def install_build_tools(gpu, yes):
+                  "PATH, in /usr/local/cuda* and in /opt/cuda*), then run it again")
+         if not have_cc:
+             run(["sudo", "apt-get", "install", "-y", "build-essential"])
+-        if nvcc is None or cuda_v < need_cuda:
++        if nvcc is None or cuda_v < need:
+             osr = dict(line.split("=", 1) for line in open("/etc/os-release").read().splitlines() if "=" in line)
+             ver = osr.get("VERSION_ID", "").strip('"').replace(".", "")
+             if osr.get("ID") != "ubuntu" or ver not in ("2204", "2404"):
+@@ -637,11 +692,11 @@ def install_build_tools(gpu, yes):
+                      deb, "CUDA repository key")
+             run(["sudo", "dpkg", "-i", str(deb)])
+             run(["sudo", "apt-get", "update"])
+-            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-13-0"])
+-    nvcc, cuda_v = find_nvcc()
++            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-11-8" if is_volta(gpu) else "cuda-toolkit-13-0"])
++    nvcc, cuda_v = find_nvcc(only_major=11 if is_volta(gpu) else None)
+     if (WIN and find_vcvars() is None) or (not WIN and shutil.which("g++") is None):
+         fail("the C++ build tools did not install", "install them by hand (README.md) and run it again")
+-    if nvcc is None or cuda_v < need_cuda:
++    if nvcc is None or cuda_v < need:
+         fail("the CUDA Toolkit did not install", "install it from https://developer.nvidia.com/cuda-downloads, then run it again")
+     ok(f"build tools installed (CUDA {cuda_v[0]}.{cuda_v[1]})")
+     return nvcc, find_vcvars() if WIN else None
+@@ -1177,10 +1232,10 @@ def main() -> int:
+             + (" (the one with the most VRAM)" if a.gpu is None else "") + " - choose another with --gpu N:")
+         for x in gpus():
+             say(f"         {x['index']}: {x['name']}, {x['vram_gb']:.0f} GB")
+-    if int(gpu["arch"]) < 80:
+-        fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
+-    if driver_major(gpu) < MIN_DRIVER:
+-        fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
++    if int(gpu["arch"]) < 70:
++        fail("this GPU is older than Volta (compute capability 7.0 is required)")
++    if driver_major(gpu) < min_driver(gpu):
++        fail(f"the NVIDIA driver is too old ({gpu['driver']}; {min_driver(gpu)} or newer is needed)",
+              "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
+     if gpu["vram_gb"] < 11:
+         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
+@@ -1317,14 +1372,14 @@ def main() -> int:
+     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
+     eng = None if a.build else get_prebuilt(a.prebuilt, gpu, vision)
+     if eng is not None and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
+-        pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
++        pip_install(cuda_wheels(gpu), "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
+         if vision != "none" and not (eng / VEXE).exists():
+             warn("the ready-made engine has no image encoder: compiling it")
+             eng = None
+     if eng is None:
+         eng = build_engine(gpu, vision, a.yes, llama)
+     meta = json.loads((eng / "BUILD.json").read_text())
+-    lib_dirs = meta.get("cuda_dirs") or cuda_lib_dirs()
++    lib_dirs = meta.get("cuda_dirs") or cuda_lib_dirs(cuda_variant(gpu))
+     ok(f"engine: {eng / EXE}")
+ 
+     # ---- 5. the model files
+@@ -1428,8 +1483,8 @@ def main() -> int:
+     if multi:                                          # a layer split across these cards (the server adds the flag)
+         for i in multi[1:]:
+             x = gpu_info(i)
+-            if int(x["arch"]) < 80:
+-                fail(f"GPU {i} ({x['name']}) is older than the RTX 30 series (compute capability 8.0 is required)")
++            if int(x["arch"]) < 70:
++                fail(f"GPU {i} ({x['name']}) is older than Volta (compute capability 7.0 is required)")
+         cfg["gpu"] = multi
+         cfg["layer_split"] = a.layer_split or "auto"
+         ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
+diff --git a/src/core/device.cu b/src/core/device.cu
+index 9b8a537..b2888d3 100644
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -30,7 +30,8 @@ DeviceInfo device_info(int ordinal) {
+     int count = 0;
+     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
+     if (count == 0) {
+-        throw CudaError("no CUDA device is present; Strata targets sm_120 (RTX 5000 series)", -1);
++        throw CudaError("no CUDA device is present; Strata needs sm_70 (Volta) or newer, "
++                           "developed on sm_120 (RTX 5000 series)", -1);
+     }
+     if (ordinal < 0 || ordinal >= count) {
+         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
+@@ -56,13 +57,14 @@ DeviceInfo device_info(int ordinal) {
+     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
+     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
+ 
+-    // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
+-    // is caught here, because a binary can be carried to a machine with an older card and would otherwise
+-    // silently take whatever path the driver chose.
+-    if (d.cc_major != 12) {
++    // The engine is developed and measured against sm_120.  CMake enforces the sm_70 floor at COMPILE time;
++    // RUNNING on something older is caught here, because a binary can be carried to a machine with an older
++    // card and would otherwise silently take whatever path the driver chose.
++    if (d.cc_major < 7) {
+         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
+                             "." + std::to_string(d.cc_minor) +
+-                            "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",
++                            "; Strata needs sm_70 (Volta, e.g. Tesla V100) or newer - sm_120 "
++                            "(RTX 5000 series / Blackwell) is the reference target",
+                         -1);
+     }
+     return d;
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 401085d..f004bde 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -456,7 +456,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
+         if (graph) cudaGraphDestroy(graph);
+         return false;
+     }
+-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
++    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
+         if (graph) cudaGraphDestroy(graph);
+         err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
+         return false;
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index d1be423..ab6a6ca 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -74,7 +74,12 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+     // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
+     // before the device's context exists, so first thing; STRATA_REMOTE_SPIN=0 keeps the driver's default.
+     const char* spin = std::getenv("STRATA_REMOTE_SPIN");
++#if CUDART_VERSION >= 12000
+     if (!(spin && spin[0] == '0')) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
++#else
++    // CUDA 11.8 has no cudaInitDevice: set the device, then its flags (likewise before first context use).
++    if (!(spin && spin[0] == '0')) { cudaSetDevice(device); cudaSetDeviceFlags(cudaDeviceScheduleSpin | cudaDeviceMapHost); }
++#endif
+     cudaGetLastError();
+     DeviceScope scope(device);
+     if (!scope.ok) { err = scope.error(device); return false; }
+diff --git a/src/core/session.cpp b/src/core/session.cpp
+index d18a5ec..2017f17 100644
+--- a/src/core/session.cpp
++++ b/src/core/session.cpp
+@@ -218,7 +218,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
+                       cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
+                 return false;
+             }
+-            if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
++            if (cudaGraphInstantiate(out, graph, nullptr, nullptr, 0) != cudaSuccess) {
+                 err = "session_capture: instantiate failed at layer " + std::to_string(l);
+                 return false;
+             }
+@@ -856,7 +856,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
+         err = std::string("session_capture_token: end capture: ") + cudaGetErrorString(ce);
+         return false;
+     }
+-    const cudaError_t ie = cudaGraphInstantiate(&tg.exec, graph, 0);
++    const cudaError_t ie = cudaGraphInstantiate(&tg.exec, graph, nullptr, nullptr, 0);
+     cudaGraphDestroy(graph);
+     if (ie != cudaSuccess) {
+         err = std::string("session_capture_token: instantiate: ") + cudaGetErrorString(ie);
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 226f09a..240f706 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -687,7 +687,7 @@ bool Verifier::capture(int T, std::string& err) {
+         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
+         return false;
+     }
+-    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
++    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, nullptr, nullptr, 0);
+     cudaGraphDestroy(graph);
+     if (ie != cudaSuccess) {
+         err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
+@@ -757,7 +757,7 @@ bool Verifier::capture_commit(std::string& err) {
+         if (graph) cudaGraphDestroy(graph);
+         return false;
+     }
+-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
++    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, nullptr, nullptr, 0) != cudaSuccess) {
+         if (graph) cudaGraphDestroy(graph);
+         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
+         return false;
+diff --git a/src/kernels/elementwise_parity.cpp b/src/kernels/elementwise_parity.cpp
+index 58a2c36..f147450 100644
+--- a/src/kernels/elementwise_parity.cpp
++++ b/src/kernels/elementwise_parity.cpp
+@@ -385,7 +385,7 @@ int main(int argc, char** argv) {
+                                     n, bits, bias, group, out + 1, stream);
+                                 strata::kernels::scale_inplace(out + 1, n, 2.0f, stream);
+                                 check(cudaStreamEndCapture(stream, &graph), "embedding capture end");
+-                                check(cudaGraphInstantiate(&exec, graph, 0), "embedding instantiate");
++                                check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "embedding instantiate");
+                                 check(cudaGraphLaunch(exec, stream), "embedding replay");
+                                 check(cudaMemcpyAsync(got.data(), out, got.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "embedding graph result");
+                                 check(cudaStreamSynchronize(stream), "embedding graph sync");
+diff --git a/src/kernels/native_expert_parity.cpp b/src/kernels/native_expert_parity.cpp
+index 496cf5e..50ebec0 100644
+--- a/src/kernels/native_expert_parity.cpp
++++ b/src/kernels/native_expert_parity.cpp
+@@ -34,9 +34,126 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
+     return n / (d + 1e-30);
+ }
+ 
++// (d) --selftest: a synthetic IQ4_XS gate/up case (gu 23 over down 20, and down 23), no GGUF needed. The
++// weights are quantized with ggml's own reference quantizer, the float reference dequantizes them with ggml's
++// to_float, the CPU path uses ggml-cpu's vec_dot, and the GPU path is native_expert_grouped.
++static int run_synthetic(cudaStream_t s, int gu_type, int d_type, int64_t H, int64_t FF, int seed) {
++    cpu::NativeFmt f;
++    std::string err;
++    if (!cpu::native_fmt(gu_type, d_type, H, FF, f, err)) {
++        std::printf("selftest %d/%d: %s\n", gu_type, d_type, err.c_str());
++        return 1;
++    }
++    const auto* tg = ggml_get_type_traits((ggml_type) gu_type);
++    const auto* td = ggml_get_type_traits((ggml_type) d_type);
++    const int NT = 2;
++    std::mt19937 rng((unsigned) seed);
++    std::normal_distribution<float> nd(0.f, 1.f);
++    std::vector<float> Gf((size_t) FF * H), Uf((size_t) FF * H), Df((size_t) H * FF);
++    for (auto& v : Gf) v = nd(rng);
++    for (auto& v : Uf) v = nd(rng);
++    for (auto& v : Df) v = nd(rng);
++    std::vector<uint8_t> blob(f.bytes);
++    for (int64_t r = 0; r < FF; ++r) {
++        tg->from_float_ref(Gf.data() + r * H, blob.data() + r * f.gu_row, H);
++        tg->from_float_ref(Uf.data() + r * H, blob.data() + f.up_off + r * f.gu_row, H);
++    }
++    for (int64_t r = 0; r < H; ++r) td->from_float_ref(Df.data() + r * FF, blob.data() + f.down_off + r * f.d_row, FF);
++    std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
++    for (int64_t r = 0; r < FF; ++r) {
++        tg->to_float(blob.data() + r * f.gu_row, G.data() + r * H, H);
++        tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
++    }
++    for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
++    std::vector<float> x((size_t) NT * H);
++    for (auto& v : x) v = nd(rng);
++    std::vector<float> ref((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
++    for (int k = 0; k < NT; ++k) {
++        std::vector<float> h(FF);
++        for (int64_t r = 0; r < FF; ++r) {
++            double g = 0, u = 0;
++            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * x[k * H + i]; u += (double) U[r * H + i] * x[k * H + i]; }
++            h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
++        }
++        for (int64_t r = 0; r < H; ++r) {
++            double o = 0;
++            for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
++            ref[k * H + r] = (float) o;
++        }
++    }
++    {
++        std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
++        std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
++        std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
++        const void* a[NT];
++        float* ffp[NT];
++        const void* hp[NT];
++        float* op[NT];
++        for (int k = 0; k < NT; ++k) {
++            cpu::native_quant_act(f, x.data() + k * H, act[k].data());
++            a[k] = act[k].data();
++            ffp[k] = ff[k].data();
++        }
++        cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
++        for (int k = 0; k < NT; ++k) {
++            cpu::native_quant_h(f, ff[k].data(), hq[k].data());
++            hp[k] = hq[k].data();
++            op[k] = got_c.data() + k * H;
++        }
++        cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
++    }
++    {
++        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
++        void *dblob, *dx, *dxq, *dscr;
++        float* dout;
++        unsigned long long* dptr;
++        int32_t *dstart, *dn, *ddst, *dtok;
++        cudaMalloc(&dblob, blob.size());
++        cudaMalloc(&dx, x.size() * 4);
++        cudaMalloc(&dxq, (size_t) NT * H / 32 * 36);
++        cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF));
++        cudaMalloc((void**) &dout, (size_t) NT * H * 4);
++        cudaMalloc((void**) &dptr, 8);
++        cudaMalloc((void**) &dstart, 8);
++        cudaMalloc((void**) &dn, 4);
++        cudaMalloc((void**) &ddst, NT * 4);
++        cudaMalloc((void**) &dtok, NT * 4);
++        cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
++        cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
++        const unsigned long long p = (unsigned long long) dblob;
++        const int32_t st[2] = {0, NT}, one = 1, idx[2] = {0, 1};
++        cudaMemcpy(dptr, &p, 8, cudaMemcpyHostToDevice);
++        cudaMemcpy(dstart, st, 8, cudaMemcpyHostToDevice);
++        cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
++        cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
++        cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
++        strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
++        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
++        cudaStreamSynchronize(s);
++        cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
++        cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
++        cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
++    }
++    const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
++    const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
++    std::printf("selftest gu %-8s/%-7s H %4lld FF %4lld  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n",
++                ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), (long long) H,
++                (long long) FF, ec, eg, ecg, ok ? "ok" : "FAIL");
++    return ok ? 0 : 1;
++}
++
+ int main(int argc, char** argv) {
+     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
+     if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...]\n"); return 2; }
++    if (argc == 2 && std::string(argv[1]) == "--selftest") {
++        cudaStream_t s;
++        cudaStreamCreate(&s);
++        int failures = 0;
++        failures += run_synthetic(s, 23, 20, 256, 64, 101);
++        failures += run_synthetic(s, 23, 23, 256, 256, 102);
++        std::printf("native_expert_parity --selftest: %d failures\n", failures);
++        return failures ? 1 : 0;
++    }
+     strata::GgufFile gguf(argv[1]);
+     std::vector<int> layers;
+     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+@@ -129,9 +246,9 @@ int main(int argc, char** argv) {
+                 // one multi-token kernel: parity against ggml's vec_dot, then one-token and NT-token throughput
+                 auto check = [&](const char* tag, bool is512) {
+                     std::vector<float> g((size_t) NT * FF);
+-                    float* gp[NT];
++                    std::vector<float*> gp(NT);   // not float* gp[NT]: NT is lambda-uncaptured, MSVC rejects it
+                     for (int k = 0; k < NT; ++k) gp[k] = g.data() + k * FF;
+-                    (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp, 0, (int) FF);
++                    (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp.data(), 0, (int) FF);
+                     const double rg = rel(g, gref);
+                     std::printf("          %s %s gate rows vs ggml vec_dot: rel %.2e\n",
+                                 ggml_type_name((ggml_type) f.gu_type), tag, rg);
+diff --git a/src/kernels/qsa_parity.cpp b/src/kernels/qsa_parity.cpp
+index 5a8186d..73875df 100644
+--- a/src/kernels/qsa_parity.cpp
++++ b/src/kernels/qsa_parity.cpp
+@@ -775,7 +775,7 @@ int main(int argc, char** argv) {
+         strata::kernels::qsa_index_step(pooled.p, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
+         strata::kernels::topk_512_step(scores.p, S, cap, step.p, ids.p, stream);
+         check(cudaStreamEndCapture(stream, &graph), "tail capture end");
+-        check(cudaGraphInstantiate(&exec, graph, 0), "tail instantiate");
++        check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "tail instantiate");
+ 
+         const std::vector<int64_t> counts = {
+             1, 2, 3, 4, 511, 512, 513, 2046, 2047, 2048, 2049, 2050, 2051,
+@@ -1323,7 +1323,7 @@ int main(int argc, char** argv) {
+         size_t nodes2 = 0;
+         check(cudaGraphGetNodes(g2, nullptr, &nodes2), "nodes");
+         cudaGraphExec_t ex2 = nullptr;
+-        check(cudaGraphInstantiate(&ex2, g2, 0), "inst");
++        check(cudaGraphInstantiate(&ex2, g2, nullptr, nullptr, 0), "inst");
+ 
+         // replay A: cells 0..3, which completes block 0
+         for (int t = 0; t < 4; ++t) {
+-- 
+2.54.0.windows.1
+
