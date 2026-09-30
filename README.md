@@ -63,13 +63,24 @@ Not yet measured on GPU: tip-budget eviction under pressure (item 6 of the ledge
 ## Layout
 
 ```
-patches/strata/         git format-patch against Niko1221/Strata main
-patches/hermes-agent/   git format-patch against NousResearch/hermes-agent
+patches/strata/         git format-patch from Niko1221/Strata 0.1.21 base (f1b1d961...)
+patches/hermes-agent/   git format-patch against the Hermes Agent snapshot used by this project
 docs/                   design, fix history, acceptance ledger
 scripts/                server launcher (PowerShell), Hermes launcher (.cmd), GPU acceptance driver
 ```
 
 Scripts resolve the project root from `HERMESTRATA_ROOT` (default: the parent of `scripts/`); model and pack paths come from the launcher's config section. Paths only matter at startup, not for speed.
+
+## Patch bases
+
+The Strata series is pinned to upstream commit
+`f1b1d961537fd66d37fee68a60015701375b7b5a` (Strata 0.1.21). The preimage blob IDs in
+`patches/strata/0001-*.patch` match that commit for every file it changes. Do not assume the series applies
+cleanly to current Strata `main`; upstream has moved since this snapshot.
+
+The Hermes patches likewise carry their exact preimage blob IDs in the format-patch headers, but this repository
+does not currently record a single upstream commit SHA for that snapshot. Treat a rebase onto current Hermes Agent
+as a separate compatibility task rather than silently applying with rejects.
 
 ## Credits
 
