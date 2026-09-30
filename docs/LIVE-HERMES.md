@@ -4,20 +4,23 @@ Production engine = cache-fix-1 f621c84, real Hermes (`hermes -p flashnext chat 
 system prompt + tools. Script: `scripts/hermes_fork_test.ps1`. Same small task delegated once as an isolated child
 and once as a forked child (`"fork": true`).
 
-## What worked
-- Forked child started from the parent's saved tip: `resume from tip at 19516`, 5.2 s (a full re-read of the
-  20K prompt is ~60 s).
-- Parent after an isolated child resumed from its tip: `resume from tip at 18786`, ~6 s.
-- Inside one session almost every turn resumed from the chain in 1.5-4 s.
+## Correction (same day)
+The first version of this page said a forked child started from the parent's tip in 5.2 s. That was wrong: the
+`flashnext` profile had the `delegation` toolset disabled, `delegate_task` was not available, and both runs had
+**zero child sessions** — the model did the work itself with the terminal. The resume lines were the parent's own
+turns. Fork mode has **not** been exercised with live Hermes yet (it is covered by unit tests and by the engine-level
+acceptance in docs/ACCEPTANCE.md, case 3).
 
+## What the runs did show
+- Inside one session almost every turn resumed from the chain in 1.5-4 s.
 ## Two holes found (both on the Hermes side, not the engine)
 1. **Every new session started cold (35 s).** The root is taken at the end of the system message, and the system
    message ends with a volatile workspace block. Two sessions differed by one line
    (`- Status: 2 modified, 75 untracked` vs `77 untracked`), so every session produced a same-length root with a new
    hash (several such roots on disk). Moving volatile parts "to the tail of the system prompt" is not enough; they must
    not be inside the cached system message at all.
-2. **Parent after a forked child started cold (50 s).** Hermes sent a shorter history (17.6K tokens) than the
-   parent's previous request (19.5K): earlier messages were rewritten. Leading explanation (Sol's code reading):
+2. **A later turn in the same session started cold (50 s).** Hermes sent a shorter history (17.6K tokens) than
+   its previous request (19.5K): earlier messages were rewritten (not related to delegation). Leading explanation (Sol's code reading):
    threshold-triggered preflight compaction rewriting history in place; tool-result pruning and micro compaction are
    other candidates (off by default).
 
@@ -28,9 +31,10 @@ appended as `[context update]` at the end; pruned/shortened earlier messages are
 when the result still fits the context; anything else passes through and is logged
 (`prefix-keeper.jsonl`). Opt-in, one flag to remove.
 
-Status: implemented and unit-tested (102 server tests); live acceptance in progress
-(`scripts/hermes_keeper_accept.ps1`: new session after a git-status change must resume the root in <= 2 s and still
-report the new status; parent after a forked child must never start cold).
+Live result (2026-09-30 20:40, `scripts/hermes_keeper_accept.ps1`): after the git status changed between sessions,
+the new session resumed from the ROOT (11743 tokens) instead of re-reading 11.8K tokens (35 s); the keeper logged a
+`system-delta` with the one changed line and the model answered from the updated status. The history-rewrite case
+has not recurred yet in a live run.
 
 ## Also: work deadline for Hermes (patch hermes-agent/0003, docs/WORK-DEADLINE.md; experimental)
 Told "work until 18:00", Hermes ended its turn after ~1.5 h ("no way to keep going"). `--run-budget` is a ceiling,
