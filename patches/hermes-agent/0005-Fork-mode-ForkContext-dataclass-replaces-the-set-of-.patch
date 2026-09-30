@@ -1,0 +1,1152 @@
+From b489c20aae5b37e5834867bb9701e9d5cf6e5537 Mon Sep 17 00:00:00 2001
+From: urawa <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:44:16 +0900
+Subject: [PATCH] Fork mode: ForkContext dataclass replaces the set of private
+ attributes a fork child carried (behaviour-preserving, recorded first-request
+ parity test)
+
+Origin: ChatGPT readability review via the user; plan: Claude; implemented: Muse; reviewed: Sol (low); 258 tests pass (Claude, prod venv).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/agent_init.py                         |  44 ++++
+ agent/tool_executor.py                      |   4 +-
+ agent/turn_context.py                       |  23 +-
+ agent/work_deadline.py                      |   3 +-
+ run_agent.py                                |   9 +
+ tests/agent/test_work_deadline.py           |  10 +-
+ tests/tools/fork_first_request_fixture.json | 112 ++++++++++
+ tests/tools/test_delegate_fork.py           | 212 ++++++++++++++----
+ tools/delegate_tool.py                      |  59 ++---
+ tools/delegate_tool_child_run.py            |  16 +-
+ tools/delegate_tool_fork.py                 | 226 +++++++++++++-------
+ 11 files changed, 553 insertions(+), 165 deletions(-)
+ create mode 100644 tests/tools/fork_first_request_fixture.json
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 00ea8068..9a2b95d5 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -617,6 +617,11 @@ _SESSION_STATE: Dict[str, Any] = {
+     # delegate_task fork children, refreshed every tool round; None until the
+     # first tool round of the session.
+     "_fork_prefix_snapshot": None,
++    # Fork snapshot (tools/delegate_tool_fork.ForkContext), installed by
++    # _install_fork_context_surface at the end of construction; None on
++    # parents and non-fork children. ``AIAgent._is_fork_child`` (read-only)
++    # is ``fork_context is not None``.
++    "fork_context": None,
+     # Self-managed work deadline (agent/work_deadline.py): session-scoped until/goal
+     # (persisted in the session row, survives resume); per-turn markers reset in
+     # agent/turn_context.py without touching the session deadline.
+@@ -2142,6 +2147,39 @@ def _snapshot_primary_runtime(agent):
+         })
+ 
+ 
++def _install_fork_context_surface(agent, fork_ctx) -> None:
++    """Agent-owned fork parity (mirrors ``agent.background_review``
++    ``build_cache_parity_fork``): attach the delegate-fork snapshot and
++    install the cached prompt / tool surface from it, so the child's first
++    request is byte-identical to the parent's last. Runs at the END of
++    construction (after context-engine tools land) so the inherited surface
++    wins. Refresh/deferral flags are NOT copied — the turn loop reads them
++    off ``fork_context`` live, and the per-task history is rebuilt from the
++    context at run time."""
++    agent.fork_context = fork_ctx
++    if fork_ctx is None:
++        return
++    from agent.background_review import _inherit_parent_tool_surface
++
++    if isinstance(fork_ctx.system_prompt, str) and fork_ctx.system_prompt:
++        agent._cached_system_prompt = fork_ctx.system_prompt
++    else:
++        logger.warning(
++            "fork child: parent has no cached system prompt; the child prompt "
++            "was built fresh and the first request will miss the prefix cache",
++        )
++    if isinstance(fork_ctx.session_start, datetime):
++        agent.session_start = fork_ctx.session_start
++    if (isinstance(fork_ctx.tools, list) and fork_ctx.tools
++            and all(isinstance(t, dict) for t in fork_ctx.tools)):
++        _inherit_parent_tool_surface(agent, SimpleNamespace(tools=fork_ctx.tools))
++    else:
++        logger.warning(
++            "fork child: parent tools[] is not a concrete list; keeping the "
++            "constructed toolsets and the first request may miss the cache",
++        )
++
++
+ def _init_usage_state(agent):
+     from agent.runtime_cwd import scope_terminal_cwd
+     agent._subdirectory_hints = SubdirectoryHintTracker(working_dir=scope_terminal_cwd() or None)
+@@ -2240,6 +2278,7 @@ def init_agent(
+     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
+     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
+     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None,
++    fork_context=None,
+ ):
+     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
+ 
+@@ -2253,6 +2292,8 @@ def init_agent(
+         assistant message — use structured outputs there instead.
+       skip_context_files: skip SOUL.md/.hermes.md/AGENTS.md/CLAUDE.md/.cursorrules injection;
+         load_soul_identity keeps ~/.hermes/SOUL.md as identity regardless.
++      fork_context: delegate-fork snapshot (tools/delegate_tool_fork.ForkContext);
++        None except on fork children built by ``_build_child_agent``.
+     """
+     _install_safe_stdio()
+ 
+@@ -2337,6 +2378,9 @@ def init_agent(
+     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
+     _emit_compression_summary(agent, cs)
+     _snapshot_primary_runtime(agent)
++    # Fork children: install the inherited prompt/tool surface last so it wins
++    # over anything construction assembled (context-engine tools included).
++    _install_fork_context_surface(agent, fork_context)
+ 
+ 
+ __all__ = ["init_agent"]
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index ee1bb8e6..75c41fe6 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -630,7 +630,9 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
+         from tools.delegate_tool_fork import fork_child_block_message
+         _fork_block = fork_child_block_message(agent, ref.name)
+     except Exception:
+-        if getattr(agent, "_is_fork_child", False):
++        # No dependency import here: if the import itself failed the helper
++        # name is unbound, so read the plain attribute (fail-closed).
++        if getattr(agent, "fork_context", None) is not None:
+             logger.exception("Fork-child tool restriction check failed")
+             return json.dumps({"error": "Fork-child restriction enforcement failed; tool call refused."}), ref.args
+         _fork_block = None
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 11c9db47..32c5f649 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -26,6 +26,7 @@ from agent.model_metadata import estimate_messages_tokens_rough, estimate_reques
+ from agent.image_token_cost import bind_image_token_cost
+ from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
+ from agent.turn_author import parse_turn_author
++from tools.delegate_tool_fork import fork_context_of
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -319,11 +320,18 @@ def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+ 
+ 
+ def _review_fork_first_request_pending(agent: Any) -> bool:
+-    """Whether a detached review fork has yet to send its first provider request: it
++    """Whether a detached fork has yet to send its first provider request: it
+     replays the parent's FULL snapshot as a warm cache read, so compaction must wait
+-    for that first response. Dormant without the attribute."""
++    for that first response. Delegate-fork children carry the flag on
++    ``fork_context``; background-review forks (no context) keep the legacy
++    attribute. Dormant without either."""
++    fork_ctx = fork_context_of(agent)
++    if fork_ctx is not None:
++        defer = fork_ctx.defer_compaction
++    else:
++        defer = getattr(agent, "_review_defer_compaction_before_first_response", False)
+     return bool(
+-        getattr(agent, "_review_defer_compaction_before_first_response", False)
++        defer
+         and not getattr(agent, "_turn_received_provider_response", False)
+     )
+ 
+@@ -446,7 +454,14 @@ def _refresh_mcp_tools_between_turns(agent: Any) -> None:
+     try:
+         # Import-cost gate: MCP tools are only registered by code that already imported
+         # ``tools.mcp_tool`` (~0.4s); not in sys.modules => nothing to do.
+-        if not getattr(agent, "_skip_mcp_refresh", False) and "tools.mcp_tool" in sys.modules:
++        # Delegate-fork children read the flag off ``fork_context`` (never
++        # copied onto the child); everything else uses the legacy attribute.
++        fork_ctx = fork_context_of(agent)
++        skip_refresh = (
++            fork_ctx.skip_mcp_refresh if fork_ctx is not None
++            else getattr(agent, "_skip_mcp_refresh", False)
++        )
++        if not skip_refresh and "tools.mcp_tool" in sys.modules:
+             from tools.mcp_tool_discovery import has_registered_mcp_tools
+             from tools.mcp_tool_agent import refresh_agent_mcp_tools
+             if has_registered_mcp_tools():
+diff --git a/agent/work_deadline.py b/agent/work_deadline.py
+index a2116900..6b92ce99 100644
+--- a/agent/work_deadline.py
++++ b/agent/work_deadline.py
+@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
+ from typing import Any, Dict, Optional, Tuple
+ 
+ from agent.delegation_context import is_delegated_child_context
++from tools.delegate_tool_fork import fork_context_of
+ from utils import is_truthy_value
+ 
+ logger = logging.getLogger(__name__)
+@@ -163,7 +164,7 @@ def _is_child_agent(agent: Any) -> Optional[str]:
+     session id with persistence disabled, so they are refused here rather than
+     by schema filtering alone.
+     """
+-    if getattr(agent, "_is_fork_child", False) is True:
++    if fork_context_of(agent) is not None:
+         return "not available to a forked child: the parent owns the work deadline"
+     if getattr(agent, "_persist_disabled", False) is True:
+         return "not available to a persistence-isolated agent: the parent owns the work deadline"
+diff --git a/run_agent.py b/run_agent.py
+index 99bcccd0..d81523ec 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -220,6 +220,14 @@ class AIAgent(
+         "have been dropped to keep the conversation alive. See issue #15236.]"
+     )
+ 
++    @property
++    def _is_fork_child(self) -> bool:
++        """Read-only: True iff this agent carries a delegate-fork snapshot
++        (``fork_context``, installed agent-side at construction). Never
++        assigned — fork state flows in through the ``fork_context``
++        constructor parameter only."""
++        return getattr(self, "fork_context", None) is not None
++
+     @property
+     def base_url(self) -> str:
+         return self._base_url
+@@ -270,6 +278,7 @@ class AIAgent(
+         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,
+         pass_session_id: bool = False, requested_provider: str = None,
+         capabilities: Dict[str, bool] | None = None,
++        fork_context=None,
+     ):
+         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
+         init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}
+diff --git a/tests/agent/test_work_deadline.py b/tests/agent/test_work_deadline.py
+index dda70589..2fd50146 100644
+--- a/tests/agent/test_work_deadline.py
++++ b/tests/agent/test_work_deadline.py
+@@ -31,7 +31,7 @@ class _GateAgent:
+ 
+     def __init__(self):
+         self._delegate_depth = 0
+-        self._is_fork_child = False
++        self.fork_context = None
+         self._persist_disabled = False
+         self._deadline_enabled = True
+         self._deadline_max_idle_continuations = 3
+@@ -595,10 +595,11 @@ def test_fork_schema_marks_deadline_tools_call_time_blocked():
+     assert "finish_work" in _FORK_BLOCKED_TOOL_REASONS
+ 
+ 
+-@pytest.mark.parametrize("attr", ["_is_fork_child", "_persist_disabled"])
++@pytest.mark.parametrize("attr", ["fork_context", "_persist_disabled"])
+ def test_isolated_child_cannot_call_deadline_tools(attr):
++    from tools.delegate_tool_fork import ForkContext
+     agent = _GateAgent()
+-    setattr(agent, attr, True)
++    setattr(agent, attr, ForkContext() if attr == "fork_context" else True)
+     set_payload = json.loads(wd.set_work_deadline(agent, {"until": _future_iso(), "goal": "x"}))
+     assert set_payload["success"] is False
+     assert "parent owns" in set_payload["error"]
+@@ -630,6 +631,7 @@ def test_children_neither_stop_nor_continue_on_parent_deadline():
+ 
+ def test_hydrate_skips_fork_children_sharing_session_id():
+     from hermes_state import SessionDB
++    from tools.delegate_tool_fork import ForkContext
+ 
+     import tempfile
+     from pathlib import Path
+@@ -644,7 +646,7 @@ def test_hydrate_skips_fork_children_sharing_session_id():
+             child = _GateAgent()
+             child.session_id = "shared-sess"
+             child._session_db = db
+-            child._is_fork_child = True
++            child.fork_context = ForkContext()
+             wd.hydrate_work_deadline(child)
+             assert wd.active_deadline(child) is None
+         finally:
+diff --git a/tests/tools/fork_first_request_fixture.json b/tests/tools/fork_first_request_fixture.json
+new file mode 100644
+index 00000000..91efd8a2
+--- /dev/null
++++ b/tests/tools/fork_first_request_fixture.json
+@@ -0,0 +1,112 @@
++{
++  "_note": "Recorded pre-refactor (CELL-A2). Child first-request bytes must stay identical.",
++  "wire_system": "PARENT-SYSTEM-PROMPT-BYTES::v1\n\nPARENT-EPHEMERAL-BYTES::v1",
++  "child_cached_system": "PARENT-SYSTEM-PROMPT-BYTES::v1",
++  "child_ephemeral": "PARENT-EPHEMERAL-BYTES::v1",
++  "child_tools_dumps": "[{\"type\": \"function\", \"function\": {\"name\": \"terminal\", \"description\": \"terminal tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"read_file tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"delegate_task\", \"description\": \"delegate_task tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"memory\", \"description\": \"memory tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"clarify\", \"description\": \"clarify tool\", \"parameters\": {\"type\": \"object\"}}}]",
++  "parent_tools_dumps": "[{\"type\": \"function\", \"function\": {\"name\": \"terminal\", \"description\": \"terminal tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"read_file tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"delegate_task\", \"description\": \"delegate_task tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"memory\", \"description\": \"memory tool\", \"parameters\": {\"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"clarify\", \"description\": \"clarify tool\", \"parameters\": {\"type\": \"object\"}}}]",
++  "conversation_history": [
++    {
++      "role": "user",
++      "content": "Please summarize the quarterly report"
++    },
++    {
++      "role": "assistant",
++      "content": "",
++      "tool_calls": [
++        {
++          "id": "call-1",
++          "type": "function",
++          "function": {
++            "name": "delegate_task",
++            "arguments": "{\"tasks\": [{\"goal\": \"Summarize the quarterly report figures\", \"context\": \"The report lives at /tmp/q3.txt; keep the summary under 200 words.\", \"fork\": true}]}"
++          }
++        },
++        {
++          "id": "call-2",
++          "type": "function",
++          "function": {
++            "name": "read_file",
++            "arguments": "{\"path\": \"/tmp/q3.txt\"}"
++          }
++        }
++      ]
++    },
++    {
++      "role": "tool",
++      "name": "delegate_task",
++      "tool_name": "delegate_task",
++      "content": "[forked child, depth 1/1] You are a copy of the agent above, now working ONLY on this task: Summarize the quarterly report figures\nThe report lives at /tmp/q3.txt; keep the summary under 200 words. Do it yourself; delegate only clearly separable sub-work. Your final message is your report to the parent.",
++      "tool_call_id": "call-1"
++    },
++    {
++      "role": "tool",
++      "name": "read_file",
++      "tool_name": "read_file",
++      "content": "(running in the parent)",
++      "tool_call_id": "call-2"
++    }
++  ],
++  "user_message": "Summarize the quarterly report figures",
++  "fork_history": [
++    {
++      "role": "user",
++      "content": "Please summarize the quarterly report"
++    },
++    {
++      "role": "assistant",
++      "content": "",
++      "tool_calls": [
++        {
++          "id": "call-1",
++          "type": "function",
++          "function": {
++            "name": "delegate_task",
++            "arguments": "{\"tasks\": [{\"goal\": \"Summarize the quarterly report figures\", \"context\": \"The report lives at /tmp/q3.txt; keep the summary under 200 words.\", \"fork\": true}]}"
++          }
++        },
++        {
++          "id": "call-2",
++          "type": "function",
++          "function": {
++            "name": "read_file",
++            "arguments": "{\"path\": \"/tmp/q3.txt\"}"
++          }
++        }
++      ]
++    },
++    {
++      "role": "tool",
++      "name": "delegate_task",
++      "tool_name": "delegate_task",
++      "content": "[forked child, depth 1/1] You are a copy of the agent above, now working ONLY on this task: Summarize the quarterly report figures\nThe report lives at /tmp/q3.txt; keep the summary under 200 words. Do it yourself; delegate only clearly separable sub-work. Your final message is your report to the parent.",
++      "tool_call_id": "call-1"
++    },
++    {
++      "role": "tool",
++      "name": "read_file",
++      "tool_name": "read_file",
++      "content": "(running in the parent)",
++      "tool_call_id": "call-2"
++    }
++  ],
++  "delegate_depth": 1,
++  "skip_mcp_refresh": true,
++  "review_defer": true,
++  "is_fork_child": true,
++  "enabled_toolsets": [
++    "terminal",
++    "file",
++    "web",
++    "delegation",
++    "memory",
++    "clarify"
++  ],
++  "disabled_toolsets": [],
++  "prefill_messages": [
++    {
++      "role": "system",
++      "content": "PREFILL-BYTES"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/tests/tools/test_delegate_fork.py b/tests/tools/test_delegate_fork.py
+index fdfb912c..8c6a3b2b 100644
+--- a/tests/tools/test_delegate_fork.py
++++ b/tests/tools/test_delegate_fork.py
+@@ -8,17 +8,22 @@ request at the END. Blocked tools stay advertised and refuse at CALL time.
+ 
+ Uses stub agents + a FakeAgent class (no network, no real model calls).
+ 
+-Run with:  venv\\Scripts\\python.exe -m pytest tests/tools/test_delegate_fork.py -v
++Run with:  scripts/run_tests.sh tests/tools/test_delegate_fork.py
+ """
+ 
+ import copy
+ import datetime as _dt
+ import json
++import os
++import sys
+ import time
+ import unittest
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
++from agent.agent_init import _install_fork_context_surface
+ from tools.delegate_tool import DELEGATE_TASK_SCHEMA, delegate_task
++from tools.delegate_tool_fork import ForkContext
+ 
+ FORK_GOAL = "Summarize the quarterly report figures"
+ FORK_CONTEXT = "The report lives at /tmp/q3.txt; keep the summary under 200 words."
+@@ -60,8 +65,28 @@ def _parent_prefix(extra_calls=True):
+     ]
+ 
+ 
++def _make_fork_context(**overrides):
++    """Small fixture building a ``ForkContext`` directly from the canonical
++    parent values (no hand-built AIAgent internals)."""
++    values = {
++        "system_prompt": PARENT_SYSTEM,
++        "ephemeral_system_prompt": PARENT_EPHEMERAL,
++        "tools": copy.deepcopy(PARENT_TOOLS),
++        "prefix": _parent_prefix(),
++        "enabled_toolsets": ["terminal", "file", "web", "delegation", "memory", "clarify"],
++        "disabled_toolsets": [],
++        "session_start": _dt.datetime(2026, 1, 1, 12, 0, 0),
++        "prefill_messages": [{"role": "system", "content": "PREFILL-BYTES"}],
++    }
++    values.update(overrides)
++    return ForkContext(**values)
++
++
+ class _StubParent:
+-    """Minimal parent with REAL values (no MagicMock attribute fog)."""
++    """Minimal parent: child-construction inputs only (runtime/credentials/
++    session/depth). Fork state is never staged here — tests patch
++    ``ForkContext.from_parent`` at the delegation seam with a directly-built
++    fixture instead, so no AIAgent internals are re-created."""
+ 
+     def __init__(self, depth=0):
+         self.base_url = "https://openrouter.ai/api/v1"
+@@ -76,13 +101,6 @@ class _StubParent:
+         self._active_children = []
+         self._print_fn = None
+         self.tool_progress_callback = None
+-        self._cached_system_prompt = PARENT_SYSTEM
+-        self.ephemeral_system_prompt = PARENT_EPHEMERAL
+-        self.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
+-        self.tools = copy.deepcopy(PARENT_TOOLS)
+-        self.enabled_toolsets = ["terminal", "file", "web", "delegation", "memory", "clarify"]
+-        self.disabled_toolsets = []
+-        self.prefill_messages = [{"role": "system", "content": "PREFILL-BYTES"}]
+         self.reasoning_config = None
+         self.request_overrides = {}
+         self._credential_pool = None
+@@ -93,12 +111,14 @@ class _StubParent:
+         self.acp_command = None
+         self.acp_args = []
+         self._memory_manager = None
+-        self._fork_prefix_snapshot = _parent_prefix()
+-        self._session_messages = copy.deepcopy(self._fork_prefix_snapshot)
+ 
+ 
+ class FakeAgent:
+-    """Stand-in for run_agent.AIAgent: captures construction + first turn."""
++    """Stand-in for run_agent.AIAgent: captures construction + first turn.
++
++    Runs the real agent-owned fork install (``_install_fork_context_surface``)
++    so the surface assertions exercise production code, and exposes the same
++    read-only ``_is_fork_child`` property as ``AIAgent``."""
+ 
+     instances = []
+     final_response_text = "fork report: done"
+@@ -107,9 +127,15 @@ class FakeAgent:
+         self.kwargs = dict(kwargs)
+         for key, value in kwargs.items():
+             setattr(self, key, value)
++        if kwargs.get("fork_context") is not None:
++            _install_fork_context_surface(self, kwargs["fork_context"])
+         self.run_conversation_calls = []
+         FakeAgent.instances.append(self)
+ 
++    @property
++    def _is_fork_child(self):
++        return getattr(self, "fork_context", None) is not None
++
+     def run_conversation(self, user_message=None, conversation_history=None,
+                          task_id=None, stream_callback=None, **kw):
+         self.run_conversation_calls.append({
+@@ -138,35 +164,85 @@ class FakeAgent:
+         pass
+ 
+ 
+-def _run_fork(parent, tasks, **kw):
+-    """Run delegate_task with AIAgent patched; return (payload, children)."""
++def _run_fork(parent, tasks, fork_context=None, **kw):
++    """Run delegate_task with AIAgent patched and the fork-capture seam
++    (``ForkContext.from_parent`` in ``tools.delegate_tool``) patched to a
++    directly-built fixture — the parent stub carries no fork internals.
++    Returns (payload, children)."""
+     FakeAgent.instances = []
+     kw.setdefault("background", False)
+-    with patch("run_agent.AIAgent", FakeAgent):
++    if fork_context is None:
++        fork_context = _make_fork_context()
++    with patch("run_agent.AIAgent", FakeAgent), \
++            patch.object(ForkContext, "from_parent", return_value=fork_context):
+         raw = delegate_task(tasks=tasks, parent_agent=parent, **kw)
+     return json.loads(raw), list(FakeAgent.instances)
+ 
+ 
++class TestForkContextCapture(unittest.TestCase):
++    def test_from_parent_captures_and_detaches(self):
++        """Focused constructor test: one read of the parent's internals,
++        detached copies, explicit assistant message."""
++        parent_tools = copy.deepcopy(PARENT_TOOLS)
++        parent_prefix = _parent_prefix()
++        parent = SimpleNamespace(
++            _cached_system_prompt=PARENT_SYSTEM,
++            ephemeral_system_prompt=PARENT_EPHEMERAL,
++            tools=parent_tools,
++            _fork_prefix_snapshot=parent_prefix,
++            enabled_toolsets=["terminal", "file"],
++            disabled_toolsets=["kanban"],
++            session_start=_dt.datetime(2026, 1, 1, 12, 0, 0),
++            prefill_messages=[{"role": "system", "content": "PREFILL-BYTES"}],
++            _delegate_depth=0,
++        )
++        ctx = ForkContext.from_parent(parent, tool_call_id="call-1", goal=FORK_GOAL)
++        self.assertEqual(ctx.system_prompt, PARENT_SYSTEM)
++        self.assertEqual(ctx.ephemeral_system_prompt, PARENT_EPHEMERAL)
++        self.assertEqual(ctx.tools, PARENT_TOOLS)
++        self.assertEqual(ctx.prefix, parent_prefix)
++        self.assertEqual(ctx.assistant_message, parent_prefix[-1])
++        self.assertEqual(ctx.enabled_toolsets, ["terminal", "file"])
++        self.assertEqual(ctx.disabled_toolsets, ["kanban"])
++        self.assertEqual(ctx.goal, FORK_GOAL)
++        self.assertEqual(ctx.spawn_tool_call_id, "call-1")
++        # Detached: mutating the parent afterwards leaves the snapshot alone.
++        parent_tools.append(_tool_def("intruder"))
++        parent_prefix.append({"role": "user", "content": "intruder"})
++        parent.enabled_toolsets.append("intruder")
++        self.assertEqual(len(ctx.tools), len(PARENT_TOOLS))
++        self.assertEqual(len(ctx.prefix), 2)
++        self.assertEqual(ctx.enabled_toolsets, ["terminal", "file"])
++        # History builds detached too: siblings never share message dicts.
++        first = ctx.build_history(FORK_GOAL, "INSTRUCTION")
++        second = ctx.build_history(FORK_GOAL, "INSTRUCTION")
++        self.assertEqual(first, second)
++        self.assertIsNot(first[0], second[0])
++
++
+ class TestForkFirstRequestParity(unittest.TestCase):
+     def test_system_tools_and_prefix_parity(self):
+         """Fork child's first request: system identical, tools identical
+         (json dumps equal), messages[:k] equal to the parent's last request
+         messages, followed by the assistant tool-call message + results."""
+         parent = _StubParent()
+-        payload, children = _run_fork(parent, [{"goal": FORK_GOAL, "context": FORK_CONTEXT, "fork": True}])
++        ctx = _make_fork_context()
++        payload, children = _run_fork(
++            parent, [{"goal": FORK_GOAL, "context": FORK_CONTEXT, "fork": True}],
++            fork_context=ctx)
+         self.assertEqual(len(children), 1)
+         child = children[0]
+ 
+         # System prompt: byte-identical, no re-render, no additions.
+         self.assertEqual(child._cached_system_prompt, PARENT_SYSTEM)
+-        self.assertIs(child._cached_system_prompt, parent._cached_system_prompt)
++        self.assertIs(child._cached_system_prompt, ctx.system_prompt)
+         self.assertEqual(child.kwargs.get("ephemeral_system_prompt"), PARENT_EPHEMERAL)
+         wire_parent = (PARENT_SYSTEM + "\n\n" + PARENT_EPHEMERAL).strip()
+         wire_child = (child._cached_system_prompt + "\n\n" + child.ephemeral_system_prompt).strip()
+         self.assertEqual(wire_child, wire_parent)
+ 
+         # tools[]: byte-identical, same order — blocked tools NOT removed.
+-        self.assertEqual(json.dumps(child.tools), json.dumps(parent.tools))
++        self.assertEqual(json.dumps(child.tools), json.dumps(ctx.tools))
+         child_names = [t["function"]["name"] for t in child.tools]
+         for blocked in ("delegate_task", "memory", "clarify"):
+             self.assertIn(blocked, child_names)
+@@ -175,7 +251,7 @@ class TestForkFirstRequestParity(unittest.TestCase):
+         self.assertEqual(len(child.run_conversation_calls), 1)
+         call = child.run_conversation_calls[0]
+         history = call["conversation_history"]
+-        prefix = parent._fork_prefix_snapshot
++        prefix = ctx.prefix
+         self.assertEqual(history[: len(prefix)], prefix)
+         assistant = history[len(prefix) - 1]
+         self.assertEqual(assistant["role"], "assistant")
+@@ -200,16 +276,24 @@ class TestForkFirstRequestParity(unittest.TestCase):
+         self.assertEqual(first_request[: len(prefix)], prefix)
+         self.assertEqual(call["user_message"], FORK_GOAL)
+ 
+-        # Fork bookkeeping.
++        # Fork bookkeeping: the context is the state; the delegate module
++        # writes no fork-specific attributes onto the child.
+         self.assertTrue(child._is_fork_child)
+-        self.assertEqual(child._fork_conversation_history, history)
+-        self.assertTrue(child._review_defer_compaction_before_first_response)
+-        self.assertTrue(child._skip_mcp_refresh)
++        self.assertIsNotNone(child.fork_context)
++        self.assertIsInstance(child.fork_context, ForkContext)
++        self.assertEqual(child.fork_context.system_prompt, PARENT_SYSTEM)
++        self.assertEqual(child.fork_context.prefix, prefix)
++        self.assertEqual(child.fork_context.assistant_message, prefix[-1])
++        self.assertIn(FORK_GOAL, child.fork_context.instruction)
++        self.assertFalse(hasattr(child, "_fork_conversation_history"))
++        self.assertTrue(child.fork_context.skip_mcp_refresh)
++        self.assertTrue(child.fork_context.defer_compaction)
+         self.assertEqual(child._delegate_depth, 1)
+ 
+-        # Prefill deep-copied (send-time sanitizers must not rewrite parent's).
+-        self.assertEqual(child.kwargs.get("prefill_messages"), parent.prefill_messages)
+-        self.assertIsNot(child.kwargs.get("prefill_messages"), parent.prefill_messages)
++        # Prefill rides the context (send-time sanitizers must not rewrite
++        # the parent's bytes); detachment itself is proven by the capture test.
++        self.assertEqual(child.kwargs.get("prefill_messages"), ctx.prefill_messages)
++        self.assertIs(child.kwargs.get("prefill_messages"), ctx.prefill_messages)
+ 
+         # Parent received the normal result entry (transcript NOT merged).
+         self.assertIn("results", payload)
+@@ -240,11 +324,11 @@ class TestForkFirstRequestParity(unittest.TestCase):
+             {"goal": "First parallel analysis tropic", "fork": True},
+             {"goal": "Second parallel analysis tropic", "fork": True},
+         ]
+-        parent._fork_prefix_snapshot = [
++        ctx = _make_fork_context(prefix=[
+             {"role": "user", "content": "fan out please"},
+             {"role": "assistant", "content": "", "tool_calls": [_delegate_call_msg("call-9", tasks=tasks)]},
+-        ]
+-        payload, children = _run_fork(parent, tasks)
++        ])
++        payload, children = _run_fork(parent, tasks, fork_context=ctx)
+         self.assertEqual(len(children), 2)
+         histories = [c.run_conversation_calls[0]["conversation_history"] for c in children]
+         self.assertEqual(histories[0][:2], histories[1][:2])
+@@ -270,7 +354,7 @@ class TestForkFirstRequestParity(unittest.TestCase):
+             payload, children = _run_fork(
+                 parent, [{"goal": "Explicitly isolated task here", "fork": False}])
+         self.assertEqual(len(children), 1)
+-        self.assertFalse(getattr(children[0], "_is_fork_child", False))
++        self.assertFalse(children[0]._is_fork_child)
+ 
+     def test_schema_advertises_fork(self):
+         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
+@@ -280,9 +364,7 @@ class TestForkFirstRequestParity(unittest.TestCase):
+ 
+ class TestForkCallTimeRestrictions(unittest.TestCase):
+     def _fork_child(self):
+-        child = FakeAgent(model="m")
+-        child._is_fork_child = True
+-        return child
++        return FakeAgent(model="m", fork_context=_make_fork_context())
+ 
+     def test_blocked_tools_refuse_at_call_time(self):
+         from tools.delegate_tool_fork import fork_child_block_message
+@@ -325,10 +407,25 @@ class TestForkCallTimeRestrictions(unittest.TestCase):
+             message, _ = _pre_tool_block(child, _ToolCallRef("memory", {}, "t", "c", []))
+         self.assertIsNotNone(message)
+         self.assertIn("restriction enforcement failed", json.loads(message)["error"].lower())
++        # Even when the helper module itself cannot be imported, a fork child
++        # is still refused (the except path reads no helper names).
++        with patch.dict(sys.modules, {"tools.delegate_tool_fork": None}):
++            message, _ = _pre_tool_block(child, _ToolCallRef("memory", {}, "t", "c", []))
++        self.assertIsNotNone(message)
++        self.assertIn("restriction enforcement failed", json.loads(message)["error"].lower())
++
++    def test_turn_context_reads_deferral_off_context(self):
++        """The turn loop defers preflight compaction for fork children via
++        ``fork_context`` (no per-child attribute writes from the delegate
++        module); agents without a context are unaffected."""
++        from agent.turn_context import _review_fork_first_request_pending
++
++        child = self._fork_child()
++        self.assertTrue(_review_fork_first_request_pending(child))
++        self.assertFalse(_review_fork_first_request_pending(FakeAgent(model="m")))
+ 
+     def test_depth_limit_refusal_for_fork(self):
+         parent = _StubParent(depth=1)  # default max_spawn_depth == 1
+-        parent._is_fork_child = True
+         with patch("run_agent.AIAgent", FakeAgent):
+             raw = delegate_task(
+                 tasks=[{"goal": FORK_GOAL, "fork": True}],
+@@ -350,18 +447,57 @@ class TestForkCallTimeRestrictions(unittest.TestCase):
+         self.assertNotIn("do this work yourself", parsed["error"])
+ 
+ 
++class TestForkFirstRequestRecordedParity(unittest.TestCase):
++    def test_first_request_matches_pre_refactor_fixture(self):
++        """No behaviour change: the fork child's first request must stay
++        byte-identical to the pre-refactor recording
++        (``fork_first_request_fixture.json``, captured before CELL-A2)."""
++        fixture_path = os.path.join(os.path.dirname(__file__), "fork_first_request_fixture.json")
++        with open(fixture_path, encoding="utf-8") as fh:
++            recorded = json.load(fh)
++        parent = _StubParent()
++        ctx = _make_fork_context()
++        _, children = _run_fork(
++            parent, [{"goal": FORK_GOAL, "context": FORK_CONTEXT, "fork": True}],
++            fork_context=ctx)
++        self.assertEqual(len(children), 1)
++        child = children[0]
++        call = child.run_conversation_calls[0]
++        history = call["conversation_history"]
++        wire_child = (child._cached_system_prompt + "\n\n" + child.ephemeral_system_prompt).strip()
++        self.assertEqual(child._cached_system_prompt, recorded["child_cached_system"])
++        self.assertEqual(child.kwargs.get("ephemeral_system_prompt"), recorded["child_ephemeral"])
++        self.assertEqual(wire_child, recorded["wire_system"])
++        self.assertEqual(json.dumps(child.tools), recorded["child_tools_dumps"])
++        self.assertEqual(json.dumps(ctx.tools), recorded["parent_tools_dumps"])
++        self.assertEqual(history, recorded["conversation_history"])
++        # The run-time rebuild from context + instruction reproduces the
++        # recorded history (construction itself carries no transcript).
++        self.assertEqual(
++            child.fork_context.build_history(FORK_GOAL, child.fork_context.instruction),
++            recorded["fork_history"])
++        self.assertEqual(call["user_message"], recorded["user_message"])
++        self.assertEqual(child._delegate_depth, recorded["delegate_depth"])
++        self.assertEqual(child.fork_context.skip_mcp_refresh, recorded["skip_mcp_refresh"])
++        self.assertEqual(child.fork_context.defer_compaction, recorded["review_defer"])
++        self.assertEqual(bool(child._is_fork_child), recorded["is_fork_child"])
++        self.assertEqual(child.kwargs.get("enabled_toolsets"), recorded["enabled_toolsets"])
++        self.assertEqual(child.kwargs.get("disabled_toolsets"), recorded["disabled_toolsets"])
++        self.assertEqual(child.kwargs.get("prefill_messages"), recorded["prefill_messages"])
++
++
+ class TestNonForkPathUnchanged(unittest.TestCase):
+     def test_normal_child_has_no_fork_state(self):
+         parent = _StubParent()
+         payload, children = _run_fork(parent, [{"goal": "A normal isolated task here"}])
+         child = children[0]
+-        self.assertFalse(getattr(child, "_is_fork_child", False))
++        self.assertFalse(child._is_fork_child)
++        self.assertIsNone(getattr(child, "fork_context", None))
+         self.assertFalse(hasattr(child, "_fork_conversation_history"))
+-        # Focused task prompt, not the parent's cached system prompt.
++        # Focused task prompt, not an inherited cached system prompt.
+         ephemeral = child.kwargs.get("ephemeral_system_prompt") or ""
+         self.assertIn("YOUR TASK", ephemeral)
+-        self.assertNotEqual(
+-            getattr(child, "_cached_system_prompt", None), parent._cached_system_prompt)
++        self.assertIsNone(getattr(child, "_cached_system_prompt", None))
+         # Normal path starts a fresh conversation (no inherited history).
+         call = child.run_conversation_calls[0]
+         self.assertIsNone(call["conversation_history"])
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 5947d8d1..e6f8daa7 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -36,8 +36,8 @@ from tools.delegate_tool_config import (  # noqa: F401
+ )
+ from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
+ from tools.delegate_tool_fork import (  # noqa: F401
+-    apply_fork_parity, build_fork_conversation_history, build_fork_instruction, fork_depth_error,
+-    fork_parent_toolsets, resolve_task_fork, tasks_request_fork,
++    ForkContext, build_fork_instruction, fork_depth_error,
++    resolve_task_fork, tasks_request_fork,
+ )
+ from tools.delegate_tool_progress import (  # noqa: F401
+     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
+@@ -193,10 +193,20 @@ def _build_child_agent(
+     import uuid as _uuid
+     from run_agent import AIAgent
+     from agent.delegation_context import delegated_child_context
++    from dataclasses import replace as _replace_fork_context
+     # Role is depth-derived: a child may delegate iff the kill switch is on and
+     # depth budget remains below max_spawn_depth. The `role` arg is ignored.
+-    child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
+-    max_spawn = _get_max_spawn_depth()
++    # Fork children capture ONE context near entry and derive everything from
++    # it (child_depth/max_spawn included); the non-fork path is unchanged.
++    if fork:
++        fork_ctx = ForkContext.from_parent(
++            parent_agent, tool_call_id=fork_tool_call_id, goal=goal)
++        child_depth = fork_ctx.depth + 1
++        max_spawn = fork_ctx.max_depth
++    else:
++        fork_ctx = None
++        child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
++        max_spawn = _get_max_spawn_depth()
+     effective_role = "orchestrator" if _get_orchestrator_enabled() and child_depth < max_spawn else "leaf"
+ 
+     # One subagent_id shared by the progress callback, spawn_requested event and
+@@ -209,27 +219,24 @@ def _build_child_agent(
+     # as auxiliary.review.
+     delegation_cfg = _load_config()
+     if fork:
+-        # No re-render, no child-specific additions: the parent's exact toolset
+-        # pair (restriction moves to call time) and the parent's ephemeral
+-        # prompt (appended at API time, never cached) keep the wire bytes
+-        # identical. The task instruction rides the tool result instead.
+-        child_toolsets, child_disabled_toolsets = fork_parent_toolsets(parent_agent)
+-        child_prompt = getattr(parent_agent, "ephemeral_system_prompt", None)
++        # The task instruction rides the tool result, and agent-owned
++        # initialization installs the surface from the context at construction.
++        # No re-render, no child-specific additions, so the wire bytes stay
++        # identical and restriction moves to call time. The per-task goal is
++        # stamped here so a patched-from_parent fixture still carries it.
+         fork_instruction = build_fork_instruction(
+             goal=goal, context=context, child_depth=child_depth, max_spawn_depth=max_spawn,
+             output_schema=fork_schema,
+         )
+-        fork_history = build_fork_conversation_history(
+-            parent_agent, task_goal=goal, instruction=fork_instruction,
+-            spawn_tool_call_id=fork_tool_call_id,
+-        )
++        fork_ctx = _replace_fork_context(fork_ctx, instruction=fork_instruction, goal=goal)
++        child_toolsets, child_disabled_toolsets = fork_ctx.enabled_toolsets, fork_ctx.disabled_toolsets
++        child_prompt = fork_ctx.ephemeral_system_prompt
+     else:
+         child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+         child_prompt = _build_child_system_prompt(
+             goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+             max_spawn_depth=max_spawn, child_depth=child_depth,
+         )
+-        fork_history = None
+     parent_api_key = getattr(parent_agent, "api_key", None)
+     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
+         parent_api_key = parent_agent._client_kwargs.get("api_key")
+@@ -260,14 +267,13 @@ def _build_child_agent(
+         # a cold cache (Anthropic keys on thinking presence); parity wins.
+         logger.debug("fork child: ignoring delegation.reasoning_effort pin for cache parity")
+         rt["reasoning_config"] = getattr(parent_agent, "reasoning_config", None)
+-    # Prefill sits right after the system message: a fork child deep-copies the
+-    # parent's so send-time sanitizers cannot rewrite the parent's bytes
+-    # in place (same hazard background_review guards against).
+-    parent_prefill = getattr(parent_agent, "prefill_messages", None)
+-    if fork and isinstance(parent_prefill, list):
+-        import copy as _copy
+-
+-        parent_prefill = _copy.deepcopy(parent_prefill)
++    # Prefill sits right after the system message: a fork child reuses the
++    # detached copy on its context so send-time sanitizers cannot rewrite the
++    # parent's bytes in place (same hazard background_review guards against).
++    if fork:
++        parent_prefill = fork_ctx.prefill_messages
++    else:
++        parent_prefill = getattr(parent_agent, "prefill_messages", None)
+     parent_sid = getattr(parent_agent, "session_id", None)
+     child_session_db = _open_child_session_db(parent_agent)
+     with delegated_child_context():
+@@ -284,6 +290,7 @@ def _build_child_agent(
+                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                 tool_progress_callback=child_progress_cb,
+                 iteration_budget=None,  # fresh budget per subagent
++                fork_context=fork_ctx,
+             )
+         except BaseException:
+             # No child close() will ever run: release the dedicated handle here.
+@@ -294,12 +301,6 @@ def _build_child_agent(
+             raise
+     child._print_fn = getattr(parent_agent, "_print_fn", None)
+     _apply_child_cache_ttl(child)
+-    if fork:
+-        # Byte-identical system prompt / tools[] / reasoning pins (see
+-        # tools/delegate_tool_fork.apply_fork_parity); restrictions move to
+-        # call time so the advertised schema keeps the prefix cache warm.
+-        apply_fork_parity(child, parent_agent)
+-        child._fork_conversation_history = fork_history
+     if child_session_db is not None:
+         child._owns_session_db = True  # released by the child's close(), never by the parent
+     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index dd97f9ab..af5761fb 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
+ from agent.interrupt_compat import request_hard_interrupt
+ from dataclasses import dataclass, field
+ from tools import file_state
++from tools.delegate_tool_fork import fork_context_of
+ from tools.delegate_tool_progress import _quiet, _safe_progress
+ from tools.delegate_tool_registry import (
+     _capture_gateway_steer_authority, _close_subagent_steering, _register_subagent, _unregister_subagent,
+@@ -657,13 +658,18 @@ class _ChildRun:
+             from agent.delegation_context import delegated_child_context
+             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                 # Fork children replay the parent's transcript prefix (system /
+-                # tools parity is set at build time); the goal still lands as
+-                # the turn's user message so the inherited tool results are
++                # tools parity was installed at construction); the history is
++                # rebuilt here from the context + instruction so construction
++                # carries no per-task transcript. The goal still lands as the
++                # turn's user message so the inherited tool results are
+                 # extended at the END, keeping the parent's request a KV prefix.
+-                fork_history = getattr(child, "_fork_conversation_history", None)
+-                if isinstance(fork_history, list) and fork_history:
++                # isinstance-gated inside fork_context_of (mocks auto-create
++                # attributes); only a real snapshot drives the fork path.
++                fork_ctx = fork_context_of(child)
++                if fork_ctx is not None:
+                     return child.run_conversation(
+-                        user_message=self.goal, conversation_history=fork_history,
++                        user_message=self.goal,
++                        conversation_history=fork_ctx.build_history(self.goal, fork_ctx.instruction),
+                         task_id=self.child_task_id, stream_callback=self.relay_text,
+                     )
+                 return child.run_conversation(
+diff --git a/tools/delegate_tool_fork.py b/tools/delegate_tool_fork.py
+index ef935396..c980d0ea 100644
+--- a/tools/delegate_tool_fork.py
++++ b/tools/delegate_tool_fork.py
+@@ -30,6 +30,7 @@ from __future__ import annotations
+ import copy
+ import json
+ import logging
++from dataclasses import dataclass, field
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
+@@ -224,94 +225,153 @@ def _spawning_call_id(
+     return ids[0][0] if ids else None
+ 
+ 
+-def build_fork_conversation_history(
+-    parent_agent: Any, *, task_goal: str, instruction: str,
+-    spawn_tool_call_id: Optional[str] = None,
+-) -> List[Dict[str, Any]]:
+-    """Full initial history for one fork child: parent prefix + verbatim
+-    assistant tool-call message + one tool result per tool_call id (this
+-    task's result carries ``instruction``)."""
+-    prefix = _snapshot_prefix(parent_agent)
+-    assistant_msg, tool_calls = _assistant_tool_calls(prefix)
+-    if assistant_msg is None:
+-        assistant_msg = _synthesized_assistant(task_goal)
+-        prefix = prefix + [assistant_msg]
+-        tool_calls = assistant_msg["tool_calls"]
+-    spawn_id = _spawning_call_id(tool_calls, task_goal, spawn_tool_call_id)
+-    history = list(prefix)
+-    for tc in tool_calls:
+-        cid = _tool_call_id(tc)
+-        if not cid:
+-            continue
+-        content = instruction if cid == spawn_id else _FORK_SIBLING_PLACEHOLDER
+-        history.append({
+-            "role": "tool", "name": _tool_call_name(tc) or "delegate_task",
+-            "tool_name": _tool_call_name(tc) or "delegate_task",
+-            "content": content, "tool_call_id": cid,
+-        })
+-    return history
+-
+-
+-def fork_parent_toolsets(parent_agent: Any) -> Tuple[Any, Any]:
+-    """``(enabled_toolsets, disabled_toolsets)`` for a fork child: the parent's
+-    own pair, verbatim — restriction moves to call time so ``tools[]`` stays
+-    byte-identical."""
+-    return getattr(parent_agent, "enabled_toolsets", None), getattr(parent_agent, "disabled_toolsets", None)
+-
+-
+-def apply_fork_parity(child: Any, parent_agent: Any) -> None:
+-    """Post-construction parity for a fork child (mirrors
+-    ``agent.background_review.build_cache_parity_fork``): inherit the parent's
+-    cached system prompt verbatim (no re-render), pin ``session_start`` so any
+-    re-render stays byte-identical, advertise the parent's exact ``tools[]``
+-    (frozen snapshot generation so refreshes cannot rebuild it), skip the
+-    between-turns MCP refresh for the same reason, and defer preflight
+-    compaction until after the first provider response so request #1 is a warm
+-    cache read. Marks the child ``_is_fork_child`` for the call-time guard."""
+-    from agent.background_review import _inherit_parent_tool_surface
+-
+-    system = getattr(parent_agent, "_cached_system_prompt", None)
+-    if isinstance(system, str) and system:
+-        child._cached_system_prompt = system
+-    else:
+-        logger.warning(
+-            "fork child: parent has no cached system prompt; the child prompt "
+-            "was built fresh and the first request will miss the prefix cache",
++@dataclass(frozen=True)
++class ForkContext:
++    """Everything a ``delegate_task`` fork child inherits from its parent.
++
++    "What a fork is" as a type instead of N private attributes read off the
++    parent at scattered call sites: the parent's cached system prompt text,
++    its exact ``tools[]`` snapshot, its last-request transcript prefix, the
++    toolset pair, depth / max depth, the blocked-tool policy, the per-task
++    fork instruction, and the flags the child needs (skip MCP refresh, defer
++    review compaction). ``from_parent`` is the ONE place that reads the
++    parent's internals; ``_build_child_agent`` builds exactly one of these
++    per fork and passes it into child construction, where agent-owned
++    initialization installs the cached prompt / tool surface from it.
++    ``child._is_fork_child`` (a read-only property on ``AIAgent``) is simply
++    ``child.fork_context is not None``.
++
++    Frozen prevents rebinding, not deep immutability: ``from_parent``
++    deep-copies every captured structure (prefix, tools, toolsets, prefill)
++    so the snapshot is detached from the parent, and ``build_history``
++    deep-copies on the way out so sibling children never share message
++    dicts.
++    """
++
++    system_prompt: Optional[str] = None
++    ephemeral_system_prompt: Optional[str] = None
++    tools: List[Dict[str, Any]] = field(default_factory=list)
++    prefix: List[Dict[str, Any]] = field(default_factory=list)
++    enabled_toolsets: Optional[Any] = None
++    disabled_toolsets: Optional[Any] = None
++    session_start: Optional[Any] = None
++    prefill_messages: Optional[Any] = None
++    # Parent's raw ``_delegate_depth`` (the CHILD's depth is ``depth + 1``,
++    # derived by ``_build_child_agent``); ``max_depth`` is the configured
++    # ``_get_max_spawn_depth()`` the parent itself was built under.
++    depth: int = 0
++    max_depth: int = 1
++    blocked_tools: Tuple[str, ...] = tuple(_FORK_BLOCKED_TOOL_REASONS)
++    skip_mcp_refresh: bool = True
++    defer_compaction: bool = True
++    spawn_tool_call_id: Optional[str] = None
++    goal: str = ""
++    instruction: str = ""
++
++    @classmethod
++    def from_parent(
++        cls, parent_agent: Any, assistant_msg: Optional[Dict[str, Any]] = None,
++        tool_call_id: Optional[str] = None, goal: str = "",
++    ) -> "ForkContext":
++        """Capture the fork snapshot from the parent (the only reader of the
++        parent's fork internals). ``assistant_msg`` pins an explicitly staged
++        assistant tool-call message when the caller has it but the parent has
++        not stashed it yet; ``tool_call_id`` pins the spawning call id;
++        ``goal`` records the task being spawned. Config/depth semantics are
++        the caller's: ``max_depth`` is ``_get_max_spawn_depth()`` exactly as
++        ``_build_child_agent`` resolves it, and ``depth`` is the parent's raw
++        ``_delegate_depth``."""
++        prefix = _snapshot_prefix(parent_agent)
++        if assistant_msg is not None and (not prefix or prefix[-1] != assistant_msg):
++            prefix = prefix + [copy.deepcopy(assistant_msg)]
++        parent_tools = getattr(parent_agent, "tools", None)
++        parent_prefill = getattr(parent_agent, "prefill_messages", None)
++        parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
++        parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
++        from tools.delegate_tool_config import _get_max_spawn_depth
++        return cls(
++            system_prompt=getattr(parent_agent, "_cached_system_prompt", None),
++            ephemeral_system_prompt=getattr(parent_agent, "ephemeral_system_prompt", None),
++            tools=copy.deepcopy(parent_tools) if isinstance(parent_tools, list) else [],
++            prefix=prefix,
++            enabled_toolsets=copy.deepcopy(parent_enabled) if isinstance(parent_enabled, list) else parent_enabled,
++            disabled_toolsets=copy.deepcopy(parent_disabled) if isinstance(parent_disabled, list) else parent_disabled,
++            session_start=getattr(parent_agent, "session_start", None),
++            prefill_messages=copy.deepcopy(parent_prefill) if isinstance(parent_prefill, list) else parent_prefill,
++            depth=getattr(parent_agent, "_delegate_depth", 0),
++            max_depth=_get_max_spawn_depth(),
++            spawn_tool_call_id=tool_call_id,
++            goal=goal,
+         )
+-    try:
+-        import datetime as _dt
+-        parent_start = getattr(parent_agent, "session_start", None)
+-        if isinstance(parent_start, _dt.datetime):
+-            child.session_start = parent_start
+-    except Exception:
+-        pass
+-    parent_tools = getattr(parent_agent, "tools", None)
+-    if (isinstance(parent_tools, list) and parent_tools
+-            and all(isinstance(t, dict) for t in parent_tools)):
+-        _inherit_parent_tool_surface(child, parent_agent)
+-    else:
+-        logger.warning(
+-            "fork child: parent tools[] is not a concrete list; keeping the "
+-            "constructed toolsets and the first request may miss the cache",
++
++    @property
++    def assistant_message(self) -> Optional[Dict[str, Any]]:
++        """The staged assistant tool-call message ending the prefix (the
++        verbatim message the child replays), or ``None`` when the prefix
++        does not end on one. Read-only view into the snapshot."""
++        assistant_msg, _ = _assistant_tool_calls(self.prefix)
++        return assistant_msg
++
++    def build_history(
++        self, task_goal: Optional[str] = None, instruction: str = "",
++        spawn_tool_call_id: Optional[str] = None,
++    ) -> List[Dict[str, Any]]:
++        """Full initial history for one fork child: parent prefix + verbatim
++        assistant tool-call message + one tool result per tool_call id (this
++        task's result carries ``instruction``, defaulting to this context's
++        own when not given). Detached: safe to hand to the child's turn."""
++        if not instruction:
++            instruction = self.instruction
++        goal = task_goal if task_goal is not None else self.goal
++        prefix = copy.deepcopy(self.prefix)
++        assistant_msg, tool_calls = _assistant_tool_calls(prefix)
++        if assistant_msg is None:
++            assistant_msg = _synthesized_assistant(goal)
++            prefix = prefix + [assistant_msg]
++            tool_calls = assistant_msg["tool_calls"]
++        pinned = spawn_tool_call_id if spawn_tool_call_id is not None else self.spawn_tool_call_id
++        spawn_id = _spawning_call_id(tool_calls, goal, pinned)
++        history = list(prefix)
++        for tc in tool_calls:
++            cid = _tool_call_id(tc)
++            if not cid:
++                continue
++            content = instruction if cid == spawn_id else _FORK_SIBLING_PLACEHOLDER
++            history.append({
++                "role": "tool", "name": _tool_call_name(tc) or "delegate_task",
++                "tool_name": _tool_call_name(tc) or "delegate_task",
++                "content": content, "tool_call_id": cid,
++            })
++        return history
++
++    def block_message(self, tool_name: str) -> Optional[str]:
++        """Call-time restriction: ``None`` to proceed, else the tool-error
++        text. ``delegate_task`` is never listed here — its own depth budget
++        decides."""
++        if tool_name not in self.blocked_tools:
++            return None
++        reason = _FORK_BLOCKED_TOOL_REASONS.get(tool_name, "restricted for fork children")
++        return json.dumps(
++            {"error": f"not available to a forked child: {reason} ({tool_name})"},
++            ensure_ascii=False,
+         )
+-    child._skip_mcp_refresh = True
+-    # Same deferral the background-review fork uses: preflight compaction must
+-    # not rewrite the inherited prefix before the first response (spec §6).
+-    # Consumed generically by agent/turn_context._review_fork_first_request_pending.
+-    child._review_defer_compaction_before_first_response = True
+-    child._is_fork_child = True
++
++
++def fork_context_of(agent: Any) -> Optional["ForkContext"]:
++    """The fork snapshot when ``agent`` is a real fork child, else ``None``.
++    The single canonical read — isinstance-gated because test doubles and
++    mocks auto-create attributes, and only a real snapshot may drive fork
++    behavior."""
++    ctx = getattr(agent, "fork_context", None)
++    return ctx if isinstance(ctx, ForkContext) else None
+ 
+ 
+ def fork_child_block_message(agent: Any, tool_name: str) -> Optional[str]:
+     """Call-time restriction for fork children: ``None`` to proceed, else the
+     tool-error text. ``delegate_task`` always passes through here — its own
+-    depth budget decides (depth == max refuses inside ``delegate_task``)."""
+-    if not getattr(agent, "_is_fork_child", False):
+-        return None
+-    reason = _FORK_BLOCKED_TOOL_REASONS.get(tool_name)
+-    if reason is None:
++    depth budget decides (depth == max refuses inside ``delegate_task``).
++    Reads the child's ``fork_context``; agents without one proceed."""
++    ctx = fork_context_of(agent)
++    if ctx is None:
+         return None
+-    return json.dumps(
+-        {"error": f"not available to a forked child: {reason} ({tool_name})"},
+-        ensure_ascii=False,
+-    )
++    return ctx.block_message(tool_name)
+-- 
+2.54.0.windows.1
+

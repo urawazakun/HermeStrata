@@ -1,0 +1,1415 @@
+From 81ae363bb8d3c904162d2a4133922f6bc27d65bb Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:45:27 +0900
+Subject: [PATCH 6/9] Cache API: aux composition tests, authenticated /v1/cache
+ inventory and non-pinned tip deletion
+
+Squashed from branch v100-030 (48ec4f9..1bd0640); history in docs/KNOWN-ISSUES.md and docs/ACCEPTANCE.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/hermes-cache-acceptance.md        |  57 +-
+ include/strata/program/saved_state.hpp |  13 +-
+ serve/server.py                        | 330 ++++++++++-
+ serve/test_server.py                   | 741 ++++++++++++++++++++++++-
+ src/program/generate.cpp               |  73 ++-
+ src/program/saved_state.cpp            |  10 +
+ src/program/saved_state_test.cpp       |  39 ++
+ 7 files changed, 1248 insertions(+), 15 deletions(-)
+
+diff --git a/docs/hermes-cache-acceptance.md b/docs/hermes-cache-acceptance.md
+index dc89c79..c5da5af 100644
+--- a/docs/hermes-cache-acceptance.md
++++ b/docs/hermes-cache-acceptance.md
+@@ -50,8 +50,55 @@ disables root-disk loading AND storing - without it a warm disk would serve the
+    and length). Record resume source/k/suffix, restore/snapshot ms, prefill ms, decode tok/s,
+    acceptance. Decode must stay within measured run-to-run noise.
+ 6. Capacity/debug (GET/DELETE need S2; budget/eviction parts run now): lower the tip budget,
+-   alternate enough lines to force eviction. Require pinned roots to survive, tip bytes within
+-   budget, exact-prefix matching (two unrelated same-length lines must not cross-match), and the
+-   disk dir within cap after background writes settle. After S2: GET `/v1/cache` inventory and
+-   DELETE dropping non-pinned tips only. Record peak host RAM and retained lines; the fork
+-   budget must hold at least depth+1 intended lines.
++    alternate enough lines to force eviction. Require pinned roots to survive, tip bytes within
++    budget, exact-prefix matching (two unrelated same-length lines must not cross-match), and the
++    disk dir within cap after background writes settle. After S2: GET `/v1/cache` inventory and
++    DELETE dropping non-pinned tips only. Record peak host RAM and retained lines; the fork
++    budget must hold at least depth+1 intended lines.
++
++## S2 cache API (GET/DELETE /v1/cache)
++
++Same auth as `/v1/models` (Bearer or x-api-key; 401 without a valid key when configured). GET and DELETE are supported; unknown GET/DELETE paths return 404.
++Engines without a cache pipe are 501 `unsupported` (MockEngine, which speaks the pipe, reports the
++honest empty inventory). A cache call waits for the Service FIFO behind any running/queued request,
++bounded (30 s): past that it answers 503 busy without sending anything or disturbing the active
++generation. A dead engine is 503; an ERR/malformed reply is 503 only after its remainder is consumed
++to a response boundary — otherwise the engine is stopped for a clean restart (a late ERR must never
++reach a future generation) and later cache calls fail until a generation restarts it.
++
++`GET /v1/cache` answers the SavedState inventory:
++
++```json
++{"memory": {"tip_budget_bytes": 8589934592, "tip_bytes": 6789,
++            "items": [{"kind": "root", "pinned": true, "ids_len": 2048, "bytes": 12345,
++                       "last_use": 7},
++                      {"kind": "tip", "pinned": false, "ids_len": 4096, "bytes": 6789,
++                       "last_use": 9}]},
++ "disk": {"enabled": true,
++          "items": [{"kind": "root", "pinned": true, "ids_len": 2048, "bytes": 123456}]}}
++```
++
++`DELETE /v1/cache` drops all non-pinned tips only (pinned memory roots and every disk root survive)
++and answers `{"dropped": <tips dropped>, "memory": {...}, "disk": {...}}` in the GET shape.
++
++Semantics the owner relies on:
++
++- `memory.items` lists roots first, then tips. `tip_budget_bytes` is the `--tip-cache-gib` budget,
++  `tip_bytes` the live tip total (within budget after eviction).
++- `last_use` is the RAM LRU clock in store ticks (a per-process monotonic counter advanced by every
++  insert and by every mounted restore via `note_use`), not a wall timestamp. Higher means used more
++  recently; values are comparable only within one engine process lifetime.
++- DELETE removes tips only. The live `ConvCheckpoint` chain (this session's in-progress history) is
++  untouched and keeps serving the next request; pinned memory roots stay pinned.
++- The `disk` section lists indexed roots only (`enabled` says whether root-disk is on at all) as
++  `kind`/`pinned`/`ids_len`/`bytes` metadata — payloads are never loaded for inventory, and disk rows
++  carry no `last_use` (the disk cap trim is LRU by file mtime, not by the RAM clock). The disk index
++  is eventually consistent: a just-captured root appears after the background writer lands it, so a
++  GET immediately after a first-prefix request may not list it yet.
++- The live `ConvCheckpoint` chain is per-request history and is NOT reported: GET covers SavedState
++  roots/tips plus the disk index only.
++- Nothing identifying content leaves the engine: no token ids, no payload bytes, no filesystem paths,
++  no header/identity fields — only lengths, byte counts, kinds, pin flags and the LRU clock.
++- A CACHE command arriving after DONE is answered only after the engine's post-DONE capture
++  completes, so the inventory (or the drop) always reflects the finished request's tip — including
++  the generated tokens the section-7 fork rule requires.
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 81bfb01..9e73475 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -344,7 +344,15 @@ struct ResumeStats {
+     double snapshot_ms = 0.0;
+ };
+ 
+-/// S2's inventory row (interface only in E1): GET /v1/cache lists these; DELETE drops all non-pinned.
++/// S2's disk inventory row (interface for GET /v1/cache): metadata only, never a payload.
++/// No path, no header/identity internals, no tokens: ids length + file bytes. The disk holds pinned
++/// roots only; last_use (the RAM LRU clock) does not exist on disk (the cap trim is LRU by mtime).
++struct DiskInventoryEntry {
++    size_t ids_len = 0;
++    uint64_t bytes = 0;
++};
++
++    /// S2's inventory row (interface only in E1): GET /v1/cache lists these; DELETE drops all non-pinned.
+ struct InventoryEntry {
+     Kind kind = Kind::Tip;
+     size_t ids_len = 0;
+@@ -530,6 +538,9 @@ class RootDiskStore {
+     bool enabled() const;
+     size_t indexed() const;                 ///< files in the RAM index
+     size_t pending() const;                 ///< captures waiting in the writer queue
++    /// S2 GET /v1/cache's disk section: one row per indexed file (ids length + file bytes, no
++    /// payload loaded, no path). Order is the index (key) order: deterministic, not LRU.
++    std::vector<DiskInventoryEntry> disk_inventory() const;
+     /// Longest index entry whose full ids prefix-match `ids` (exact images/cvec/geometry/compat), with
+     /// lo < ids_len < hi and path not in `skip`. Payload is NOT loaded here (lazy on load_item).
+     bool find_match(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
+diff --git a/serve/server.py b/serve/server.py
+index de61d89..c9ed89c 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -92,6 +92,13 @@ class MockEngine:
+                 time.sleep(self.delay)
+             yield t
+ 
++    def cache_rpc(self, op, timeout=None):
++        """S2 without an engine process: the honest empty inventory (no SavedState lives here)."""
++        format_cache_command(op)                          # same op gate as the pipe path
++        inv = {"memory": {"tip_budget_bytes": 0, "tip_bytes": 0, "items": []},
++               "disk": {"enabled": False, "items": []}}
++        return {"dropped": 0, **inv} if op == "DROP" else inv
++
+ 
+ class EngineDied(RuntimeError):
+     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+@@ -206,13 +213,17 @@ class StrataEngine:
+             self.info["version"] = str(self.info["engine"])
+         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
+         self.lines: queue.Queue = queue.Queue()
+-        threading.Thread(target=self._pump, daemon=True).start()
+-
+-    def _pump(self):
+-        for line in self.proc.stdout:
+-            self.lines.put(line)
+-        self.ended = True                               # its output closed: it is gone, even before the OS says so
+-        self.lines.put(None)
++        self._cache_desync = False                     # a cache exchange left the pipe mid-response (see cache_rpc)
++        threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
++
++    def _pump(self, proc, q):
++        # Process-local refs: after a restart the old pump's EOF lands in the OLD queue, never in the fresh
++        # one (which would read as a spurious engine-death). Only the still-current proc may set ended.
++        for line in proc.stdout:
++            q.put(line)
++        q.put(None)
++        if self.proc is proc:
++            self.ended = True                           # its output closed: it is gone, even before the OS says so
+ 
+     def death_note(self) -> str:
+         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+@@ -413,6 +424,120 @@ class StrataEngine:
+         except Exception:
+             self.proc.kill()
+ 
++    def _cache_invalidate(self):
++        """A cache exchange left the pipe mid-response (no CACHE_END or ERR consumed): a late reply could be
++        trusted as a fresh answer, or leak generation tokens into a later request. Stop the engine instead -
++        the next generation restarts it via the existing alive()/restart() flow, and cache calls fail as
++        EngineDied until then. Never returns a usable pipe."""
++        self._cache_desync = True
++        try:
++            self.proc.kill()
++        except OSError:
++            pass
++        self.ended = True
++
++    def _cache_drain(self) -> str:
++        """Consume a failed exchange's remainder: "end"/"err" when a response boundary was consumed (the pipe
++        is reusable), "dead" when the engine died mid-drain, "open" when nothing bounded arrived (desync)."""
++        end = time.monotonic() + CACHE_DRAIN_S
++        for _ in range(CACHE_MAX_ITEMS):
++            try:
++                line = self.lines.get(timeout=max(0.0, end - time.monotonic()))
++            except queue.Empty:
++                return "open"
++            if line is None:
++                return "dead"
++            if line.strip() == "CACHE_END" or line.startswith("ERR"):
++                return "end" if line.strip() == "CACHE_END" else "err"
++        return "open"
++
++    def cache_rpc(self, op, timeout=None):
++        """S2: one `CACHE <op>` exchange with the resident engine (the caller holds Service.fifo).
++
++        Returns {"memory": {"tip_budget_bytes", "tip_bytes", "items": [...]}, "disk": {"enabled", "items":
++        [...]}} plus {"dropped": n} for DROP. Raises EngineDied (dead pipe or a desynchronized one, stopped
++        for safety), TimeoutError (no CACHE_END in time) or ValueError (the engine's ERR line, or a strict
++        parse/count rejection). The pipe is reused after a failure ONLY when a response boundary (CACHE_END
++        or the standalone ERR line) was consumed - a late ERR is never left for a future GEN (which would
++        raise on it and orphan its real tokens), and post-CACHE_END count errors never drain (the next reply
++        is already on the wire). Otherwise the engine is stopped for a clean restart. All deadlines use the
++        monotonic clock."""
++        if timeout is None:
++            timeout = CACHE_TIMEOUT_S
++        format_cache_command(op)                          # ValueError on an unknown op, before touching the pipe
++        if getattr(self, "_cache_desync", False):
++            raise EngineDied("the cache protocol desynchronized; the engine was stopped for a clean restart")
++        try:
++            self.proc.stdin.write(f"CACHE {op}\n")
++            self.proc.stdin.flush()
++        except OSError:
++            self._cache_invalidate()
++            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
++        expect_dropped = op == "DROP"
++        begin, memory, disk_items, disk_enabled = None, [], [], False
++        terminal: str | None = None                       # "end" once CACHE_END is consumed, "err" on ERR
++        deadline = time.monotonic() + timeout
++        try:
++            for _ in range(CACHE_MAX_ITEMS + 2):
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError(f"the engine did not answer CACHE {op} in time")
++                try:
++                    line = self.lines.get(timeout=remaining)
++                except queue.Empty:
++                    raise TimeoutError(f"the engine did not answer CACHE {op} in time") from None
++                if line is None:
++                    self._cache_invalidate()
++                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
++                if line.startswith("ERR"):
++                    # A standalone terminal: the whole response. Never drained (nothing follows it) and the
++                    # pipe stays reusable - but never left queued, where a future GEN would raise on it.
++                    terminal = "err"
++                    raise ValueError(line[4:].strip() or "the engine refused the cache command")
++                s = line.strip()
++                if s == "CACHE_END":
++                    terminal = "end"
++                    if begin is None:
++                        raise ValueError("CACHE_END without CACHE_BEGIN")
++                    break
++                if s.startswith("CACHE_BEGIN"):
++                    if begin is not None:
++                        raise ValueError("two CACHE_BEGIN lines")
++                    begin = parse_cache_begin(s, expect_dropped)
++                    disk_enabled = begin.pop("disk_enabled")
++                    continue
++                if s.startswith("CACHE "):
++                    if begin is None:
++                        raise ValueError("CACHE item before CACHE_BEGIN")
++                    item = parse_cache_item(s)
++                    if len(memory) + len(disk_items) >= CACHE_MAX_ITEMS:
++                        raise ValueError("too many cache items")
++                    (memory if item.pop("source") == "memory" else disk_items).append(item)
++                    continue
++                # Anything else on an idle pipe (a GEN-protocol stray, a blank line, garbage) is a protocol
++                # violation, never absorbed: trusting the rest of the reply after it is how stale inventories
++                # and orphaned tokens happen.
++                raise ValueError(f"unexpected engine line during CACHE {op}: {s[:60]!r}")
++            else:
++                raise ValueError("too many cache lines")
++        except TimeoutError:
++            if self._cache_drain() not in ("end", "err"):
++                self._cache_invalidate()
++            raise
++        except ValueError:
++            if terminal is None and self._cache_drain() not in ("end", "err"):
++                self._cache_invalidate()
++            raise
++        if begin is None:                                 # unreachable (CACHE_END requires begin), kept explicit
++            raise ValueError("no CACHE_BEGIN from the engine")
++        # Post-terminal count validation: CACHE_END is already consumed, so no drain here - draining would eat
++        # the NEXT reply. A mismatch still fails the call, but the pipe stays reusable.
++        validate_cache_inventory(begin, memory, disk_items)
++        out = {"memory": {"tip_budget_bytes": begin["tip_budget_bytes"], "tip_bytes": begin["tip_bytes"],
++                          "items": memory},
++               "disk": {"enabled": disk_enabled, "items": disk_items}}
++        return {"dropped": begin["dropped"], **out} if expect_dropped else out
++
+ 
+ class Vision:
+     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
+@@ -628,6 +753,135 @@ def is_aux_request(req: dict, tools) -> bool:
+     return not tools and bool(req.get("response_format"))
+ 
+ 
++# ------------------------------------------------------------------------------------------------ S2 cache control
++# GET/DELETE /v1/cache over the engine's stdin/stdout: the server writes one line (`CACHE INVENTORY` or
++# `CACHE DROP`) and reads `CACHE_BEGIN ...` item lines (`CACHE memory|disk ...`) up to `CACHE_END` (`ERR ...`
++# on engine failure). The exchange holds Service.fifo like a generation (bounded wait: 503 busy instead of
++# blocking forever), so cache commands never race the engine output reader; vision encoding holds the same
++# fifo. The engine answers between requests, after its post-DONE capture finished, so the inventory (or the
++# drop) always sees the finished request's tip. Parsing is strict (exact field sets, bounded counts,
++# post-CACHE_END count/byte validation); a failure reuses the pipe ONLY after consuming CACHE_END or the
++# standalone ERR line, else the engine is stopped for a clean restart (a late ERR must never reach a future
++# GEN). Engines without a cache pipe are 501, never a fabricated success. last_use is the RAM LRU clock
++# (inserts and mounts advance it); the live ConvCheckpoint chain is per-request history and is NOT reported.
++# Disk rows are index metadata only (payloads never loaded); memory and disk are separate sections, and no
++# tokens, payloads, filesystem paths or identity internals ever reach HTTP.
++CACHE_TIMEOUT_S = 30.0            # one cache exchange may wait this long (post-DONE capture runs first)
++CACHE_DRAIN_S = 5.0               # after a malformed reply, how long to discard until CACHE_END
++CACHE_MAX_ITEMS = 100000          # bound on inventory lines per exchange
++CACHE_FIFO_TIMEOUT_S = 30.0       # how long a cache call waits for a busy engine before answering 503 busy
++
++
++def format_cache_command(op: str) -> str:
++    """The stdin line for a cache exchange: `CACHE INVENTORY` or `CACHE DROP` (ValueError otherwise)."""
++    if op not in ("INVENTORY", "DROP"):
++        raise ValueError(f"unknown cache op {op!r}")
++    return f"CACHE {op}\n"
++
++
++def _cache_int(fields: dict, key: str) -> int:
++    try:
++        v = int(fields[key])
++    except (KeyError, TypeError, ValueError):
++        raise ValueError(f"bad cache field {key!r}") from None
++    if v < 0:
++        raise ValueError(f"bad cache field {key!r}")
++    return v
++
++
++def _cache_fields(parts: list, allowed: set, what: str) -> dict:
++    """Split `k=v` tokens strictly: no duplicates, no unknown fields, no bare tokens."""
++    fields = {}
++    for tok in parts:
++        k, sep, v = tok.partition("=")
++        if not sep or not k or not v:
++            raise ValueError(f"bad cache field {tok!r} in {what}")
++        if k in fields:
++            raise ValueError(f"duplicate cache field {k!r} in {what}")
++        if k not in allowed:
++            raise ValueError(f"unknown cache field {k!r} in {what}")
++        fields[k] = v
++    return fields
++
++
++# Every count the engine reports is bounded: roots are a handful, tips fit the byte budget, disk fits the cap.
++_CACHE_BEGIN_INVENTORY = {"budget", "used", "roots", "tips", "disk", "disk_enabled"}
++_CACHE_BEGIN_DROP = _CACHE_BEGIN_INVENTORY | {"dropped"}
++_CACHE_ITEM_MEMORY = {"kind", "pinned", "ids_len", "bytes", "last_use"}
++_CACHE_ITEM_DISK = {"kind", "pinned", "ids_len", "bytes"}
++
++
++def parse_cache_begin(line: str, expect_dropped: bool) -> dict:
++    """`CACHE_BEGIN ...` -> {"dropped"?, "tip_budget_bytes", "tip_bytes", "roots", "tips", "disk", "disk_enabled"}.
++
++    Strict: exact field set (dropped only for DROP), every count within CACHE_MAX_ITEMS."""
++    parts = line.split()
++    if not parts or parts[0] != "CACHE_BEGIN":
++        raise ValueError("not a CACHE_BEGIN line")
++    fields = _cache_fields(parts[1:], _CACHE_BEGIN_DROP if expect_dropped else _CACHE_BEGIN_INVENTORY,
++                           "CACHE_BEGIN")
++    out = {}
++    if expect_dropped:
++        out["dropped"] = _cache_int(fields, "dropped")
++    out["tip_budget_bytes"] = _cache_int(fields, "budget")
++    out["tip_bytes"] = _cache_int(fields, "used")
++    out["roots"] = _cache_int(fields, "roots")
++    out["tips"] = _cache_int(fields, "tips")
++    out["disk"] = _cache_int(fields, "disk")
++    if out["roots"] > CACHE_MAX_ITEMS or out["tips"] > CACHE_MAX_ITEMS or out["disk"] > CACHE_MAX_ITEMS:
++        raise ValueError("cache counts out of range")
++    if "disk_enabled" not in fields or fields["disk_enabled"] not in ("0", "1"):
++        raise ValueError("bad cache field 'disk_enabled'")
++    out["disk_enabled"] = fields["disk_enabled"] == "1"
++    for key in ("budget", "used", "roots", "tips", "disk", "dropped"):
++        if key in fields and fields[key] != str(_cache_int(fields, key)):
++            raise ValueError(f"bad cache field {key!r}")
++    return out
++
++
++def parse_cache_item(line: str) -> dict:
++    """`CACHE memory|disk kind=... ...` -> {"source", "kind", "pinned", "ids_len", "bytes", "last_use"?}.
++
++    Strict: exact field set per source (memory rows carry last_use, disk rows never do)."""
++    parts = line.split()
++    if len(parts) < 3 or parts[0] != "CACHE" or parts[1] not in ("memory", "disk"):
++        raise ValueError("not a CACHE item line")
++    source = parts[1]
++    fields = _cache_fields(parts[2:], _CACHE_ITEM_MEMORY if source == "memory" else _CACHE_ITEM_DISK,
++                           "CACHE item")
++    if fields.get("kind") not in ("root", "tip"):
++        raise ValueError("bad cache kind")
++    if source == "disk" and fields["kind"] != "root":
++        raise ValueError("disk holds pinned roots only")
++    pinned = _cache_int(fields, "pinned")
++    if pinned not in (0, 1):
++        raise ValueError("bad cache pinned flag")
++    if bool(pinned) != (fields["kind"] == "root"):
++        raise ValueError("only roots are pinned")
++    out = {"source": source, "kind": fields["kind"], "pinned": bool(pinned),
++           "ids_len": _cache_int(fields, "ids_len"), "bytes": _cache_int(fields, "bytes")}
++    if source == "memory":
++        out["last_use"] = _cache_int(fields, "last_use")
++    return out
++
++
++def validate_cache_inventory(begin: dict, memory: list, disk_items: list) -> None:
++    """Cross-check a complete exchange: row counts match CACHE_BEGIN, tip bytes sum to `used`, and the
++    budget covers them. Raises ValueError on any truncation or mismatch (called after CACHE_END, so the
++    caller must NOT drain on failure: the next reply is already on the wire)."""
++    roots = sum(1 for i in memory if i["kind"] == "root")
++    tips = sum(1 for i in memory if i["kind"] == "tip")
++    if roots != begin["roots"] or tips != begin["tips"] or len(disk_items) != begin["disk"]:
++        raise ValueError(f"cache row counts do not match CACHE_BEGIN "
++                         f"(roots {roots}/{begin['roots']}, tips {tips}/{begin['tips']}, "
++                         f"disk {len(disk_items)}/{begin['disk']})")
++    tip_bytes = sum(i["bytes"] for i in memory if i["kind"] == "tip")
++    if tip_bytes != begin["tip_bytes"]:
++        raise ValueError(f"cache tip bytes {tip_bytes} do not match CACHE_BEGIN used {begin['tip_bytes']}")
++    if begin["tip_bytes"] > begin["tip_budget_bytes"]:
++        raise ValueError("cache tip bytes exceed the budget")
++
++
+ class Service:
+     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+                  vision: Vision | None = None, sampling_defaults: dict | None = None,
+@@ -903,6 +1157,35 @@ class Service:
+                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
+                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
+ 
++    def _cache_exchange(self, op, timeout, fifo_timeout) -> dict:
++        """One FIFO-serialized cache exchange. The fifo wait itself is bounded (CACHE_FIFO_TIMEOUT_S):
++        on timeout nothing is sent and the running generation is untouched - the caller answers 503 busy."""
++        if not self.fifo.acquire(timeout=fifo_timeout):
++            raise TimeoutError("the engine is busy; try again shortly")
++        try:
++            if hasattr(self.engine, "alive") and not self.engine.alive():
++                code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
++                raise EngineDied(f"the engine stopped unexpectedly (exit code {code})")
++            rpc = getattr(self.engine, "cache_rpc", None)
++            if rpc is None:
++                # MockEngine speaks cache_rpc (honest empty); anything else without it is unsupported -
++                # never a fabricated success (a DELETE must not claim tips were cleared).
++                raise NotImplementedError("this engine does not support /v1/cache")
++            return rpc(op, timeout=timeout)
++        finally:
++            self.fifo.release()
++
++    def cache_inventory(self, timeout=CACHE_TIMEOUT_S, fifo_timeout=CACHE_FIFO_TIMEOUT_S) -> dict:
++        """S2 GET /v1/cache: the engine's SavedState inventory, serialized through the same FIFO as
++        generations and vision encodes (a running or queued generation finishes first; an aux wait never
++        blocks it)."""
++        return self._cache_exchange("INVENTORY", timeout, fifo_timeout)
++
++    def cache_drop(self, timeout=CACHE_TIMEOUT_S, fifo_timeout=CACHE_FIFO_TIMEOUT_S) -> dict:
++        """S2 DELETE /v1/cache: drop all non-pinned tips (pinned memory/disk roots survive), then the
++        post-drop inventory plus the dropped count. Same FIFO serialization as cache_inventory."""
++        return self._cache_exchange("DROP", timeout, fifo_timeout)
++
+     def prepare(self, messages, tools, kwargs, max_new=None):
+         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+         the rest of the context."""
+@@ -1585,6 +1868,39 @@ def make_handler(svc: Service):
+             elif path == "/v1/status":
+                 if self._authorized():
+                     self._json(200, svc.v1_status())
++            elif path == "/v1/cache":
++                # S2: the SavedState inventory (memory roots/tips + disk metadata, separate sections).
++                # Same auth as /v1/models; engine failures are 503, never a leak of tokens/paths.
++                if self._authorized():
++                    try:
++                        self._json(200, svc.cache_inventory())
++                    except EngineDied as e:
++                        self._json(503, {"error": {"type": "server_error",
++                                                   "message": f"{e}; the next request restarts it"}})
++                    except NotImplementedError as e:
++                        self._json(501, {"error": {"type": "unsupported", "message": str(e)}})
++                    except (TimeoutError, ValueError) as e:
++                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
++            else:
++                self._json(404, {"error": {"message": "not found"}})
++
++        def do_DELETE(self):
++            # S2: DELETE /v1/cache drops all non-pinned tips (pinned memory/disk roots survive) and
++            # answers the dropped count plus the post-drop inventory. Auth first like POST (401 before
++            # any 404); unknown DELETE paths are 404 like GET/POST.
++            path = self.path.split("?")[0].rstrip("/")
++            if not self._authorized():
++                return
++            if path == "/v1/cache":
++                try:
++                    self._json(200, svc.cache_drop())
++                except EngineDied as e:
++                    self._json(503, {"error": {"type": "server_error",
++                                               "message": f"{e}; the next request restarts it"}})
++                except NotImplementedError as e:
++                    self._json(501, {"error": {"type": "unsupported", "message": str(e)}})
++                except (TimeoutError, ValueError) as e:
++                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+             else:
+                 self._json(404, {"error": {"message": "not found"}})
+ 
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 93f6eec..037dbdd 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -17,7 +17,9 @@ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from serve.frontend import ChatTemplate  # noqa: E402
+-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine, is_aux_request, request_timings, serve  # noqa: E402
++from serve.server import (CACHE_TIMEOUT_S, CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine,  # noqa: E402
++                           Service, StrataEngine, format_cache_command, is_aux_request,
++                           parse_cache_begin, parse_cache_item, request_timings, serve)
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ CTX = 4096
+@@ -1144,6 +1146,743 @@ class AuxYield(unittest.TestCase):
+         self.assertEqual(svc._mcp_turns, 0)
+ 
+ 
++    def test_aux_flag_reaches_the_gen_line(self):
++        """S1 forwarding: strata_aux=True rides the GEN line as `aux=1` (the engine then
++        snapshots no tip for it, keeping the main tip budget intact); main traffic has no key."""
++        self.assertIn("aux=1", StrataEngine.sampling_keys({"strata_aux": True}).split())
++        self.assertFalse([k for k in StrataEngine.sampling_keys({}).split() if k.startswith("aux=")])
++        self.assertFalse([k for k in StrataEngine.sampling_keys({"strata_aux": False}).split()
++                          if k.startswith("aux=")])
++
++    def test_aux_flag_reaches_the_engine_over_both_apis(self):
++        """S1 forwarding end to end: an aux HTTP request arrives at engine.generate with
++        strata_aux=True (so the engine resumes but snapshots nothing); a main request has no flag."""
++
++        class Sampled(MockEngine):
++            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++                self.last_sampling = dict(sampling or {})
++                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
++
++        tok = ByteTokenizer()
++        eng = Sampled(tok, "</think>\n\nok", max_context=CTX)
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++
++            def post(path, body):
++                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
++                                             headers={"Content-Type": "application/json"})
++                with urllib.request.urlopen(req, timeout=30) as r:
++                    return json.loads(r.read())
++
++            for path, aux in (("/v1/chat/completions", dict(self.AUX_OPENAI)),
++                              ("/v1/messages", dict(self.AUX_ANTHROPIC))):
++                with self.subTest(path=path):
++                    post(path, aux)
++                    self.assertTrue(eng.last_sampling.get("strata_aux"), eng.last_sampling)
++            post("/v1/chat/completions",
++                 {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
++            self.assertNotIn("strata_aux", eng.last_sampling, eng.last_sampling)
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_aux_yields_across_mcp_rounds(self):
++        """S1 yield: an aux request waits while an MCP turn holds the engine between rounds
++        (_mcp_turns covers the gaps, not just active generation)."""
++        tok = ByteTokenizer()
++        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        with svc.status_lock:
++            svc._mcp_turns = 1
++        try:
++            self.assertFalse(svc._yield_to_main_turn(threading.Event(), wait=0.3, grace=0))
++        finally:
++            with svc.status_lock:
++                svc._mcp_turns = 0
++        self.assertTrue(svc._yield_to_main_turn(threading.Event(), wait=5, grace=0))
++
++
++class CacheProtocol(unittest.TestCase):
++    """S2 pipe protocol: formatting helpers plus StrataEngine.cache_rpc against a fake pipe (no GPU)."""
++
++    def test_format_gate(self):
++        self.assertEqual(format_cache_command("INVENTORY"), "CACHE INVENTORY\n")
++        self.assertEqual(format_cache_command("DROP"), "CACHE DROP\n")
++        with self.assertRaises(ValueError):
++            format_cache_command("WIPE")
++
++    def test_begin_ok(self):
++        b = parse_cache_begin("CACHE_BEGIN budget=8 used=0 roots=0 tips=0 disk=0 disk_enabled=1", False)
++        self.assertEqual(b, {"tip_budget_bytes": 8, "tip_bytes": 0, "roots": 0, "tips": 0, "disk": 0,
++                             "disk_enabled": True})
++        b = parse_cache_begin("CACHE_BEGIN dropped=2 budget=8 used=0 roots=1 tips=0 disk=0 disk_enabled=0",
++                              True)
++        self.assertEqual(b["dropped"], 2)
++        self.assertFalse(b["disk_enabled"])
++        with self.assertRaises(ValueError):   # DROP without its count
++            parse_cache_begin("CACHE_BEGIN budget=8 used=0 roots=1 tips=0 disk=0 disk_enabled=0", True)
++        for bad in ("CACHE_BEGIN budget=-1 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                    "CACHE_BEGIN budget=x used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                    "CACHE_BEGIN budget=8 used=0 roots=0 tips=0 disk=0",
++                    "CACHE_BEGIN budget=8 used=0 roots=0 tips=0 disk=0 disk_enabled=2",
++                    "HELLO"):
++            with self.subTest(line=bad):
++                with self.assertRaises(ValueError):
++                    parse_cache_begin(bad, False)
++
++    def test_item_ok(self):
++        self.assertEqual(parse_cache_item("CACHE memory kind=root pinned=1 ids_len=40 bytes=100 last_use=7"),
++                         {"source": "memory", "kind": "root", "pinned": True, "ids_len": 40, "bytes": 100,
++                          "last_use": 7})
++        self.assertEqual(parse_cache_item("CACHE memory kind=tip pinned=0 ids_len=60 bytes=200 last_use=9"),
++                         {"source": "memory", "kind": "tip", "pinned": False, "ids_len": 60, "bytes": 200,
++                          "last_use": 9})
++        self.assertEqual(parse_cache_item("CACHE disk kind=root pinned=1 ids_len=40 bytes=300"),
++                         {"source": "disk", "kind": "root", "pinned": True, "ids_len": 40, "bytes": 300})
++        for bad in ("CACHE disk kind=tip pinned=0 ids_len=1 bytes=1",        # disk holds pinned roots only
++                    "CACHE memory kind=root pinned=0 ids_len=1 bytes=1 last_use=1",
++                    "CACHE memory kind=tip pinned=1 ids_len=1 bytes=1 last_use=1",
++                    "CACHE disk kind=root pinned=1 ids_len=1 bytes=1 last_use=1",
++                    "CACHE memory kind=root pinned=1 ids_len=1 bytes=1",     # memory needs last_use
++                    "CACHE memory kind=nope pinned=0 ids_len=1 bytes=1 last_use=1",
++                    "CACHE nowhere kind=root pinned=1 ids_len=1 bytes=1",
++                    "T 5"):
++            with self.subTest(line=bad):
++                with self.assertRaises(ValueError):
++                    parse_cache_item(bad)
++
++    def test_begin_strict(self):
++        """Duplicates, unknown fields, a dropped count outside DROP, and over-cap counts all fail."""
++        good = "CACHE_BEGIN budget=8 used=0 roots=0 tips=0 disk=0 disk_enabled=0"
++        self.assertEqual(parse_cache_begin(good, False)["tip_budget_bytes"], 8)
++        for bad, drop in (
++                ("CACHE_BEGIN budget=8 budget=9 used=0 roots=0 tips=0 disk=0 disk_enabled=0", False),
++                ("CACHE_BEGIN budget=8 used=0 roots=0 tips=0 disk=0 disk_enabled=0 foo=1", False),
++                ("CACHE_BEGIN budget=8 used=0 roots=0 tips=0 disk=0 disk_enabled=0 dropped=1", False),
++                ("CACHE_BEGIN dropped=1 budget=8 used=0 roots=0 tips=0 disk=0 disk_enabled=0 dropped=2", True),
++                (f"CACHE_BEGIN budget=8 used=0 roots={10**12} tips=0 disk=0 disk_enabled=0", False),
++                ("CACHE_BEGIN budget=007 used=0 roots=0 tips=0 disk=0 disk_enabled=0", False)):
++            with self.subTest(line=bad):
++                with self.assertRaises(ValueError):
++                    parse_cache_begin(bad, drop)
++
++    def test_item_strict(self):
++        """Duplicates and unknown fields fail on item lines too."""
++        for bad in ("CACHE memory kind=tip pinned=0 pinned=1 ids_len=1 bytes=1 last_use=1",
++                    "CACHE memory kind=tip pinned=0 ids_len=1 bytes=1 last_use=1 extra=2",
++                    "CACHE disk kind=root pinned=1 ids_len=1 bytes=1 mtime=5"):
++            with self.subTest(line=bad):
++                with self.assertRaises(ValueError):
++                    parse_cache_item(bad)
++
++    def test_validate_inventory(self):
++        """Post-CACHE_END cross-checks: counts, tip-byte sum, budget cover. All fail when off."""
++        from serve.server import validate_cache_inventory
++
++        begin = {"tip_budget_bytes": 100, "tip_bytes": 20, "roots": 1, "tips": 1, "disk": 1}
++        mem = [{"kind": "root", "pinned": True, "ids_len": 40, "bytes": 10, "last_use": 7},
++               {"kind": "tip", "pinned": False, "ids_len": 60, "bytes": 20, "last_use": 9}]
++        disk = [{"kind": "root", "pinned": True, "ids_len": 40, "bytes": 300}]
++        validate_cache_inventory(begin, mem, disk)      # exact: passes
++        with self.assertRaises(ValueError):
++            validate_cache_inventory({**begin, "tips": 2}, mem, disk)        # row count lies
++        with self.assertRaises(ValueError):
++            validate_cache_inventory({**begin, "disk": 0}, mem, disk)
++        with self.assertRaises(ValueError):
++            validate_cache_inventory({**begin, "tip_bytes": 21}, mem, disk)  # byte sum lies
++        with self.assertRaises(ValueError):
++            validate_cache_inventory({**begin, "tip_budget_bytes": 19}, mem, disk)  # over budget
++
++    def pipe(self, lines):
++        import queue
++
++        class Stdin:
++            def __init__(self):
++                self.written = []
++
++            def write(self, s):
++                self.written.append(s)
++
++            def flush(self):
++                pass
++
++        class Proc:
++            def __init__(self, stdin):
++                self.stdin = stdin
++                self.kills = 0
++
++            def kill(self):
++                self.kills += 1
++
++            def poll(self):
++                return None if self.kills == 0 else -9
++
++            def wait(self, timeout=None):
++                return -9
++
++        stdin = Stdin()
++        proc = Proc(stdin)
++        eng = StrataEngine.__new__(StrataEngine)
++        eng.proc = proc
++        eng.lines = queue.Queue()
++        eng.ended = False
++        eng._cache_desync = False
++        for ln in lines:
++            eng.lines.put(ln)
++        eng.exit_code = lambda: -9
++        return eng, stdin
++
++    def test_pipe_inventory_ok(self):
++        eng, stdin = self.pipe(["CACHE_BEGIN budget=100 used=20 roots=1 tips=1 disk=1 disk_enabled=1",
++                                "CACHE memory kind=root pinned=1 ids_len=40 bytes=10 last_use=7",
++                                "CACHE memory kind=tip pinned=0 ids_len=60 bytes=20 last_use=9",
++                                "CACHE disk kind=root pinned=1 ids_len=40 bytes=300",
++                                "CACHE_END"])
++        out = eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"])
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 100)
++        self.assertEqual(out["memory"]["tip_bytes"], 20)
++        self.assertEqual(len(out["memory"]["items"]), 2)
++        self.assertEqual(out["memory"]["items"][0]["kind"], "root")
++        self.assertEqual(out["disk"], {"enabled": True, "items": [
++            {"kind": "root", "pinned": True, "ids_len": 40, "bytes": 300}]})
++        self.assertNotIn("dropped", out)
++
++    def test_pipe_drop_ok(self):
++        eng, stdin = self.pipe(["CACHE_BEGIN dropped=2 budget=100 used=0 roots=1 tips=0 disk=0 disk_enabled=0",
++                                "CACHE memory kind=root pinned=1 ids_len=40 bytes=10 last_use=7",
++                                "CACHE_END"])
++        out = eng.cache_rpc("DROP", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE DROP\n"])
++        self.assertEqual(out["dropped"], 2)
++        self.assertEqual(len(out["memory"]["items"]), 1)
++
++    def test_pipe_stray_is_rejected_not_absorbed(self):
++        """A GEN-protocol stray (or a pre-BEGIN item) fails the exchange instead of being silently
++        trusted past; the drain then consumes the bounded reply and the next exchange starts clean."""
++        eng, stdin = self.pipe(["T 5",
++                                "CACHE_BEGIN budget=0 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                                "CACHE_END",
++                                "CACHE_BEGIN budget=7 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                                "CACHE_END"])
++        with self.assertRaises(ValueError):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        out = eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 7)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++        eng2, _ = self.pipe(["CACHE memory kind=tip pinned=0 ids_len=1 bytes=1 last_use=1",
++                             "CACHE_END"])
++        with self.assertRaises(ValueError):
++            eng2.cache_rpc("INVENTORY", timeout=5)
++
++    def test_pipe_err_never_drains(self):
++        """The standalone ERR line is the whole response: reported, never drained, pipe stays clean."""
++        eng, stdin = self.pipe(["ERR boom",
++                                "CACHE_BEGIN budget=1 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                                "CACHE_END"])
++        with self.assertRaises(ValueError) as ctx:
++            eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertIn("boom", str(ctx.exception))
++        out = eng.cache_rpc("INVENTORY", timeout=5)   # the second reply is intact: no drain ate it
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 1)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++
++    def test_pipe_malformed_is_drained(self):
++        eng, _ = self.pipe(["CACHE_BEGIN budget=1 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                            "CACHE memory kind=tip pinned=0 ids_len=1 bytes=1",   # no last_use
++                            "CACHE_END",
++                            "CACHE_BEGIN budget=2 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "CACHE_END"])
++        with self.assertRaises(ValueError):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(eng.cache_rpc("INVENTORY", timeout=5)["memory"]["tip_budget_bytes"], 2)
++
++    def test_pipe_count_mismatch_never_drains_next_reply(self):
++        """CACHE_END is already consumed when counts are checked: the failure must not eat the next reply."""
++        eng, stdin = self.pipe(["CACHE_BEGIN budget=100 used=50 roots=0 tips=1 disk=0 disk_enabled=0",
++                                "CACHE_END",                       # claims a tip that never arrives
++                                "CACHE_BEGIN budget=100 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                                "CACHE_END"])
++        with self.assertRaises(ValueError):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        out = eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(out["memory"]["tip_bytes"], 0)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++
++    def test_pipe_dead(self):
++        eng, _ = self.pipe([None])
++        with self.assertRaises(EngineDied):
++            eng.cache_rpc("INVENTORY", timeout=5)
++
++    def test_pipe_timeout_without_boundary_invalidates(self):
++        """No boundary arrives: the pipe is stopped, never reused; the next call fails without touching it."""
++        import serve.server as srv
++
++        eng, stdin = self.pipe([])                    # nothing arrives: a fast timeout ...
++        old, srv.CACHE_DRAIN_S = srv.CACHE_DRAIN_S, 0.2
++        try:
++            with self.assertRaises(TimeoutError):
++                eng.cache_rpc("INVENTORY", timeout=0.2)
++        finally:
++            srv.CACHE_DRAIN_S = old
++        self.assertTrue(eng._cache_desync)
++        self.assertEqual(eng.proc.kills, 1)           # the engine was stopped for a clean restart
++        self.assertFalse(eng.alive())
++        with self.assertRaises(EngineDied):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"])   # the dead pipe was never reused
++
++    def test_pipe_timeout_late_reply_is_discarded_not_trusted(self):
++        """The late reply arrives inside the drain: discarded, TimeoutError stands, the next exchange reads
++        only fresh lines (stale budget=111 never surfaces)."""
++        eng, stdin = self.pipe(["CACHE_BEGIN budget=111 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                                "CACHE_END"])
++        with self.assertRaises(TimeoutError):
++            eng.cache_rpc("INVENTORY", timeout=0)     # immediate deadline: nothing consumed yet
++        self.assertFalse(getattr(eng, "_cache_desync", False))   # the boundary was consumed: reusable
++        for ln in ("CACHE_BEGIN budget=222 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "CACHE_END"):
++            eng.lines.put(ln)
++        out = eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertEqual(out["memory"]["tip_budget_bytes"], 222)
++        self.assertEqual(stdin.written, ["CACHE INVENTORY\n"] * 2)
++
++    def test_pipe_late_err_never_reaches_gen(self):
++        """A late ERR is swallowed by the drain (pipe reusable) instead of waiting for a future GEN, which
++        would raise on it and orphan its real tokens."""
++        eng, _ = self.pipe(["ERR late boom"])
++        with self.assertRaises(TimeoutError):
++            eng.cache_rpc("INVENTORY", timeout=0)
++        self.assertFalse(getattr(eng, "_cache_desync", False))
++        self.assertTrue(eng.lines.empty())            # nothing left for any future reader
++        for ln in ("CACHE_BEGIN budget=3 used=0 roots=0 tips=0 disk=0 disk_enabled=0", "CACHE_END"):
++            eng.lines.put(ln)
++        self.assertEqual(eng.cache_rpc("INVENTORY", timeout=5)["memory"]["tip_budget_bytes"], 3)
++
++    def test_pipe_malformed_open_invalidates(self):
++        """Malformed with no boundary after it: stopped, not reused."""
++        import serve.server as srv
++
++        eng, _ = self.pipe(["CACHE_BEGIN budget=1 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                            "GARBAGE"])
++        old, srv.CACHE_DRAIN_S = srv.CACHE_DRAIN_S, 0.2
++        try:
++            with self.assertRaises(ValueError):
++                eng.cache_rpc("INVENTORY", timeout=5)
++        finally:
++            srv.CACHE_DRAIN_S = old
++        self.assertTrue(eng._cache_desync)
++        self.assertEqual(eng.proc.kills, 1)
++        with self.assertRaises(EngineDied):
++            eng.cache_rpc("INVENTORY", timeout=5)
++
++    def test_pump_keeps_process_local_refs(self):
++        """A restart's fresh queue never sees the old proc's EOF; ended follows only the current proc."""
++        import queue
++        import threading
++
++        release = threading.Event()
++
++        def gen():
++            yield "T 1\n"
++            release.wait(10)
++
++        class Stdout:
++            def __init__(self, g):
++                self.g = g
++
++            def __iter__(self):
++                return self.g
++
++        eng = StrataEngine.__new__(StrataEngine)
++        eng.proc = type("P", (), {})()
++        eng.proc.stdout = Stdout(gen())
++        old_q = eng.lines = queue.Queue()
++        eng.ended = False
++        t = threading.Thread(target=eng._pump, args=(eng.proc, old_q), daemon=True)
++        t.start()
++        self.assertEqual(old_q.get(timeout=10), "T 1\n")
++        eng.lines = queue.Queue()                     # a restart swaps the queue ...
++        eng.proc = type("P2", (), {})()               # ... and the process
++        release.set()
++        t.join(10)
++        self.assertTrue(old_q.get(timeout=10) is None)  # the old EOF lands in the old queue
++        self.assertTrue(eng.lines.empty())              # the fresh queue is uncontaminated
++        self.assertFalse(eng.ended)                     # a dead stranger marks nothing alive
++
++    def test_pump_started_after_restart_keeps_original_queue(self):
++        import queue
++
++        eng = StrataEngine.__new__(StrataEngine)
++        old_proc = eng.proc = type("OldProc", (), {"stdout": ["T 1\n"]})()
++        old_q = eng.lines = queue.Queue()
++        # A thread can be scheduled after restart: its arguments already bind the old process and queue.
++        eng.proc = type("NewProc", (), {})()
++        eng.lines = queue.Queue()
++        eng.ended = False
++        eng._pump(old_proc, old_q)
++        self.assertEqual(old_q.get_nowait(), "T 1\n")
++        self.assertIsNone(old_q.get_nowait())
++        self.assertTrue(eng.lines.empty())
++        self.assertFalse(eng.ended)
++
++    def test_end_without_begin_does_not_drain_next_reply(self):
++        eng, _ = self.pipe(["CACHE_END",
++                            "CACHE_BEGIN budget=3 used=0 roots=0 tips=0 disk=0 disk_enabled=0",
++                            "CACHE_END"])
++        with self.assertRaisesRegex(ValueError, "without CACHE_BEGIN"):
++            eng.cache_rpc("INVENTORY", timeout=5)
++        self.assertFalse(getattr(eng, "_cache_desync", False))
++        self.assertEqual(eng.cache_rpc("INVENTORY", timeout=5)["memory"]["tip_budget_bytes"], 3)
++
++    def test_bad_op_never_touches_the_pipe(self):
++        eng, stdin = self.pipe([])
++        with self.assertRaises(ValueError):
++            eng.cache_rpc("WIPE", timeout=5)
++        self.assertEqual(stdin.written, [])
++
++
++class FakeCacheEngine(MockEngine):
++    """A scripted SavedState inventory with real drop semantics (roots pin, tips drop)."""
++
++    def __init__(self, tok, script, max_context, budget=1000):
++        super().__init__(tok, script, max_context=max_context)
++        self.budget = budget
++        self.roots = [{"kind": "root", "pinned": True, "ids_len": 40, "bytes": 100, "last_use": 7}]
++        self.tips = [{"kind": "tip", "pinned": False, "ids_len": 60, "bytes": 200, "last_use": 9},
++                     {"kind": "tip", "pinned": False, "ids_len": 75, "bytes": 250, "last_use": 11}]
++        self.disk = [{"kind": "root", "pinned": True, "ids_len": 40, "bytes": 300}]
++        self.disk_enabled = True
++
++    def cache_rpc(self, op, timeout=None):
++        format_cache_command(op)
++        if op == "DROP":
++            dropped = len(self.tips)
++            self.tips = []
++            return {"dropped": dropped, "memory": self._mem(), "disk": self._disk()}
++        return {"memory": self._mem(), "disk": self._disk()}
++
++    def _mem(self):
++        return {"tip_budget_bytes": self.budget,
++                "tip_bytes": sum(t["bytes"] for t in self.tips),
++                "items": list(self.roots) + list(self.tips)}
++
++    def _disk(self):
++        return {"enabled": self.disk_enabled, "items": list(self.disk)}
++
++
++class CacheAPI(unittest.TestCase):
++    """S2 over HTTP: auth, content/budget/pin, serialization, drop semantics, failures, routes."""
++
++    def setUp(self):
++        tok = ByteTokenizer()
++        self.engine = FakeCacheEngine(tok, "</think>\n\nok", max_context=CTX)
++        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        self.httpd = serve(self.svc, port=0)
++        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
++
++    def tearDown(self):
++        self.httpd.shutdown()
++        self.httpd.server_close()
++
++    def req(self, method, path, headers=None, body=None):
++        data = json.dumps(body).encode() if body is not None else None
++        h = {"Content-Type": "application/json", **(headers or {})} if body is not None else dict(headers or {})
++        r = urllib.request.Request(self.base + path, data=data, headers=h, method=method)
++        try:
++            with urllib.request.urlopen(r, timeout=30) as resp:
++                return resp.status, json.loads(resp.read())
++        except urllib.error.HTTPError as e:
++            with e:
++                return e.code, json.loads(e.read())
++
++    def get(self, path, headers=None):
++        return self.req("GET", path, headers)
++
++    def test_auth_get_and_delete(self):
++        self.assertEqual(self.get("/v1/cache")[0], 200)
++        self.svc.api_key = "secret"
++        try:
++            self.assertEqual(self.get("/v1/cache")[0], 401)            # same gate as /v1/models
++            self.assertEqual(self.get("/v1/models")[0], 401)
++            self.assertEqual(self.req("DELETE", "/v1/cache")[0], 401)
++            self.assertEqual(self.get("/v1/cache", {"Authorization": "Bearer secret"})[0], 200)
++            self.assertEqual(self.get("/v1/cache", {"x-api-key": "secret"})[0], 200)
++            self.assertEqual(self.req("DELETE", "/v1/cache", {"Authorization": "Bearer secret"})[0], 200)
++        finally:
++            self.svc.api_key = ""
++
++    def test_empty_mock_inventory_shape(self):
++        tok = ByteTokenizer()
++        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++
++            def get(p):
++                with urllib.request.urlopen(base + p, timeout=30) as r:
++                    return json.loads(r.read())
++
++            inv = get("/v1/cache")
++            self.assertEqual(inv["memory"], {"tip_budget_bytes": 0, "tip_bytes": 0, "items": []})
++            self.assertEqual(inv["disk"], {"enabled": False, "items": []})
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_content_budget_pin_and_no_internals(self):
++        code, inv = self.get("/v1/cache")
++        self.assertEqual(code, 200, inv)
++        mem = inv["memory"]
++        self.assertEqual((mem["tip_budget_bytes"], mem["tip_bytes"]), (1000, 450))
++        self.assertEqual([i["kind"] for i in mem["items"]], ["root", "tip", "tip"])   # roots first
++        self.assertEqual([i["pinned"] for i in mem["items"]], [True, False, False])
++        self.assertEqual(mem["items"][0]["last_use"], 7)
++        self.assertEqual(inv["disk"], {"enabled": True, "items": [
++            {"kind": "root", "pinned": True, "ids_len": 40, "bytes": 300}]})
++        for item in mem["items"]:
++            self.assertEqual(set(item), {"kind", "pinned", "ids_len", "bytes", "last_use"}, item)
++        for item in inv["disk"]["items"]:
++            self.assertEqual(set(item), {"kind", "pinned", "ids_len", "bytes"}, item)
++        blob = json.dumps(inv)                       # no tokens, payloads, paths or identity internals
++        for needle in ("\"ids\":", "\"tokens\"", "path", "fingerprint", "root-"):
++            self.assertNotIn(needle, blob)
++
++    def test_delete_drops_tips_only_and_stays_dropped(self):
++        code, out = self.req("DELETE", "/v1/cache")
++        self.assertEqual(code, 200, out)
++        self.assertEqual(out["dropped"], 2)
++        self.assertEqual([i["kind"] for i in out["memory"]["items"]], ["root"])   # roots survive
++        self.assertEqual(out["memory"]["tip_bytes"], 0)
++        self.assertEqual(len(out["disk"]["items"]), 1)                            # disk roots survive
++        code, inv = self.get("/v1/cache")             # no tip persistence after DELETE
++        self.assertEqual(code, 200, inv)
++        self.assertEqual(len(inv["memory"]["items"]), 1)
++        self.assertEqual(inv["memory"]["items"][0]["kind"], "root")
++        code, chat = self.req("POST", "/v1/chat/completions",
++                              body={"model": "m", "messages": [{"role": "user", "content": "hi"}],
++                                    "max_tokens": 5})
++        self.assertEqual(code, 200, chat)             # generation still works after the drop
++
++    def test_roots_survive_a_tipless_delete(self):
++        self.engine.tips = []
++        code, out = self.req("DELETE", "/v1/cache")
++        self.assertEqual((code, out["dropped"]), (200, 0))
++        self.assertEqual(len(out["memory"]["items"]), 1)
++
++    def test_queued_generation_serializes_without_stdout_interference(self):
++        gate = threading.Event()
++        entered = threading.Event()
++
++        class Gated(FakeCacheEngine):
++            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++                entered.set()
++                self.last_ids = list(ids)
++                self.last_sampling = dict(sampling or {})
++                gate.wait(30)
++                yield from MockEngine.generate(self, ids, max_new, sampling, cancel, embeddings)
++
++        tok = ByteTokenizer()
++        eng = Gated(tok, "</think>\n\nok", max_context=CTX)
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++            box, done = {}, threading.Event()
++
++            def gen():
++                body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
++                r = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                           headers={"Content-Type": "application/json"})
++                try:
++                    with urllib.request.urlopen(r, timeout=30) as resp:
++                        box["r"] = (resp.status, json.loads(resp.read()))
++                except Exception as e:  # noqa: BLE001 - record thread errors for the main thread
++                    box["e"] = e
++                finally:
++                    done.set()
++
++            t = threading.Thread(target=gen, daemon=True)
++            t.start()
++            self.assertTrue(entered.wait(30))         # the generation holds the fifo ...
++            cbox, cdone = {}, threading.Event()
++
++            def cache():
++                try:
++                    with urllib.request.urlopen(base + "/v1/cache", timeout=30) as resp:
++                        cbox["r"] = (resp.status, json.loads(resp.read()))
++                except Exception as e:  # noqa: BLE001 - as above
++                    cbox["e"] = e
++                finally:
++                    cdone.set()
++
++            ct = threading.Thread(target=cache, daemon=True)
++            ct.start()
++            self.assertFalse(cdone.wait(1.0))         # ... so the cache waits behind it
++            gate.set()
++            self.assertTrue(done.wait(30), box)
++            self.assertTrue(cdone.wait(30), cbox)
++            t.join(30)
++            ct.join(30)
++            self.assertNotIn("e", box, box.get("e"))
++            self.assertNotIn("e", cbox, cbox.get("e"))
++            self.assertEqual(box["r"][0], 200, box["r"])      # the answer is intact: no stdout interference
++            self.assertEqual(box["r"][1]["usage"]["completion_tokens"], 5)
++            self.assertEqual(cbox["r"][0], 200, cbox["r"])
++            self.assertEqual(len(cbox["r"][1]["memory"]["items"]), 3)
++        finally:
++            gate.set()
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_dead_engine_is_a_503(self):
++        class Dead(FakeCacheEngine):
++            def cache_rpc(self, op, timeout=None):
++                raise EngineDied("the engine stopped unexpectedly (exit code -9)")
++
++        tok = ByteTokenizer()
++        svc = Service(Dead(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++
++            def req(method, path):
++                r = urllib.request.Request(base + path, method=method)
++                try:
++                    with urllib.request.urlopen(r, timeout=30) as resp:
++                        return resp.status, resp.read().decode()
++                except urllib.error.HTTPError as e:
++                    with e:
++                        return e.code, e.read().decode()
++
++            for method in ("GET", "DELETE"):
++                with self.subTest(method=method):
++                    code, text = req(method, "/v1/cache")
++                    self.assertEqual(code, 503)
++                    self.assertIn("stopped unexpectedly", text)
++            code, text = req("GET", "/v1/cache")      # nothing hangs forever: a generation still answers
++            self.assertEqual(code, 503)
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_malformed_engine_is_a_503_and_gen_still_works(self):
++        class Garbage(FakeCacheEngine):
++            def cache_rpc(self, op, timeout=None):
++                raise ValueError("CACHE_END without CACHE_BEGIN")
++
++        tok = ByteTokenizer()
++        svc = Service(Garbage(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++
++            def req(method, path, body=None):
++                data = json.dumps(body).encode() if body is not None else None
++                h = {"Content-Type": "application/json"} if body is not None else {}
++                r = urllib.request.Request(base + path, data=data, headers=h, method=method)
++                try:
++                    with urllib.request.urlopen(r, timeout=30) as resp:
++                        return resp.status, resp.read().decode()
++                except urllib.error.HTTPError as e:
++                    with e:
++                        return e.code, e.read().decode()
++
++            self.assertEqual(req("GET", "/v1/cache")[0], 503)
++            self.assertEqual(req("DELETE", "/v1/cache")[0], 503)
++            code, text = req("POST", "/v1/chat/completions",
++                             {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
++            self.assertEqual(code, 200, text)         # no stale reply consumed the generation
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_unsupported_engine_is_501_not_success(self):
++        """A custom engine without cache_rpc is explicit 501 (never a fabricated DELETE success)."""
++
++        class BareEngine(MockEngine):
++            cache_rpc = None                          # custom engines predate the cache pipe
++
++        tok = ByteTokenizer()
++        svc = Service(BareEngine(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++
++            def req(method, path, headers=None):
++                r = urllib.request.Request(base + path, headers=dict(headers or {}), method=method)
++                try:
++                    with urllib.request.urlopen(r, timeout=30) as resp:
++                        return resp.status, json.loads(resp.read())
++                except urllib.error.HTTPError as e:
++                    with e:
++                        return e.code, json.loads(e.read())
++
++            for method in ("GET", "DELETE"):
++                with self.subTest(method=method):
++                    code, b = req(method, "/v1/cache")
++                    self.assertEqual(code, 501, b)
++                    self.assertEqual(b["error"]["type"], "unsupported")
++            svc.api_key = "secret"                    # auth still gates before routing
++            try:
++                self.assertEqual(req("GET", "/v1/cache")[0], 401)
++                self.assertEqual(req("DELETE", "/v1/cache")[0], 401)
++                self.assertEqual(req("GET", "/v1/cache", {"Authorization": "Bearer secret"})[0], 501)
++            finally:
++                svc.api_key = ""
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_held_fifo_is_503_busy_without_touching_the_pipe(self):
++        """A stuck generation bounds the cache wait: 503 busy, no CACHE sent, the generation untouched."""
++        self.assertTrue(self.svc.fifo.acquire())      # the stuck generation's hold, simulated
++        try:
++            with self.assertRaises(TimeoutError):
++                self.svc.cache_inventory(fifo_timeout=0.2)
++            with self.assertRaises(TimeoutError):
++                self.svc.cache_drop(fifo_timeout=0.2)
++        finally:
++            self.svc.fifo.release()
++        code, inv = self.get("/v1/cache")             # released: straight through again
++        self.assertEqual(code, 200, inv)
++        self.assertEqual(len(inv["memory"]["items"]), 3)
++
++    def test_busy_http_is_503(self):
++        """Same bound over HTTP while the fifo is held elsewhere."""
++        orig = self.svc.cache_inventory
++        self.svc.cache_inventory = lambda: orig(fifo_timeout=0.3)   # fast bound for this probe only
++        self.assertTrue(self.svc.fifo.acquire())
++        try:
++            code, b = self.get("/v1/cache")
++            self.assertEqual(code, 503, b)
++            self.assertIn("busy", b["error"]["message"])
++        finally:
++            self.svc.fifo.release()
++            self.svc.cache_inventory = orig
++        code, inv = self.get("/v1/cache")
++        self.assertEqual(code, 200, inv)
++
++    def test_unsupported_routes(self):
++        self.assertEqual(self.req("POST", "/v1/cache",
++                                  body={"model": "m", "messages": [{"role": "user", "content": "hi"}]})[0],
++                         404)
++        self.assertEqual(self.get("/v1/nothing")[0], 404)
++        self.assertEqual(self.req("DELETE", "/v1/nothing")[0], 404)
++        self.svc.api_key = "secret"
++        try:
++            self.assertEqual(self.req("DELETE", "/v1/cache")[0], 401)     # auth before routing, like POST
++            self.assertEqual(self.req("POST", "/v1/cache", body={})[0], 401)
++        finally:
++            self.svc.api_key = ""
++
++
++
++
+ class TimingsDrafts(unittest.TestCase):
+     """`timings` carries the speculative draft counts (PR #83's fields) only when the engine reported them."""
+ 
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ba6a6da..05742fa 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4039,7 +4039,23 @@ int main(int argc, char** argv) {
+     //
+     // Before that, `RESUME <n>` (n prompt tokens are not read again), `PP <position> <prompt_tokens> <ms> <tok/s>`
+     // after every prompt chunk, and `REUSED <n>` once the prompt is read.  (`ERR <message>` instead when a request
+-    // cannot run; `STOP` ends the running request at its next step; `QUIT` ends the process.)  A request continues
++    // cannot run; `STOP` ends the running request at its next step; `QUIT` ends the process.)
++    //
++    // S2 cache control (DESIGN-HERMES-CACHE.md, GET/DELETE /v1/cache): between requests the loop also takes
++    //
++    //     CACHE INVENTORY
++    //     CACHE DROP
++    //
++    // INVENTORY reports the SavedState store (memory roots/tips with kind/pinned/ids_len/bytes/last_use plus
++    // the tip budget/used bytes) and the disk index metadata (ids_len/bytes per indexed root file, payloads
++    // never loaded); DROP deletes all non-pinned tips (memory roots and all disk roots survive) and reports
++    // the dropped count plus the same post-drop inventory. Both reply with `CACHE_BEGIN <k=v ...>` inventory
++    // lines (`CACHE memory|disk kind=... ...`) and a trailing `CACHE_END` on stdout (stderr stays diagnostics);
++    // any failure replies `ERR <message>`. The stdin reader is single-threaded, so a CACHE line arriving
++    // while post-DONE capture runs queues behind it and is answered only after the capture completes: the
++    // inventory (or the drop) always sees the finished request's tip. The live ConvCheckpoint chain is NOT
++    // reported (per-request history only); last_use is the RAM LRU clock (inserts and mounts advance it).
++    // A request continues
+     // from the live session or the longest conversation checkpoint its prompt starts with (see ConvCheckpoint),
+     // otherwise from an empty sequence (`session_zero`); the rest of the prompt goes through the batched prompt path
+     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
+@@ -5012,6 +5028,61 @@ int main(int argc, char** argv) {
+         std::vector<const float*> row_ptr;
+         while (next_line(line)) {
+             if (line == "QUIT") break;
++            // S2 cache control (see the --serve block above). Answered between requests on stdout only
++            // (never stderr): INVENTORY reports, DROP clears non-pinned tips then reports. Both run on
++            // the serve thread after any post-DONE capture finished (the stdin queue orders them behind
++            // it), do no GPU work, and never touch the live chain. Unknown CACHE lines are ERR, never silent.
++            if (line == "CACHE INVENTORY" || line == "CACHE DROP") {
++                try {
++                    const bool drop = line == "CACHE DROP";
++                    size_t dropped = 0;
++                    if (drop) dropped = saved_states.drop_non_pinned();   // tips only: RAM + disk roots pin
++                    const std::vector<saved::InventoryEntry> inv = saved_states.inventory();   // roots then tips
++                    const std::vector<saved::DiskInventoryEntry> dinv = root_disk_store.disk_inventory();
++                    const bool disk_on = root_disk_store.enabled();
++                    size_t n_roots = 0, n_tips = 0;
++                    for (const saved::InventoryEntry& e : inv)
++                        (e.kind == saved::Kind::Root ? n_roots : n_tips)++;
++                    if (drop)
++                        std::printf("CACHE_BEGIN dropped=%llu budget=%llu used=%llu roots=%llu tips=%llu "
++                                    "disk=%llu disk_enabled=%d\n",
++                                    (unsigned long long)dropped,
++                                    (unsigned long long)saved_states.tip_budget_bytes(),
++                                    (unsigned long long)saved_states.tip_bytes(),
++                                    (unsigned long long)n_roots, (unsigned long long)n_tips,
++                                    (unsigned long long)dinv.size(), disk_on ? 1 : 0);
++                    else
++                        std::printf("CACHE_BEGIN budget=%llu used=%llu roots=%llu tips=%llu disk=%llu "
++                                    "disk_enabled=%d\n",
++                                    (unsigned long long)saved_states.tip_budget_bytes(),
++                                    (unsigned long long)saved_states.tip_bytes(),
++                                    (unsigned long long)n_roots, (unsigned long long)n_tips,
++                                    (unsigned long long)dinv.size(), disk_on ? 1 : 0);
++                    for (const saved::InventoryEntry& e : inv)
++                        std::printf("CACHE memory kind=%s pinned=%d ids_len=%llu bytes=%llu last_use=%llu\n",
++                                    e.kind == saved::Kind::Root ? "root" : "tip",
++                                    e.kind == saved::Kind::Root ? 1 : 0,
++                                    (unsigned long long)e.ids_len, (unsigned long long)e.bytes,
++                                    (unsigned long long)e.last_use);
++                    for (const saved::DiskInventoryEntry& d : dinv)
++                        std::printf("CACHE disk kind=root pinned=1 ids_len=%llu bytes=%llu\n",
++                                    (unsigned long long)d.ids_len, (unsigned long long)d.bytes);
++                    std::printf("CACHE_END\n");
++                    std::fflush(stdout);
++                } catch (const std::exception& ex) {
++                    std::printf("ERR cache inventory failed: %s\n", ex.what());
++                    std::fflush(stdout);
++                } catch (...) {
++                    std::printf("ERR cache inventory failed\n");
++                    std::fflush(stdout);
++                }
++                continue;
++            }
++            if (line.rfind("CACHE", 0) == 0) {
++                std::printf("ERR unknown cache command (CACHE INVENTORY or CACHE DROP)\n");
++                std::fflush(stdout);
++                continue;
++            }
+             // the watchdog watches a request from here until this iteration ends, whichever way it ends
+             struct BusyScope {
+                 BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index 2fa8d37..a1bc600 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -1256,6 +1256,16 @@ size_t RootDiskStore::pending() const {
+     return queue_.size();
+ }
+ 
++std::vector<DiskInventoryEntry> RootDiskStore::disk_inventory() const {
++    std::unique_lock<std::mutex> lk(mu_);
++    std::vector<DiskInventoryEntry> out;
++    if (!started_) return out;
++    out.reserve(index_.size());
++    for (const auto& [key, e] : index_)
++        out.push_back(DiskInventoryEntry{e.meta.ids.size(), e.file_bytes});
++    return out;
++}
++
+ bool RootDiskStore::find_match(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
+                                const std::vector<std::string>& skip, int64_t lo, int64_t hi,
+                                Entry& out) const {
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index 172f852..d3491d6 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -1248,6 +1248,45 @@ int main() {
+         d.shutdown();   // must not crash
+         check(!d.enabled(), "e3 disabled shutdown stays off");
+     }
++    {   // S2: disk_inventory reports one metadata row per indexed file (ids length + file bytes):
++        // no payload loaded, no path, no last_use (the type has neither). Disabled stores report empty.
++        const std::string sub = "rootdisk-e3-tmp/s2inv";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "s2 disk inventory tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem a = e3_canary_line(40, 0);
++        const saved::SavedItem b = e3_canary_line(20, 1000);
++        std::vector<uint8_t> abuf, bbuf;
++        std::string why;
++        check(saved::root_encode(h, a, abuf, why) && saved::root_encode(h, b, bbuf, why),
++              "s2 inventory fixtures encode");
++        const std::string pa = sub + "/root-" + saved::root_file_key(h, a) + ".hstr";
++        const std::string pb = sub + "/root-" + saved::root_file_key(h, b) + ".hstr";
++        e3_write(pa, abuf);
++        e3_write(pb, bbuf);
++        saved::RootDiskStore st;
++        check(st.start(e3_config(sub, 1ull << 40), why) && st.indexed() == 2,
++              "s2 inventory store indexes both roots");
++        const std::vector<saved::DiskInventoryEntry> inv = st.disk_inventory();
++        check(inv.size() == 2, "s2 disk inventory has one row per file");
++        bool seen_a = false, seen_b = false;
++        for (const saved::DiskInventoryEntry& e : inv) {
++            if (e.ids_len == 40 && e.bytes == fs::file_size(pa)) seen_a = true;
++            if (e.ids_len == 20 && e.bytes == fs::file_size(pb)) seen_b = true;
++        }
++        check(seen_a && seen_b, "s2 rows carry ids length + file bytes");
++        // A bulk edit on disk changes bytes but not the row shape: reload still decodes complete.
++        saved::RootDiskStore::Entry e;
++        check(st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e),
++              "s2 indexed root still matches");
++        saved::SavedItem loaded;
++        check(st.load_item(e, loaded, why) && loaded.complete(),
++              "s2 inventory implies no payload was needed (lazy load still complete)");
++        st.shutdown();
++        saved::RootDiskStore off;
++        check(off.disk_inventory().empty(), "s2 disabled store reports no disk rows");
++    }
+     {   // E3 filesystem lifecycle stays inside ./rootdisk-e3-tmp (workspace build tree): the real
+         // default root dir is never touched by any test above.
+         const std::string probe = saved::kDefaultRootDir;
+-- 
+2.54.0.windows.1
+

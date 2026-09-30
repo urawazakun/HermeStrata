@@ -10,9 +10,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $Repo = (Resolve-Path "$PSScriptRoot\..").Path
-# Pinned bases. Strata: 0.1.21 (f1b1d96). Hermes: the parent of patches/hermes-agent/0001.
+# Pinned bases. Strata: 0.1.30 (30ec18e); the older 0.1.21 series is kept in patches/strata-0.1.21. Hermes: the parent of patches/hermes-agent/0001.
 $bases = @{
-    strata         = @{ url = $StrataRepo; base = 'f1b1d961537fd66d37fee68a60015701375b7b5a'; patches = "$Repo\patches\strata" }
+    strata         = @{ url = $StrataRepo; base = '30ec18ec7094550fcc594fd948220d511d80464e'; patches = "$Repo\patches\strata" }
     'hermes-agent' = @{ url = $HermesRepo; base = 'd5aaaa4a'; patches = "$Repo\patches\hermes-agent" }
 }
 New-Item -ItemType Directory -Force $Out | Out-Null

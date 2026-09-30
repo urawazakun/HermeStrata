@@ -34,3 +34,14 @@ Deploy gate: 1, 3b, 3c, 3d, 4, 5a pass (and 2 once E3 lands). Currently blocked 
 | 5a | decode 8K-doc 26.7 tok/s (prod 26.5) — unchanged |
 | 5b | --spec-adapt: no measurable gain (24.2-25.9 vs 25.5-25.8) — keep off |
 Deploy gate met (2 disk-root: basic pass; 6 capacity not run).
+
+## Upstream 0.1.29 port (v100-029), 2026-10-01 03:00 — PASS
+c1 root after aux 0.49-0.69 s; c3 tip/chain/recall 3/3; root-disk after restart; needle at 1/3 depth of 39K tokens 3/3;
+Japanese answers 25.3 (t=0) / 25.6 (t=0.7) tok/s vs 22.6 / 22.3 on the 0.1.21 build; 39K prompt 95 s vs 108 s.
+
+## Upstream 0.1.30 port (v100-030), 2026-10-01
+- first run FAIL: every saved-state restore "recurrent restore failed" (0.1.30 added `dead`/`block_pos` to the
+  recurrent checkpoint; ours dropped them) -> fixed, disk schema v3.
+- re-run 06:35 PASS: c1 0.53-0.72 s; c3 tip 0.69-0.73 s, fork 1.6-1.7 s, recall 2/2 shown, root-disk after restart
+  2.0-2.4 s; needle 3/3; Japanese 24-29 tok/s; 8K-doc decode 25.1 vs 23.2 tok/s (0.1.29, 3 reps each).
+  Regression noted: identical repeated request resumes in ~1.3 s (0.1.29: 0.1-0.5 s).

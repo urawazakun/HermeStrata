@@ -1,0 +1,1397 @@
+From 2e4b5e4e69ed88ed20251a684f3b43c2113b5e2b Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:45:32 +0900
+Subject: [PATCH 9/9] Upstream 0.1.29/0.1.30 follow-ups: K8V4 KV unsupported
+ for saved states, single MTP prefill, conversation-cache/layer-split mutual
+ exclusion, 0.1.30 dead/block_pos state carried through capture/restore/disk
+ (schema v3), AVX-512-only test skipped on AVX2
+
+Squashed from branch v100-030 (13d8eb2..472083d); history in docs/KNOWN-ISSUES.md and docs/ACCEPTANCE.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                          |  20 ++
+ include/strata/program/saved_state.hpp  |  57 +++-
+ src/kernels/cpu/expert_multi_test.cpp   |   7 +
+ src/kernels/native_expert_parity.cpp    |   1 -
+ src/program/generate.cpp                | 275 +++++++++++++---
+ src/program/saved_state.cpp             |  35 ++-
+ src/program/saved_state_layout_test.cpp | 398 ++++++++++++++++++++++++
+ src/program/saved_state_test.cpp        | 115 +++++++
+ 8 files changed, 853 insertions(+), 55 deletions(-)
+ create mode 100644 src/program/saved_state_layout_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 72593b4..fe0560b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -672,6 +672,24 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(saved_state_test src/program/saved_state_test.cpp)
+   target_link_libraries(saved_state_test PRIVATE strata_spec)
+   add_test(NAME saved_state_test COMMAND saved_state_test)
++  # 030 carve-aware checkpoint layout regression (host-only, no GPU): real ModelGeometry/SessionState
++  # fixtures (full + split carve), real size derivation + validate + save/restore seam, real disk codec
++  # and RootDiskStore scan. conversation_state/snapshot TUs compile here with test-only CUDA stubs
++  # (no cudart link); never linked into production. Needs the CUDA headers for session.hpp (types only).
++  # Discovery: the CUDAToolkit_ROOT hint the build scripts pass, standard env, conventional locations.
++  find_path(LAYOUT_CUDA_INCLUDE_DIR NAMES cuda_runtime.h
++    HINTS ${CUDAToolkit_ROOT} $ENV{CUDAToolkit_ROOT} $ENV{CUDA_PATH} ${CUDAToolkit_INCLUDE_DIRS}
++    PATH_SUFFIXES include
++    PATHS /usr/local/cuda /opt/cuda)
++  if(LAYOUT_CUDA_INCLUDE_DIR)
++    add_executable(saved_state_layout_test src/program/saved_state_layout_test.cpp
++      src/core/conversation_state.cpp src/core/conversation_snapshot.cpp src/program/saved_state.cpp)
++    target_include_directories(saved_state_layout_test PRIVATE include src/core ${LAYOUT_CUDA_INCLUDE_DIR})
++    add_test(NAME saved_state_layout_test COMMAND saved_state_layout_test)
++    set_tests_properties(saved_state_layout_test PROPERTIES TIMEOUT 600)
++  else()
++    message(STATUS "saved_state_layout_test skipped: cuda_runtime.h not found (set CUDAToolkit_ROOT)")
++  endif()
+ endif()
+ 
+ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+@@ -842,6 +860,8 @@ if(STRATA_BUILD_TESTS)
+   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
+   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
+   add_test(NAME expert_multi_test COMMAND expert_multi_test)
++  # The kernels need AVX512F/BW/VL/VNNI/VBMI: without them the test exits 77 and ctest reports SKIPPED.
++  set_tests_properties(expert_multi_test PROPERTIES SKIP_RETURN_CODE 77)
+ 
+   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
+   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 022257e..8c9090d 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -42,6 +42,7 @@
+ 
+ #include "strata/kernels/kv_q4.hpp"   // authoritative q4 row formula (CPU-clean: <cstdint> + qsa.hpp only)
+ #include "strata/kernels/kv_q8.hpp"   // authoritative int8 group (same)
++#include "strata/kernels/rope_scaling.hpp"   // resolved rope identity (CPU-clean struct; no device code)
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -123,8 +124,35 @@ inline std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L)
+     return v;
+ }
+ 
+-/// KV cell storage format (mirrors qsa_kv_format: 0 fp16, 1 int8, 2 q4_0).
+-enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2 };
++/// KV cell storage format (mirrors qsa_kv_format: 0 fp16, 1 int8, 2 q4_0). kKvHybrid marks K8V4
++/// (kv_hybrid) payloads, which SavedState does not support: the validators below reject it, so a hybrid
++/// item can never restore, mount, or load from disk even if one were constructed.
++enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3 };
++
++/// SavedState support by KV mode (pure policy; the engine branches below call these so unit tests cover
++/// the exact predicate). K8V4 (kv_hybrid): no capture, restore, or offers - RAM or disk.
++inline bool kv_saved_supported(bool kv_hybrid) { return !kv_hybrid; }
++
++/// Whether a chain/live mount requires a saved boundary repair source and runs the E2b repair block.
++/// K8V4 mounts stand on checkpoint_restore + kv_restore exactly as upstream (no repair); other modes
++/// keep the repair requirement.
++inline bool kv_chain_mount_needs_repair(bool kv_hybrid) { return !kv_hybrid; }
++
++/// Startup mode gate (pure policy, CPU-testable): SavedState capture/restore/disk/inventory run only
++/// when the upstream conversation cache is NOT opted in (mib>0 && slots>0 && prompt_cache>0 enables
++/// it) and there is no layer split (SavedState items carry no carve tags yet, so a split session must
++/// never capture or mount them). K8V4 stays runtime-gated via kv_saved_supported(). The engine folds
++/// this into its central gate, so every entry point is covered with no call-site edits.
++inline bool saved_startup_mode_on(int64_t conv_mib, int conv_slots, int64_t prompt_cache, bool layer_split) {
++    if (layer_split) return false;
++    return !(conv_mib > 0 && conv_slots > 0 && prompt_cache > 0);
++}
++
++/// Exact resolved rope identity for the disk header (lossless: the type int plus every double in %a
++/// hexfloat, which round-trips bit-exactly). Two processes share disk roots only under byte-identical
++/// RESOLVED configs - flags, GGUF-derived defaults and the none-normalization included - anything else
++/// fails closed at compatible_with(). Defined in saved_state.cpp (pure string ops, CPU-linkable).
++std::string saved_rope_identity(const strata::kernels::RopeScaling& cfg);
+ 
+ /// QSA KV cells [0, cells) of ONE layer, identity layout [block][kv_head][page_size][head_dim].
+ /// k/v hold codes (or fp16 halves as bytes); ks/vs the int8 scales (empty in fp16/q4_0).
+@@ -152,10 +180,28 @@ struct IndexerPayload {
+ /// Same set checkpoint_save() copies today (conv_state_sizes), plus the ple window.
+ struct RecurrentPayload {
+     std::vector<uint8_t> gdn, ple, tails;
++    std::vector<uint8_t> dead;        ///< 030 carve-aware checkpoint contract: the spare key per owned layer
++    std::vector<uint8_t> block_pos;   ///< 030 carve-aware checkpoint contract: the block cursor per owned layer
+     int32_t ple_prev[2] = {-1, -1};
+-    uint64_t bytes() const { return (uint64_t)gdn.size() + ple.size() + tails.size() + 8; }
++    uint64_t bytes() const { return (uint64_t)gdn.size() + ple.size() + tails.size() + dead.size() +
++                                    block_pos.size() + 8; }
+ };
+ 
++/// Expected recurrent sizes for one stage under the 030 carve-aware checkpoint contract: gdn for this
++/// session's carve, per-layer tails/dead/cursors times the stage's owned QSA layers, ple exactly when
++/// the live session holds PLE history. Pure so CPU tests cover the exact predicate the restore path
++/// enforces BEFORE any GPU mutation (a 029-shaped payload without dead/block_pos can never pass again).
++struct RecExpect {
++    size_t gdn = 0, tails = 0, dead = 0, block_pos = 0, ple = 0;
++    bool ple_present = false;
++};
++inline bool rec_sizes_ok(const RecurrentPayload& r, const RecExpect& e) {
++    if (r.gdn.size() != e.gdn || r.tails.size() != e.tails || r.dead.size() != e.dead ||
++        r.block_pos.size() != e.block_pos)
++        return false;
++    return e.ple_present ? r.ple.size() == e.ple : r.ple.empty();
++}
++
+ /// One GPU stage's worth of state. Stage 0 is the main session; a layer split's later stages append theirs
+ /// (mirrors ConvCheckpoint::stage_parts). n_stages is fixed at startup; a change clears the store.
+ struct StagePayload {
+@@ -454,8 +500,9 @@ inline bool TipEntry::complete() const {
+ /// rule applies after load (never hash-only).
+ struct RootDiskHeader {
+     static constexpr uint32_t kMagic = 0x48535452;   // 'HSTR' (Hermes strata root)
+-    static constexpr uint32_t kVersion = 2;   // v2: trailing FNV-1a payload checksum (v1 files lack it:
+-                                              // the decoder rejects them, fail closed, never half-trusted)
++    static constexpr uint32_t kVersion = 3;   // v3: dead/block_pos recurrent blobs for the 030 carve-aware
++                                              // checkpoint contract (+ rope identity in numeric_flags). v2 and
++                                              // v1 files fail closed at decode/scan (never mounted, never trusted)
+     uint32_t magic = kMagic;
+     uint32_t version = kVersion;
+     std::string engine_version;           ///< STRATA_VERSION
+diff --git a/src/kernels/cpu/expert_multi_test.cpp b/src/kernels/cpu/expert_multi_test.cpp
+index 446c95f..920746e 100644
+--- a/src/kernels/cpu/expert_multi_test.cpp
++++ b/src/kernels/cpu/expert_multi_test.cpp
+@@ -32,6 +32,13 @@ double now_ms() {
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
++    // No AVX512F/BW/VL/VNNI/VBMI: skip (ctest SKIP_RETURN_CODE 77) instead of the fatal
++    // cpu_require_expert_support below - the kernels under test cannot run on this host.
++    const c::CpuFeatures feats = c::cpu_features();
++    if (!feats.usable()) {
++        std::printf("expert_multi_test: SKIP (this CPU cannot run the expert kernel: %s)\n", feats.reason());
++        return 77;
++    }
+     c::cpu_require_expert_support();
+     std::mt19937 rng(9);
+     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+diff --git a/src/kernels/native_expert_parity.cpp b/src/kernels/native_expert_parity.cpp
+index 19dfabf..1e91a09 100644
+--- a/src/kernels/native_expert_parity.cpp
++++ b/src/kernels/native_expert_parity.cpp
+@@ -162,7 +162,6 @@ int main(int argc, char** argv) {
+ #else
+         setenv("STRATA_IQ_MT_MIN", "1", 1);
+ #endif
+-    }
+     }
+     strata::GgufFile gguf(argv[1]);
+     std::vector<int> layers;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 519329e..fa8e1b1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1060,6 +1060,10 @@ std::string root_numeric_flags(const Options& o, bool& ok) {
+     s += ";cvec=" + root_cvec_identity(o, cok);
+     ok = cok;
+     s += ";mtpwin=" + std::to_string((long long)o.mtp_window) + ";spec=" + std::to_string(o.spec) + ";";
++    // The EXACT resolved rope config (flags + GGUF-derived defaults + none-normalization, lossless):
++    // a root captured under one rotation must never restore under another, even across processes.
++    // Incompatible files fail closed at compatible_with() (and get a new file key), never half-trusted.
++    s += ";" + strata::program::saved_state::saved_rope_identity(strata::kernels::rope_scaling());
+     return s;
+ }
+ 
+@@ -1115,9 +1119,28 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
+ namespace saved = strata::program::saved_state;
+ 
+ inline int saved_kv_format(const strata::core::QsaState& st) {
++    if (st.kv_hybrid) return saved::kKvHybrid;   // K8V4: SavedState unsupported (rejected by validation)
+     return st.kv_q4 ? saved::kKvQ4 : st.kv_int8 ? saved::kKvInt8 : saved::kKvF16;
+ }
+ 
++/// SavedState is explicitly unsupported for K8V4 (kv_hybrid) KV: no capture, restore, or offers
++/// (RAM or disk, including disk load). Logs 'saved state: disabled for K8V4 KV' once per process.
++/// The live conversation chain is untouched - only SavedState store paths check this.
++/// Central gate: the startup mode (upstream conversation cache opted in, or a layer split) is folded
++/// in here too, so EVERY entry point - RAM/disk capture, restore offers, inventory/drop, post-DONE
++/// work - is covered with no call-site edits. The prefix keeper (serve/) is independent and unaffected.
++static bool g_saved_startup_on = true;
++inline bool saved_state_kv_ok() {
++    static bool logged = false;
++    if (!g_saved_startup_on) return false;   // logged once at startup with the reason; stay silent per request
++    if (saved::kv_saved_supported(strata::core::qsa_kv_hybrid())) return true;
++    if (!logged) {
++        logged = true;
++        std::fprintf(stderr, "saved state: disabled for K8V4 KV\n");
++    }
++    return false;
++}
++
+ /// Copies `n` bytes from one page-contiguous pool. `from_host` reads the (device-mapped, pinned) host copy.
+ inline bool saved_copy_bytes(const uint8_t* src, uint8_t* dst, size_t n, bool from_host) {
+     if (n == 0) return true;
+@@ -1137,6 +1160,7 @@ inline bool saved_copy_bytes(const uint8_t* src, uint8_t* dst, size_t n, bool fr
+ bool saved_snapshot_kv(const strata::core::QsaState& st, const strata::core::ModelGeometry& g, int64_t k,
+                        saved::KvLayerPayload& out) {
+     out = saved::KvLayerPayload{};
++    if (!saved::kv_saved_supported(st.kv_hybrid)) return false;   // K8V4: capture nothing (before any copy)
+     if (k <= 0) return true;
+     const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+     const int64_t nH = g.n_head_kv, hd = g.head_dim, ps = qs.page_size;
+@@ -1197,11 +1221,19 @@ bool saved_snapshot_indexer(const strata::core::QsaState& st, const strata::core
+ bool saved_snapshot_stage(const strata::core::SessionState& ss, const strata::core::ModelGeometry& g, int64_t L,
+                           saved::StagePayload& out) {
+     out = saved::StagePayload{};
++    // K8V4: capture nothing (before any copy).
++    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
++        if (!saved::kv_saved_supported(ss.qsa_states[(size_t) i].kv_hybrid)) return false;
+     ConvCheckpoint tmp;   // the existing recurrent copy (GDN state + conv history, PLE history, QSA tails)
+     if (!checkpoint_save(tmp, ss, g)) return false;
+     out.rec.gdn = std::move(tmp.gdn);
+     out.rec.ple = std::move(tmp.ple);
+     out.rec.tails = std::move(tmp.tails);
++    // 030 carve-aware contract: the spare key + block cursor per owned layer ride along, or the
++    // restore-side checkpoint_validate (dead/block_pos sizes) fails every mount - capture and restore
++    // must carry exactly what conversation_checkpoint_save produces.
++    out.rec.dead = std::move(tmp.dead);
++    out.rec.block_pos = std::move(tmp.block_pos);
+     for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+         saved::KvLayerPayload kv;
+         if (!saved_snapshot_kv(ss.qsa_states[i], g, L, kv)) return false;
+@@ -1294,6 +1326,12 @@ inline saved::SnapshotGeom saved_live_geom(const strata::core::ModelGeometry& g)
+ /// backing - pages are contiguous, so [0, cells) is a byte-prefix). Exact payloads behave exactly as before.
+ bool saved_restore_kv(const strata::core::QsaState& st, const strata::core::ModelGeometry& g,
+                        const saved::KvLayerPayload& pay, int64_t cells, void* stream, std::string& e) {
++    // K8V4: restore nothing, before any copy. (An F16 item would otherwise
++    // pass the format check below and copy into the hybrid session's absent pools.)
++    if (!saved::kv_saved_supported(st.kv_hybrid) || pay.fmt == saved::kKvHybrid) {
++        e = "K8V4 KV: SavedState restore unsupported";
++        return false;
++    }
+     if (cells < 1 || pay.cells < cells) { e = "KV cell count mismatch"; return false; }
+     if (pay.fmt != saved_kv_format(st)) { e = "KV format changed"; return false; }
+     const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+@@ -1381,16 +1419,24 @@ bool saved_restore_indexer(const strata::core::QsaState& st, const strata::core:
+ bool saved_restore_stage(strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                           const saved::StagePayload& sp, const std::vector<int32_t>& ids, int64_t L, void* stream,
+                           std::string& e, const saved::StagePayload* kv_src = nullptr) {
++    // K8V4: restore nothing, before any mutation (checkpoint_restore memcpys blindly).
++    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
++        if (!saved::kv_saved_supported(ss.qsa_states[(size_t) i].kv_hybrid)) {
++            e = "K8V4 KV: SavedState restore unsupported";
++            return false;
++        }
+     const saved::StagePayload& ksp = (kv_src != nullptr && sp.kv.empty()) ? *kv_src : sp;
+     if ((int64_t) ksp.kv.size() != g.n_qsa_layers() || (int64_t) sp.idx.size() != g.n_qsa_layers()) {
+         e = "stage layer count changed";
+         return false;
+     }
+-    ConvCheckpoint tmp;   // the checkpoint contract for GDN/PLE/tails (+ple_prev from ids, as at capture)
++    ConvCheckpoint tmp;   // the checkpoint contract for GDN/PLE/tails/dead/cursors (+ple_prev from ids, as at capture)
+     tmp.ids = ids;
+     tmp.gdn = sp.rec.gdn;
+     tmp.ple = sp.rec.ple;
+     tmp.tails = sp.rec.tails;
++    tmp.dead = sp.rec.dead;
++    tmp.block_pos = sp.rec.block_pos;
+     if (!checkpoint_restore(tmp, ss, g)) { e = "recurrent restore failed"; return false; }
+     for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+         if (!saved_restore_indexer(ss.qsa_states[i], g, sp.idx[(size_t) i], e)) return false;
+@@ -1450,7 +1496,7 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+     const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+     const int64_t pages = (L + qs.page_size - 1) / qs.page_size;
+     const int64_t prow = L / qs.idx_block + 1;
+-    const ConvStateSizes z = conv_state_sizes(g);
++    const ConvStateSizes z = conv_state_sizes(g, ss);
+     const size_t tails_exp = z.tail * (size_t) g.n_qsa_layers();
+     for (size_t s = 0; s < it.stages.size(); ++s) {
+         const strata::core::SessionState& ls = (s == 0) ? ss : stages[s - 1]->ss;
+@@ -1477,13 +1523,17 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+         }
+         // blocker 3: the exact recurrent sizes checkpoint_restore assumes (ple matches the live session's
+         // own presence bit, ple_prev the ids' last two) - gated before any copy starts.
+-        if (sp.rec.gdn.size() != z.gdn) { why = "GDN state size"; return false; }
+-        if (sp.rec.tails.size() != tails_exp) { why = "QSA tails size"; return false; }
+-        if (ls.ple_hist != nullptr) {
+-            if (sp.rec.ple.size() != z.ple) { why = "PLE history size"; return false; }
+-        } else if (!sp.rec.ple.empty()) {
+-            why = "PLE payload but no live PLE state";
+-            return false;
++        // The 030 carve-aware sizes (tails AND dead/cursors per owned layer) are enforced through the
++        // shared pure predicate, so a truncated/029-shaped payload fails here, never mid-upload.
++        {
++            saved::RecExpect exp;
++            exp.gdn = z.gdn;
++            exp.tails = tails_exp;
++            exp.dead = z.dead * (size_t) g.n_qsa_layers();
++            exp.block_pos = z.block_pos * (size_t) g.n_qsa_layers();
++            exp.ple = z.ple;
++            exp.ple_present = ls.ple_hist != nullptr;
++            if (!saved::rec_sizes_ok(sp.rec, exp)) { why = "recurrent sizes (GDN/tails/dead/cursors/PLE)"; return false; }
+         }
+         if (sp.rec.ple_prev[0] != (L >= 2 ? it.ids[(size_t) (L - 2)] : -1) ||
+             sp.rec.ple_prev[1] != it.ids[(size_t) (L - 1)]) {
+@@ -1945,6 +1995,20 @@ int main(int argc, char** argv) {
+         std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
+         return 2;
+     }
++    // SavedState (roots/tips/disk/inventory) and the upstream conversation cache are mutually exclusive:
++    // when the upstream cache is opted in, ALL SavedState capture/restore/disk/inventory and post-DONE
++    // SavedState work stay off (the central gate above covers every entry point) - the two restore paths
++    // must never race. SavedState items also carry no carve tags yet, so a layer split disables it too.
++    // The live chain, upstream parking, and the prefix keeper are unaffected. No warning-only mode: our
++    // defaults would otherwise silently run both.
++    g_saved_startup_on = saved::saved_startup_mode_on(o.conversation_cache_mib, o.conversation_cache_slots,
++                                                       o.prompt_cache, !o.layer_split.empty());
++    if (!g_saved_startup_on) {
++        std::fprintf(stderr, "strata serve: SavedState disabled (%s); upstream chain%s active\n",
++                     !o.layer_split.empty() ? "--layer-split without carve tags"
++                                            : "upstream conversation cache opted in",
++                     !o.layer_split.empty() ? "" : "/parking");
++    }
+     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
+     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  Across
+     // GPUs, not yet: KV streaming, images, control vectors, the helper caches (--expert-cache-remote), and lending
+@@ -4494,7 +4558,8 @@ int main(int argc, char** argv) {
+         // exact full-ids match. Disabled by --no-root-disk (true-cold) or when the scan fails (nonfatal:
+         // the engine then serves from chain/tips only). The destructor drains the writer and joins it.
+         saved::RootDiskStore root_disk_store;
+-        if (o.root_disk) {
++        // K8V4: SavedState is unsupported, including disk load - the store never starts (log-once above).
++        if (o.root_disk && saved_state_kv_ok()) {
+             // Optional disk index/header init errors disable disk nonfatally (never a fatal serve
+             // error): the engine then serves from chain/tips only. Fail closed on unreadable
+             // identity inputs (a model shard that cannot be fingerprinted must not authorize reuse
+@@ -4525,7 +4590,10 @@ int main(int argc, char** argv) {
+                 std::fprintf(stderr, "strata serve: root-disk disabled (init threw)\n");
+             }
+         } else {
+-            std::fprintf(stderr, "strata serve: root-disk disabled by --no-root-disk\n");
++            std::fprintf(stderr, "strata serve: root-disk disabled (%s)\n",
++                         !o.root_disk ? "--no-root-disk" :
++                         !g_saved_startup_on ? "SavedState mode off (see above)" :
++                         "K8V4 KV (SavedState unsupported)");
+         }
+         // E1 final review: the MTP repair row R_(root_at-1) for roots. R rows are borrowed prompt-path scratch
+         // (batched chunks, verify windows), overwritten by the next chunk/window - so on_chunk/read_windows stash
+@@ -4548,6 +4616,8 @@ int main(int argc, char** argv) {
+         // only leaves the row unavailable and the boundary snapshot is skipped.
+         auto stash_bdry_row = [&](std::vector<float>& dst, int64_t& dst_L, int64_t want,
+                                   const float* base, int64_t p0, int64_t T, const char* what) -> bool {
++            // K8V4: no boundary rows are retained (no SavedState capture or repair under hybrid).
++            if (!saved_state_kv_ok()) return false;
+             if (want <= 0 || dst_L == want || base == nullptr) return dst_L == want;
+             if (!(p0 <= want - 1 && want - 1 < p0 + T)) return false;
+             try {
+@@ -4585,6 +4655,8 @@ int main(int argc, char** argv) {
+         auto saved_snapshot = [&](int64_t L, const std::vector<int32_t>& ids, const std::vector<ImgKey>& all_imgs,
+                                   bool cvec, const float* brow, int64_t bhc, int64_t bnembd,
+                                   saved::SavedItem& item) -> bool {
++            // K8V4: no snapshots at all (callers gate too; this is the last line of defense).
++            if (!saved_state_kv_ok()) return false;
+             if (L < 1 || (int64_t) ids.size() != L) return false;
+             if (brow == nullptr || bhc <= 0 || bnembd <= 0) return false;   // no MTP repair row, no snapshot
+             item = saved::SavedItem{};
+@@ -4785,7 +4857,8 @@ int main(int argc, char** argv) {
+             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
+             const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+-            if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
++            // (no second prefill: prefill writes absolute cells, so a repeat only redoubles the drafter work -
++            // on a batched chunk it would clobber E-9's values with the slow path's. R_rows below is only read.)
+             // F2b: stash the turn-boundary residual R_(f2_bdry_at-1) - this chunk's row
+             // (f2_bdry_at-1-p0). Same borrowed-scratch lifetime as the root row above.
+             stash_bdry_row(f2_bdry_row, f2_bdry_row_L, f2_bdry_at, R_rows, p0, T, "boundary");
+@@ -4794,7 +4867,8 @@ int main(int argc, char** argv) {
+             // D2H happens here, inside on_chunk, while valid. Reporting stage is the last one when split (the
+             // drafter's rows live there). A failed copy just leaves the row unavailable: the root hook then
+             // rejects the snapshot (the chain still stands), it never fails the request.
+-            if (e1_root_at > 0 && e1_root_row_L != e1_root_at && p0 <= e1_root_at - 1 && e1_root_at - 1 < p0 + T) {
++            if (e1_root_at > 0 && e1_root_row_L != e1_root_at && saved_state_kv_ok() &&
++                p0 <= e1_root_at - 1 && e1_root_at - 1 < p0 + T) {
+                 // Sol final-review fix: the assign below can throw (allocation) - an OPTIONAL root capture
+                 // must never kill the request. A failed stash only leaves the row unavailable (root rejected).
+                 try {
+@@ -5125,11 +5199,17 @@ int main(int argc, char** argv) {
+             if (line == "CACHE INVENTORY" || line == "CACHE DROP") {
+                 try {
+                     const bool drop = line == "CACHE DROP";
++                    // K8V4: SavedState unsupported - offer nothing (empty inventory, zero drops).
++                    const bool saved_off = !saved_state_kv_ok();
+                     size_t dropped = 0;
+-                    if (drop) dropped = saved_states.drop_non_pinned();   // tips only: RAM + disk roots pin
+-                    const std::vector<saved::InventoryEntry> inv = saved_states.inventory();   // roots then tips
+-                    const std::vector<saved::DiskInventoryEntry> dinv = root_disk_store.disk_inventory();
+-                    const bool disk_on = root_disk_store.enabled();
++                    if (drop && !saved_off) dropped = saved_states.drop_non_pinned();   // tips only: RAM + disk roots pin
++                    const std::vector<saved::InventoryEntry> inv =
++                        saved_off ? std::vector<saved::InventoryEntry>{} :
++                                    saved_states.inventory();   // roots then tips
++                    const std::vector<saved::DiskInventoryEntry> dinv =
++                        saved_off ? std::vector<saved::DiskInventoryEntry>{} :
++                                    root_disk_store.disk_inventory();
++                    const bool disk_on = !saved_off && root_disk_store.enabled();
+                     size_t n_roots = 0, n_tips = 0;
+                     for (const saved::InventoryEntry& e : inv)
+                         (e.kind == saved::Kind::Root ? n_roots : n_tips)++;
+@@ -5387,6 +5467,21 @@ int main(int argc, char** argv) {
+             }
+             int64_t resume = 0;
+             bool from_live = false;
++            // Upstream resume mode (SavedState startup-off: upstream cache opted in, or layer-split
++            // without carve tags): match upstream exactly - scan live/chain BEFORE parking, so a live match
++            // skips the needless park_current snapshot below and no reuse is lost. Parking itself stays
++            // gated by conversations.enabled() (park_current/best are inert when disabled). SavedState mode
++            // skips this scan: the unified walk collects live/chain itself (with repair sources), and
++            // from_live is set on mount there. K8V4 keeps the F1 walk (runtime-gated, startup stays on).
++            const bool upstream_resume_mode = !g_saved_startup_on;
++            if (upstream_resume_mode && o.prompt_cache > 0 && want_cvec == cvec_cached) {
++                if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
++                for (const ConvCheckpoint& c : checks)
++                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
++                        resume = (int64_t) c.ids.size();
++                        from_live = false;
++                    }
++            }
+             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+             std::optional<strata::core::SavedConversation> incoming;
+             if (parked.tokens > resume) incoming.emplace(conversations.take(parked.index));
+@@ -5446,20 +5541,66 @@ int main(int argc, char** argv) {
+             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+             bool from_saved = false;
+             const saved::SavedItem* saved_hit = nullptr;
+-            // E3: a disk-loaded mount lives here for the request (a local: no store mutation can move it).
+-            saved::SavedItem disk_mount;
+             const saved::SavedItem* disk_hit = nullptr;
+             std::string disk_hit_path;
+             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+             static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+-            mtp.set_prompt_len(n);   // E2: the new request's length before resume selection - the restore
+-                                     // validation reads prefill_valid_from() (the new drafter window) from it
++            // Request-id vectors for the SavedState walk and the post-DONE tip path (shared tail). Hoisted
++            // out of the SavedState branch: pure CPU, tiny, and the shared tail below needs them in both modes.
+             std::vector<int32_t> ids32;
+             ids32.reserve((size_t) n);
+             for (int64_t t : ids) ids32.push_back((int32_t) t);
+             std::vector<saved::ImgKey> req_simgs;
+             req_simgs.reserve(req_imgs.size());
+             for (const ImgKey& k : req_imgs) req_simgs.push_back({k.start, k.hash});
++            if (upstream_resume_mode) {
++                // Upstream 0.1.30 verbatim resume middle (chain scan and parked restore above): restore the
++                // mounted checkpoint (or reread it), refill the drafter ring. No SavedState walk, no repair
++                // machinery, no boundary pairing - SavedState is startup-off in this mode. The prune /
++                // live_ok=false / session_zero-if-cold lines below are shared with the walk path.
++                if (resume != 0 && !from_live) {
++                    ConvCheckpoint* c = nullptr;
++                    for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
++                    if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
++                    if (reread && c != nullptr) {
++                        // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from
++                        // position 0 in one run (below, with the prompt path's slots lent like any read) -
++                        // the same chunks the request that saved it read them in, when that request started
++                        // at 0. With the VRAM expert set fixed (--adapt-swaps 0) the answer must match the
++                        // restored one token for token; anything the checkpoint missed shows up as a difference.
++                        strata::core::session_zero(ss, g, nullptr, main_cs);
++                        cudaStreamSynchronize(main_stream);
++                        for (auto& st : stages) {
++                            const strata::core::OnDevice on(st->dev);
++                            strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
++                            cudaStreamSynchronize(st->stream);
++                        }
++                        reread_to = resume;
++                        std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
++                                             "restoring\n", (long long) resume);
++                    } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
++                               [&] {
++                                   for (size_t i = 0; i < stages.size(); ++i) {
++                                       const strata::core::OnDevice on(stages[i]->dev);
++                                       if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
++                                   }
++                                   return false;
++                               }()) {
++                        std::printf("ERR restoring a conversation checkpoint failed\n");
++                        return 1;
++                    }
++                }
++                // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main
++                // layers' host copies and slots are always current (every writer writes both), so they need nothing.
++                if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
++                mtp.set_prompt_len(n);
++            } else {
++            // SavedState path (the default): the unified F1 walk below runs at the outer indent to keep the
++            // diff reviewable - it is fully inside this else branch.
++            // E3: a disk-loaded mount lives here for the request (a local: no store mutation can move it).
++            saved::SavedItem disk_mount;
++            mtp.set_prompt_len(n);   // E2: the new request's length before resume selection - the restore
++                                     // validation reads prefill_valid_from() (the new drafter window) from it
+             // E4: actual restore cost (uploads + the repairs below, not cold prefill): the whole F1 walk.
+             const auto e4_restore_t0 = Clock::now();
+             try {
+@@ -5467,7 +5608,8 @@ int main(int argc, char** argv) {
+                 // shorter on-disk root, never the same file twice. The disk peek in the loop below is
+                 // metadata-only; the payload is lazy-loaded only when the disk entry is the longest side.
+                 std::vector<std::string> disk_skip;
+-                const bool use_disk = root_disk_store.enabled();
++                // K8V4: no disk offers either (the store never started under hybrid; belt-and-braces).
++                const bool use_disk = saved_state_kv_ok() && root_disk_store.enabled();
+                 // F1 (BRIEF-CACHE-FIX-1) + E3 disk: unified longest-first walk over {live, chain,
+                 // RAM saved, on-disk roots}. Collection is CPU-only (no GPU touched): chain/live prefix matches WITH an MTP boundary repair source (a
+                 // chain checkpoint carries no MTP rows of its own - without the live row or a same-length saved
+@@ -5484,13 +5626,18 @@ int main(int argc, char** argv) {
+                 auto f1_chain_repairable = [&](int64_t k, bool is_live) -> bool {
+                     try {
+                     if (k < 1 || k >= n || f1_hcn == 0) return false;
++                    // K8V4: upstream eligibility is the prefix match the caller already checked - no
++                    // saved-boundary repair source is required (SavedState is unsupported; the mount below
++                    // stands on checkpoint_restore + kv_restore exactly as upstream).
++                    if (!saved::kv_chain_mount_needs_repair(strata::core::qsa_kv_hybrid())) return true;
+                     if (is_live) {
+                         return live_bdry_L == k && live_bdry.size() == f1_hcn && f1_hcn > 0 &&
+                                live_bdry_hash == fnv1a(live.data(), live.size() * sizeof(int32_t)) &&
+                                f1_new_vf >= live_bdry_vf;
+                     }
+                     const saved::SavedItem* exact =
+-                        saved_states.find_exact(ids32, req_simgs, cvec_cached, k);
++                        saved_state_kv_ok() ?
++                            saved_states.find_exact(ids32, req_simgs, cvec_cached, k) : nullptr;
+                     return exact != nullptr && exact->boundary.complete() &&
+                            exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
+                            exact->boundary.row.size() == f1_hcn && f1_new_vf >= exact->mtp.valid_from;
+@@ -5530,6 +5677,8 @@ int main(int argc, char** argv) {
+                     });
+                 }
+                 std::vector<const saved::SavedItem*> f1_saved;   // validated, longest-first
++                // K8V4: no RAM offers - the walk stays empty (live/chain candidates above are unaffected).
++                if (saved_state_kv_ok()) {
+                 {
+                     // accumulating skip set (blocker 5 review): each rejected candidate joins, so the walk is
+                     // longest-first without revisit and always terminates (cand==nullptr ends it).
+@@ -5577,6 +5726,7 @@ int main(int argc, char** argv) {
+                         skip.push_back(cand);
+                     }
+                 }
++                }   // K8V4: walk skipped above
+                 bool chain_dead = false;   // a mount was attempted: live/chain no longer trustworthy
+                 for (size_t f1_ci = 0, f1_si = 0;;) {
+                     // E3: longest on-disk root below n (chain wins ties; k == n never mounts).
+@@ -5804,8 +5954,9 @@ int main(int argc, char** argv) {
+                         mtp.kv_restore(k);
+                         // E2b boundary repair (was below: ALWAYS repair cell k-1, no proven-older shortcut).
+                         // The repairability pre-check above ran on untouched state, so a failure here is
+-                        // transient: reset and fall through, same as a failed mount.
+-                        {
++                        // transient: reset and fall through, same as a failed mount. K8V4 skips repair
++                        // entirely: upstream mounts on checkpoint_restore + kv_restore alone.
++                        if (saved::kv_chain_mount_needs_repair(strata::core::qsa_kv_hybrid())) {
+                             const int32_t btok = (int32_t) ids[(size_t) k];
+                             const float* bdry_src = nullptr;
+                             if (is_live && live_bdry_L == k && live_bdry.size() == f1_hcn && f1_hcn > 0 &&
+@@ -5813,8 +5964,9 @@ int main(int argc, char** argv) {
+                                 f1_new_vf >= live_bdry_vf) {
+                                 bdry_src = live_bdry.data();
+                             } else if (!is_live) {
+-                                const saved::SavedItem* exact =
+-                                    saved_states.find_exact(ids32, req_simgs, cvec_cached, k);
++                                // K8V4: the store holds nothing (walks skipped) - defensive null.
++                                const saved::SavedItem* exact = saved_state_kv_ok() ?
++                                    saved_states.find_exact(ids32, req_simgs, cvec_cached, k) : nullptr;
+                                 if (exact != nullptr && exact->boundary.complete() &&
+                                     exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
+                                     exact->boundary.row.size() == f1_hcn && f1_hcn > 0 &&
+@@ -5889,8 +6041,9 @@ int main(int argc, char** argv) {
+                     try {
+                     // F2: a prompt point mounts from its generation owner's shared backing (main KV as the
+                     // [0, sk) prefix, shared MTP rows as [0, sk-1); recurrent/indexer/boundary/MTP-metadata
+-                    // from the prompt itself).
+-                    const saved::SavedItem* kv_owner = saved_states.tip_gen_for(cand);
++                    // from the prompt itself). K8V4: no saved candidates exist - defensive null owner.
++                    const saved::SavedItem* kv_owner =
++                        saved_state_kv_ok() ? saved_states.tip_gen_for(cand) : nullptr;
+                     bool ok = cudaDeviceSynchronize() == cudaSuccess;
+                     if (!ok) why = "device not idle";
+                     if (ok && !saved_restore_stage(ss, g, cand->stages[0], cand->ids, sk, main_cs, why,
+@@ -6036,6 +6189,7 @@ int main(int argc, char** argv) {
+             }
+             saved_stats.restore_ms +=
+                 std::chrono::duration<double, std::milli>(Clock::now() - e4_restore_t0).count();
++            } // end else: SavedState walk (upstream_resume_mode takes the upstream path above)
+             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
+             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+@@ -6170,8 +6324,8 @@ int main(int argc, char** argv) {
+                     // (e1_root_at-1-q) of final_R. The rows are verify scratch, reused by the next window, so the
+                     // D2H happens here, before it. final_R_all is the last stage's on a split. A failed copy only
+                     // leaves the row unavailable (root hook rejects the snapshot); the request proceeds.
+-                    if (e1_root_at > 0 && e1_root_row_L != e1_root_at && q <= e1_root_at - 1 &&
+-                        e1_root_at - 1 < q + T) {
++                    if (e1_root_at > 0 && e1_root_row_L != e1_root_at && saved_state_kv_ok() &&
++                        q <= e1_root_at - 1 && e1_root_at - 1 < q + T) {
+                         // Sol final-review fix: see on_chunk - an allocation fault here must not fail the request.
+                         try {
+                             const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
+@@ -6317,8 +6471,8 @@ int main(int argc, char** argv) {
+                     }
+             // E1 final review: publish the root boundary for the R-row stash (on_chunk/read_windows above) and
+             // reset any previous request's row. The stash fires at most once: only the segment ending at root_at
+-            // covers row root_at-1.
+-            e1_root_at = root_at;
++            // covers row root_at-1. K8V4: never published (SavedState unsupported) - both stash sites stay idle.
++            e1_root_at = saved_state_kv_ok() ? root_at : -1;
+             e1_root_row.clear();
+             e1_root_row_L = -1;
+             // F2b: the LAST TURN BOUNDARY inside this prompt - the start of the trailing assistant
+@@ -6340,7 +6494,9 @@ int main(int argc, char** argv) {
+             // (see TipEntry). Failures only drop the prompt point (the generation tip still records).
+             saved::SavedItem f2_prompt;
+             bool f2_prompt_ok = false;
+-            f2_bdry_at = (f2_at > read_from && !req_aux && o.tip_cache_gib > 0.0) ? f2_at : -1;
++            f2_bdry_at = (f2_at > read_from && !req_aux && o.tip_cache_gib > 0.0 && saved_state_kv_ok()) ?
++                             f2_at :
++                             -1;
+             f2_bdry_row.clear();
+             f2_bdry_row_L = -1;
+             int64_t at = read_from;
+@@ -6385,7 +6541,7 @@ int main(int argc, char** argv) {
+                     std::printf("ERR saving a conversation checkpoint failed\n");
+                     return 1;
+                 }
+-                if (to == root_at && root_at > 0) {
++                if (to == root_at && root_at > 0 && saved_state_kv_ok()) {
+                     // E1: pin the upstream system-prefix root at its exact boundary (never evicted by traffic).
+                     // Sol final review: the snapshot needs the MTP repair row R_(root_at-1) stashed from the
+                     // authoritative prompt source above - reject it when unavailable (never invent it).
+@@ -6440,7 +6596,8 @@ int main(int argc, char** argv) {
+                     saved_stats.snapshot_ms +=
+                         std::chrono::duration<double, std::milli>(Clock::now() - e4_root_t0).count();
+                 }
+-                if (to == f2_bdry_at && f2_bdry_at > 0 && !stop_req.load() && !cancelled) {
++                if (to == f2_bdry_at && f2_bdry_at > 0 && !stop_req.load() && !cancelled &&
++                    saved_state_kv_ok()) {
+                     // F2b: snapshot the tip's turn-boundary point at exactly L = f2_at tokens. The session
+                     // just read [at, L), so recurrent/PLE/tails/indexer are prompt-only boundary-L state -
+                     // never later decode state sliced to shorter ids. MTP pairs [0, L-1) are exact (every
+@@ -6518,17 +6675,23 @@ int main(int argc, char** argv) {
+                                                            saved::StagePayload& out,
+                                                            const std::vector<uint8_t>* r_gdn,
+                                                            const std::vector<uint8_t>* r_ple,
+-                                                           const std::vector<uint8_t>* r_tails) -> bool {
++                                                           const std::vector<uint8_t>* r_tails,
++                                                           const std::vector<uint8_t>* r_dead,
++                                                           const std::vector<uint8_t>* r_block) -> bool {
+                                 if (r_gdn != nullptr) {
+                                     out.rec.gdn = *r_gdn;
+                                     out.rec.ple = *r_ple;
+                                     out.rec.tails = *r_tails;
++                                    out.rec.dead = *r_dead;
++                                    out.rec.block_pos = *r_block;
+                                 } else {
+                                     ConvCheckpoint tmp;
+                                     if (!checkpoint_save(tmp, ls, g)) return false;
+                                     out.rec.gdn = std::move(tmp.gdn);
+                                     out.rec.ple = std::move(tmp.ple);
+                                     out.rec.tails = std::move(tmp.tails);
++                                    out.rec.dead = std::move(tmp.dead);
++                                    out.rec.block_pos = std::move(tmp.block_pos);
+                                 }
+                                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                                     saved::IndexerPayload ix;
+@@ -6541,7 +6704,9 @@ int main(int argc, char** argv) {
+                             if (!snap_boundary_stage(ss, s0,
+                                                      f2b_ck != nullptr ? &f2b_ck->gdn : nullptr,
+                                                      f2b_ck != nullptr ? &f2b_ck->ple : nullptr,
+-                                                     f2b_ck != nullptr ? &f2b_ck->tails : nullptr))
++                                                     f2b_ck != nullptr ? &f2b_ck->tails : nullptr,
++                                                     f2b_ck != nullptr ? &f2b_ck->dead : nullptr,
++                                                     f2b_ck != nullptr ? &f2b_ck->block_pos : nullptr))
+                                 throw std::runtime_error("boundary state copy failed");
+                             s0.rec.ple_prev[0] = L >= 2 ? pp.ids[(size_t) (L - 2)] : -1;
+                             s0.rec.ple_prev[1] = pp.ids[(size_t) (L - 1)];
+@@ -6557,7 +6722,9 @@ int main(int argc, char** argv) {
+                                 if (!snap_boundary_stage(st->ss, sps,
+                                                          f2b_part != nullptr ? &f2b_part->gdn : nullptr,
+                                                          f2b_part != nullptr ? &f2b_part->ple : nullptr,
+-                                                         f2b_part != nullptr ? &f2b_part->tails : nullptr))
++                                                         f2b_part != nullptr ? &f2b_part->tails : nullptr,
++                                                         f2b_part != nullptr ? &f2b_part->dead : nullptr,
++                                                         f2b_part != nullptr ? &f2b_part->block_pos : nullptr))
+                                     throw std::runtime_error("boundary stage copy failed");
+                                 sps.rec.ple_prev[0] = L >= 2 ? pp.ids[(size_t) (L - 2)] : -1;
+                                 sps.rec.ple_prev[1] = pp.ids[(size_t) (L - 1)];
+@@ -6801,10 +6968,16 @@ int main(int argc, char** argv) {
+                 static const bool on = std::getenv("STRATA_STATE_HASH") != nullptr;
+                 if (!on || !boundary_ok) return;
+                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
+-                // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
++                // separately of what lies past them in the last KV page (stale cells, fine unless something reads them).
++                // Diagnostics only, called after DONE: failures go to stderr (stdout past DONE is protocol),
++                // and the live/boundary state is invalidated - a CUDA error here means the device state is
++                // suspect, so the next request re-reads cold and no tip is captured from it below.
+                 if (cudaDeviceSynchronize() != cudaSuccess) {
+-                    std::printf("ERR synchronizing state fingerprint\n");
+-                    return 1;
++                    std::fprintf(stderr, "strata serve: state fingerprint sync failed: dropping live/boundary state\n");
++                    live_ok = false;
++                    boundary_ok = false;
++                    live_bdry_L = -1;
++                    return;
+                 }
+                 const int64_t L = (int64_t) live.size();
+                 const strata::kernels::QsaShapes qs = [&] {
+@@ -6898,8 +7071,11 @@ int main(int argc, char** argv) {
+                 for (const auto& [pool, w] : kv_arrays(ms))
+                     if (pool != nullptr) h_mtp = hash_cells(pool, w, 0, mL, h_mtp);
+                 if (!hash_ok) {
+-                    std::printf("ERR reading state fingerprint\n");
+-                    return 1;
++                    std::fprintf(stderr, "strata serve: state fingerprint read failed: dropping live/boundary state\n");
++                    live_ok = false;
++                    boundary_ok = false;
++                    live_bdry_L = -1;
++                    return;
+                 }
+                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
+                                      "kv=%016llx mtp=%016llx stale=%016llx dead=%016llx pooled_full=%016llx ple_prev=%d,%d\n", (long long) L,
+@@ -6939,8 +7115,9 @@ int main(int argc, char** argv) {
+                 // (a) runs only when a tip or live-boundary retention can come of it (same aux/budget gate
+                 // as the flush below): drafter-only work, so skipping it for aux/budget-off lines leaves live
+                 // and the chain exactly as the catch-up-failure path does (tip suppressed, live/chain kept).
++                // K8V4: skipped as well (imported SavedState preparation, not an upstream chain operation).
+                 if (boundary_ok && mtp_ok && produced_n > 0 && emit_win_e > 0 && !req_aux &&
+-                    o.tip_cache_gib > 0.0) {
++                    o.tip_cache_gib > 0.0 && saved_state_kv_ok()) {
+                     std::vector<int32_t> fnxt((size_t) emit_win_e);
+                     for (int t = 0; t < emit_win_e; ++t)
+                         fnxt[(size_t) t] = t + 1 < emit_win_e ? window[(size_t) (t + 1)] : emit_last;
+@@ -6952,8 +7129,10 @@ int main(int argc, char** argv) {
+                 }
+                 // (b) final-token flush. Skipped (leaving the coherent pre-flush boundary) when no tip can come
+                 // of it anyway (aux lines, budget off): aux must not advance the shared session either.
++                // K8V4: no post-DONE flush (it exists for the tip boundary) - live stays as decode left it,
++                // exactly as upstream; the chain reuses it via checkpoint_restore + kv_restore.
+                 if (boundary_ok && !stop_req.load() && produced_n > 0 && emit_pos >= 0 &&
+-                    emit_pos + 1 <= o.max_context && o.tip_cache_gib > 0.0 && !req_aux) {
++                    emit_pos + 1 <= o.max_context && o.tip_cache_gib > 0.0 && !req_aux && saved_state_kv_ok()) {
+                     struct FlushNoHead {
+                         strata::core::Verifier& v;
+                         explicit FlushNoHead(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+@@ -7020,9 +7199,9 @@ int main(int argc, char** argv) {
+                 // pairing additionally stays gated on boundary_ok and the post-DONE flush (flush_R/emit_last),
+                 // so a stop/cancel records nothing. Without a fresh boundary capture (L at or below the
+                 // restored resume, unavailable row, failure), a coherent exact saved point at f2_at already
+-                // in the store is reused when practical - else generation-only.
++                // in the store is reused when practical - else generation-only. K8V4: no tips either.
+                 if (boundary_ok && mtp_ok && !flush_R.empty() && !req_aux && o.tip_cache_gib > 0.0 &&
+-                    !live.empty()) {
++                    !live.empty() && saved_state_kv_ok()) {
+                     saved::SavedItem tip;
+                     if (saved_snapshot((int64_t) live.size(), live, live_imgs, cvec_cached, flush_R.data(),
+                                        g.hc, g.n_embd, tip)) {
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index c5edf83..439783c 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -483,6 +483,29 @@ bool root_read_kv(RootReader& r, KvLayerPayload& k, bool want, int64_t L, const
+ }
+ }  // namespace
+ 
++std::string saved_rope_identity(const strata::kernels::RopeScaling& cfg) {
++    // Lossless: %a hexfloat round-trips every double bit-exactly, so two processes agree if and
++    // only if their RESOLVED configs are identical (CLI flags, GGUF-derived defaults, and the
++    // none-normalization that zeroes the inert knobs). Any difference fails closed downstream.
++    char b[64];
++    std::string s = "rope=v1;type=" + std::to_string((int) cfg.type) + ";";
++    auto hex = [&](const char* k, double v) {
++        std::snprintf(b, sizeof(b), "%a", v);
++        s += k;
++        s += b;
++        s += ";";
++    };
++    hex("base=", cfg.freq_base);
++    hex("factor=", cfg.factor);
++    hex("fsi=", cfg.freq_scale_in);
++    hex("orig=", cfg.orig_ctx);
++    hex("ext=", cfg.ext_factor);
++    hex("attn=", cfg.attn_factor);
++    hex("bf=", cfg.beta_fast);
++    hex("bs=", cfg.beta_slow);
++    return s;
++}
++
+ std::string root_file_key(const RootDiskHeader& hdr, const SavedItem& item) {
+     // Length-prefix every variable field: two different (field, value) splits must never hash equal.
+     uint64_t h = 1469598103934665603ull;
+@@ -605,6 +628,8 @@ bool root_encode(const RootDiskHeader& hdr, const SavedItem& item, std::vector<u
+         w.blob(s.rec.gdn);
+         w.blob(s.rec.ple);
+         w.blob(s.rec.tails);
++        w.blob(s.rec.dead);
++        w.blob(s.rec.block_pos);
+         w.i32(s.rec.ple_prev[0]);
+         w.i32(s.rec.ple_prev[1]);
+         for (const IndexerPayload& x : s.idx) {
+@@ -748,6 +773,8 @@ bool root_decode(const uint8_t* data, size_t size, RootDiskHeader& hdr, SavedIte
+         if (!r.blob(sp.rec.gdn, want, why, kMaxRootRecBytes)) return false;
+         if (!r.blob(sp.rec.ple, want, why, kMaxRootRecBytes)) return false;
+         if (!r.blob(sp.rec.tails, want, why, kMaxRootRecBytes)) return false;
++        if (!r.blob(sp.rec.dead, want, why, kMaxRootRecBytes)) return false;
++        if (!r.blob(sp.rec.block_pos, want, why, kMaxRootRecBytes)) return false;
+         sp.rec.ple_prev[0] = r.i32();
+         sp.rec.ple_prev[1] = r.i32();
+         if (!r.ok) {
+@@ -1051,7 +1078,9 @@ bool root_scan_meta(const std::string& path, uint64_t fsize, RootDiskHeader& hdr
+         return false;
+     }
+     for (int s = 0; s < meta.n_stages; ++s) {
+-        if (!r.skip_blob(why) || !r.skip_blob(why) || !r.skip_blob(why)) return false;   // rec
++        if (!r.skip_blob(why) || !r.skip_blob(why) || !r.skip_blob(why) || !r.skip_blob(why) ||
++            !r.skip_blob(why))
++            return false;   // rec: gdn, ple, tails, dead, block_pos
+         r.i32(why);
+         r.i32(why);   // ple_prev
+         if (!r.ok) {
+@@ -1129,6 +1158,10 @@ void root_strip_bulk(SavedItem& item) {
+         s.rec.ple.shrink_to_fit();
+         s.rec.tails.clear();
+         s.rec.tails.shrink_to_fit();
++        s.rec.dead.clear();
++        s.rec.dead.shrink_to_fit();
++        s.rec.block_pos.clear();
++        s.rec.block_pos.shrink_to_fit();
+         for (IndexerPayload& x : s.idx) {
+             x.pooled.clear();
+             x.pooled.shrink_to_fit();
+diff --git a/src/program/saved_state_layout_test.cpp b/src/program/saved_state_layout_test.cpp
+new file mode 100644
+index 0000000..2ff0edc
+--- /dev/null
++++ b/src/program/saved_state_layout_test.cpp
+@@ -0,0 +1,398 @@
++// src/program/saved_state_layout_test.cpp - host-only regression for the 030 carve-aware
++// checkpoint contract (GPU-acceptance failure: every SavedState restore failed upstream
++// `conversation_checkpoint_validate` with "invalid checkpoint running-state payload").
++//
++// Links conversation_state.cpp + conversation_snapshot.cpp + saved_state.cpp with test-only
++// CUDA stubs below: no GPU, no device init, no cudart link. Uses the REAL ModelGeometry (artifact
++// defaults) and SessionState structs, REAL size derivation (conversation_session_sizes), the REAL
++// save/restore transfer seam (conversation_checkpoint_save/restore, stub memcpy), the REAL validator,
++// and the REAL disk codec (root_encode/decode) + RootDiskStore scan. Fails on the 029-shaped layout
++// (missing dead/block_pos), passes on the complete 030 one.
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <vector>
++
++#include "strata/core/conversation_snapshot.hpp"
++#include "strata/core/conversation_cache.hpp"
++#include "strata/core/layout.hpp"
++#include "strata/core/session.hpp"
++#include "strata/kernels/qsa.hpp"   // real QsaShapes formula for the pooled fixture sizing
++#include "strata/program/saved_state.hpp"
++
++// ---- test-only CUDA stubs (definitions only; declarations + types come from <cuda_runtime.h>
++// via session.hpp; C linkage matches cudart ABI; host memcpy, always success) ----
++extern "C" {
++cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, enum cudaMemcpyKind) {
++    if (n) std::memcpy(dst, src, n);
++    return cudaSuccess;
++}
++cudaError_t cudaDeviceSynchronize(void) { return cudaSuccess; }
++cudaError_t cudaGetLastError(void) { return cudaSuccess; }
++const char* cudaGetErrorString(cudaError_t) { return "stub-no-gpu"; }
++}  // extern "C"
++
++// Uncalled-link stubs for the KV leg (conversation_kv_restore) of conversation_snapshot.cpp: this
++// test exercises the running-state contract (sizes/validate/save/restore) and the disk codec only.
++// Any accidental call aborts loudly instead of faking device behavior.
++namespace strata::kernels {
++void kv_stream_reset(const KvStreamMap&, void*) { std::abort(); }
++void kv_ring_restore(const QsaAttnPools&, const KvHostPools&, int, int64_t, int64_t, int64_t,
++                     const QsaShapes&, void*) {
++    std::abort();
++}
++}  // namespace strata::kernels
++namespace strata::core {
++strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState&) { std::abort(); }
++}  // namespace strata::core
++
++namespace {
++
++namespace fs = std::filesystem;
++namespace core = strata::core;
++namespace saved = strata::program::saved_state;
++
++int g_fail = 0;
++void check(bool ok, const char* what) {
++    std::printf("  %-72s %s\n", what, ok ? "ok" : "FAIL");
++    if (!ok) ++g_fail;
++}
++
++void fill_pattern(std::vector<uint8_t>& v, uint8_t seed) {
++    for (size_t i = 0; i < v.size(); ++i) v[i] = (uint8_t)(seed + i * 31);
++}
++
++// A SessionState fixture with host buffers: `qsa_alloc` owned QSA states starting at global
++// ordinal `qsa_ord0` (the array keeps global indexing: size ord0+alloc), `gdn_alloc` GDN rows.
++// All device pointers are host allocations (the stub memcpy treats everything as host).
++struct Fixture {
++    core::ModelGeometry g;   // artifact defaults (48 layers: 12 QSA, 36 GDN)
++    core::SessionState ss;
++    std::vector<core::QsaState> qs;
++    std::vector<uint8_t> gdn_buf, ple_buf;
++    struct QBuf {
++        std::vector<uint8_t> tail, dead, bpos, pooled;
++    };
++    std::vector<QBuf> qb;
++};
++
++bool make_fixture(int64_t qsa_ord0, int64_t qsa_alloc, int64_t gdn_ord0, int64_t gdn_alloc,
++                  bool with_ple, Fixture& f, std::string& err) {
++    f = Fixture{};
++    // max_cells is fixture-scale (the layout contract under test is max_cells-independent), but the
++    // restore seam writes the pooled row at ids/idx_block, so idx_pooled uses the real formula
++    // (max_cells/idx_block + 2, idx_dim) - a short dummy would be a heap smash, not a layout check.
++    f.ss.max_cells = 16384;
++    f.ss.qsa_ord0 = qsa_ord0;
++    f.ss.qsa_alloc = qsa_alloc;
++    f.ss.gdn_ord0 = gdn_ord0;
++    f.ss.gdn_alloc = gdn_alloc;
++    core::ConversationStateSizes z;
++    if (!core::conversation_session_sizes(f.g, f.ss, z, err)) return false;
++    const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
++    f.gdn_buf.resize(z.gdn);
++    fill_pattern(f.gdn_buf, 11);
++    f.ss.gdn_state = reinterpret_cast<float*>(f.gdn_buf.data());
++    if (with_ple) {
++        f.ple_buf.resize(z.ple);
++        fill_pattern(f.ple_buf, 23);
++        f.ss.ple_hist = reinterpret_cast<float*>(f.ple_buf.data());
++    }
++    f.qs.resize((size_t)(qsa_ord0 + qsa_alloc));
++    f.qb.resize((size_t)(qsa_ord0 + qsa_alloc));
++    for (int64_t j = 0; j < qsa_alloc; ++j) {
++        const size_t o = (size_t)(qsa_ord0 + j);
++        core::QsaState& st = f.qs[o];
++        Fixture::QBuf& b = f.qb[o];
++        b.tail.resize(z.tail);
++        b.dead.resize(z.dead);
++        b.bpos.resize(z.block_pos);
++        b.pooled.resize(((size_t)f.ss.max_cells / (size_t)qs.idx_block + 2) * (size_t)qs.idx_dim * 4);
++        fill_pattern(b.tail, (uint8_t)(40 + j));
++        fill_pattern(b.dead, (uint8_t)(60 + j));
++        fill_pattern(b.bpos, (uint8_t)(80 + j));
++        fill_pattern(b.pooled, (uint8_t)(100 + j));
++        st.idx_tail = reinterpret_cast<float*>(b.tail.data());
++        st.idx_dead = reinterpret_cast<float*>(b.dead.data());
++        st.idx_block_pos = reinterpret_cast<int32_t*>(b.bpos.data());
++        st.idx_pooled = reinterpret_cast<float*>(b.pooled.data());
++        st.idx_pooled_rows = 65536;   // >> 11687/idx_block: the targets check passes
++        st.max_cells = f.ss.max_cells;
++    }
++    f.ss.qsa_states = f.qs.data();
++    return true;
++}
++
++}  // namespace
++
++int main() {
++    setvbuf(stdout, nullptr, _IONBF, 0);
++    std::string err;
++    const int64_t L = 11687;   // the acceptance length that failed on GPU
++    // Full carve: the whole model on one session (the V100 acceptance shape).
++    {
++        Fixture f;
++        check(make_fixture(0, 12, 0, 36, true, f, err), "layout full fixture builds");
++        core::ConversationStateSizes z;
++        check(core::conversation_session_sizes(f.g, f.ss, z, err), "layout full sizes derive");
++        check(z.gdn > 0 && z.tail > 0 && z.dead > 0 && z.block_pos > 0, "layout sizes nonzero");
++        core::ConversationCheckpoint c;
++        c.ids.assign((size_t)L, 7);
++        check(core::conversation_checkpoint_save(c, f.ss, f.g, err), "layout full save transfers");
++        check(core::conversation_checkpoint_validate(c, f.ss, f.g, err), "layout full validates");
++        check(c.gdn.size() == z.gdn && c.tails.size() == 12 * z.tail &&
++                  c.dead.size() == 12 * z.dead && c.block_pos.size() == 12 * z.block_pos,
++              "layout full blobs are carve-sized");
++        // Transfer seam: restore into a second zeroed fixture, re-save, bytes must match.
++        Fixture f2;
++        check(make_fixture(0, 12, 0, 36, true, f2, err), "layout restore fixture builds");
++        std::memset(f2.gdn_buf.data(), 0, f2.gdn_buf.size());
++        std::memset(f2.ple_buf.data(), 0, f2.ple_buf.size());
++        for (auto& b : f2.qb) {
++            std::memset(b.tail.data(), 0, b.tail.size());
++            std::memset(b.dead.data(), 0, b.dead.size());
++            std::memset(b.bpos.data(), 0, b.bpos.size());
++        }
++        check(core::conversation_checkpoint_restore(c, f2.ss, f2.g, err), "layout restore transfers");
++        core::ConversationCheckpoint c2;
++        c2.ids = c.ids;
++        check(core::conversation_checkpoint_save(c2, f2.ss, f2.g, err), "layout re-save transfers");
++        check(c2.gdn == c.gdn && c2.ple == c.ple && c2.tails == c.tails && c2.dead == c.dead &&
++                  c2.block_pos == c.block_pos,
++              "layout transfer roundtrip preserves bytes");
++        // The restore seam also plants the dead key into the pooled row at ids/idx_block.
++        {
++            const size_t row = (size_t)L / 4;
++            const uint8_t* got = f2.qb[0].pooled.data() + row * 128 * 4;
++            check(std::memcmp(got, c.dead.data(), 128 * 4) == 0,
++                  "layout restore plants pooled row");
++        }
++        // The 029 shape (tails-only rec): the REAL validator must refuse it before any GPU work.
++        core::ConversationCheckpoint old29 = c;
++        old29.dead.clear();
++        old29.block_pos.clear();
++        err.clear();
++        check(!core::conversation_checkpoint_validate(old29, f.ss, f.g, err),
++              "layout 029-shaped checkpoint refused");
++        check(err.find("invalid checkpoint running-state payload") != std::string::npos,
++              "layout refusal names the acceptance error");
++    }
++    // Split carve: a stage owning QSA ordinals [4,12) and GDN rows [12,36).
++    {
++        Fixture f;
++        check(make_fixture(4, 8, 12, 24, true, f, err), "layout carved fixture builds");
++        core::ConversationCheckpoint c;
++        c.ids.assign((size_t)L, 7);
++        check(core::conversation_checkpoint_save(c, f.ss, f.g, err), "layout carved save transfers");
++        check(core::conversation_checkpoint_validate(c, f.ss, f.g, err), "layout carved validates");
++        Fixture full;
++        check(make_fixture(0, 12, 0, 36, true, full, err), "layout full fixture rebuilds");
++        core::ConversationCheckpoint cf;
++        cf.ids.assign((size_t)L, 7);
++        check(core::conversation_checkpoint_save(cf, full.ss, full.g, err), "layout full save replays");
++        err.clear();
++        check(!core::conversation_checkpoint_validate(cf, f.ss, f.g, err),
++              "layout full checkpoint refused on carved session");
++        err.clear();
++        check(!core::conversation_checkpoint_validate(c, full.ss, full.g, err),
++              "layout carved checkpoint refused on full session");
++    }
++    // No-PLE session: ple blob empty on both sides, still valid.
++    {
++        Fixture f;
++        check(make_fixture(0, 12, 0, 36, false, f, err), "layout no-PLE fixture builds");
++        core::ConversationCheckpoint c;
++        c.ids.assign((size_t)L, 7);
++        check(core::conversation_checkpoint_save(c, f.ss, f.g, err), "layout no-PLE save transfers");
++        check(c.ple.empty(), "layout no-PLE save holds no PLE");
++        check(core::conversation_checkpoint_validate(c, f.ss, f.g, err), "layout no-PLE validates");
++    }
++    // Disk leg: real 030 blobs through the real v3 codec, then rebuilt and really validated.
++    {
++        Fixture f;
++        check(make_fixture(0, 12, 0, 36, true, f, err), "layout disk fixture builds");
++        core::ConversationCheckpoint c;
++        c.ids.assign(9, 5);
++        check(core::conversation_checkpoint_save(c, f.ss, f.g, err), "layout disk save transfers");
++        saved::SavedItem it;
++        it.kind = saved::Kind::Root;
++        it.ids.assign(9, 5);
++        it.cvec = true;
++        it.n_stages = 1;
++        it.geom.n_qsa_layers = 12;
++        it.geom.n_head_kv = 2;
++        it.geom.head_dim = 256;
++        it.geom.idx_dim = 128;
++        it.geom.idx_block = 4;
++        it.geom.page_size = 4;
++        saved::StagePayload sp;
++        sp.rec.gdn = c.gdn;
++        sp.rec.ple = c.ple;
++        sp.rec.tails = c.tails;
++        sp.rec.dead = c.dead;
++        sp.rec.block_pos = c.block_pos;
++        sp.rec.ple_prev[0] = 5;
++        sp.rec.ple_prev[1] = 5;
++        for (int64_t i = 0; i < 12; ++i) {
++            saved::KvLayerPayload kv;
++            kv.fmt = saved::kKvF16;
++            kv.cells = 9;
++            const size_t code =
++                (size_t)saved::kv_pool_bytes(saved::kKvF16, 9, 2, 256, 4, false);
++            kv.k.assign(code, 1);
++            kv.v.assign(code, 2);
++            sp.kv.push_back(std::move(kv));
++            saved::IndexerPayload ix;
++            ix.pooled_rows = 3;
++            ix.pooled.assign(3 * 128 * 4, 3);
++            ix.block_pos.assign(1, 0);
++            ix.dead_key.assign(128 * 4, 4);
++            sp.idx.push_back(std::move(ix));
++        }
++        it.stages.push_back(std::move(sp));
++        it.mtp.cells = 8;
++        it.mtp.valid_from = 0;
++        saved::KvLayerPayload mkv;
++        mkv.fmt = saved::kKvF16;
++        mkv.cells = 8;
++        const size_t mcode = (size_t)saved::kv_pool_bytes(saved::kKvF16, 8, 2, 256, 4, false);
++        mkv.k.assign(mcode, 5);
++        mkv.v.assign(mcode, 6);
++        it.mtp.kv.push_back(std::move(mkv));
++        it.boundary.hc = 4;
++        it.boundary.n_embd = 2560;
++        it.boundary.row.assign(4 * 2560, 0.5f);
++        check(it.complete(), "layout disk item complete");
++        saved::RootDiskHeader h;
++        h.numeric_flags = "layout-test";
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "layout disk encodes");
++        saved::RootDiskHeader dh;
++        saved::SavedItem di;
++        check(saved::root_decode(buf.data(), buf.size(), dh, di, false, why), "layout disk decodes");
++        check(di.stages[0].rec.dead == it.stages[0].rec.dead &&
++                  di.stages[0].rec.block_pos == it.stages[0].rec.block_pos &&
++                  di.stages[0].rec.gdn == it.stages[0].rec.gdn &&
++                  di.stages[0].rec.tails == it.stages[0].rec.tails,
++              "layout disk rec blobs survive");
++        core::ConversationCheckpoint back;
++        back.ids.assign(9, 5);
++        back.gdn = di.stages[0].rec.gdn;
++        back.ple = di.stages[0].rec.ple;
++        back.tails = di.stages[0].rec.tails;
++        back.dead = di.stages[0].rec.dead;
++        back.block_pos = di.stages[0].rec.block_pos;
++        err.clear();
++        check(core::conversation_checkpoint_validate(back, f.ss, f.g, err),
++              "layout disk-rebuilt checkpoint validates");
++    }
++    // Scan leg: a v2-schema file is rejected by RootDiskStore metadata scan (not merely by decode).
++    {
++        const std::string dir = "layout-scan-v2-tmp";
++        std::error_code ec;
++        fs::remove_all(dir, ec);
++        fs::create_directories(dir, ec);
++        check(!ec, "layout scan tmpdir created");
++        saved::SavedItem it;
++        it.kind = saved::Kind::Root;
++        it.ids.assign(9, 5);
++        it.cvec = true;
++        it.n_stages = 1;
++        it.geom.n_qsa_layers = 1;
++        it.geom.n_head_kv = 2;
++        it.geom.head_dim = 8;
++        it.geom.idx_dim = 8;
++        it.geom.idx_block = 4;
++        it.geom.page_size = 4;
++        saved::StagePayload sp;
++        sp.rec.gdn = {1};
++        sp.rec.tails = {2};
++        sp.rec.dead = {3};
++        sp.rec.block_pos = {4};
++        sp.rec.ple_prev[0] = 5;
++        sp.rec.ple_prev[1] = 5;
++        saved::KvLayerPayload kv;
++        kv.fmt = saved::kKvF16;
++        kv.cells = 9;
++        const size_t code = (size_t)saved::kv_pool_bytes(saved::kKvF16, 9, 2, 8, 4, false);
++        kv.k.assign(code, 1);
++        kv.v.assign(code, 2);
++        sp.kv.push_back(kv);
++        saved::IndexerPayload ix;
++        ix.pooled_rows = 3;
++        ix.pooled.assign(3 * 8 * 4, 3);
++        ix.block_pos.assign(1, 0);
++        ix.dead_key.assign(8 * 4, 4);
++        sp.idx.push_back(std::move(ix));
++        it.stages.push_back(std::move(sp));
++        it.mtp.cells = 8;
++        it.mtp.valid_from = 0;
++        saved::KvLayerPayload mkv;
++        mkv.fmt = saved::kKvF16;
++        mkv.cells = 8;
++        const size_t mcode = (size_t)saved::kv_pool_bytes(saved::kKvF16, 8, 2, 8, 4, false);
++        mkv.k.assign(mcode, 5);
++        mkv.v.assign(mcode, 6);
++        it.mtp.kv.push_back(std::move(mkv));
++        it.boundary.hc = 1;
++        it.boundary.n_embd = 4;
++        it.boundary.row.assign(4, 0.5f);
++        saved::RootDiskHeader h;
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "layout scan fixture encodes");
++        // Forge the v2 schema tag (LE u32 at bytes 4..7): the scan must refuse it at the version
++        // gate, before any bulk byte is read - the trailing checksum is irrelevant to the scan.
++        // A valid v3 control file proves the store scans this directory at all.
++        buf[4] = 2;
++        buf[5] = 0;
++        buf[6] = 0;
++        buf[7] = 0;
++        auto write_file = [&](const std::string& name, const std::vector<uint8_t>& data) {
++            std::ofstream out(dir + "/" + name, std::ios::binary);
++            if (!out) return false;
++            out.write(reinterpret_cast<const char*>(data.data()), (std::streamsize)data.size());
++            return static_cast<bool>(out);
++        };
++        std::vector<uint8_t> good;
++        check(saved::root_encode(h, it, good, why), "layout scan control encodes");
++        // The store only indexes files named by their content key; the v2 forgery gets distinct
++        // ids so both files have valid distinct names (same key would dedup by mtime instead).
++        saved::SavedItem it2 = it;
++        std::fill(it2.ids.begin(), it2.ids.end(), 6);
++        std::vector<uint8_t> buf2;
++        check(saved::root_encode(h, it2, buf2, why), "layout scan v2 source encodes");
++        buf = std::move(buf2);
++        buf[4] = 2;
++        buf[5] = 0;
++        buf[6] = 0;
++        buf[7] = 0;
++        const std::string key3 = saved::root_file_key(h, it);
++        const std::string key2 = saved::root_file_key(h, it2);
++        check(key3.size() == 16 && key2.size() == 16 && key3 != key2, "layout scan keys distinct");
++        check(write_file(("root-" + key2 + ".hstr").c_str(), buf), "layout scan v2 file written");
++        check(write_file(("root-" + key3 + ".hstr").c_str(), good), "layout scan v3 file written");
++        saved::RootDiskStore st;
++        saved::RootDiskStore::Config cfg;
++        cfg.dir = dir;
++        cfg.cap_bytes = 1ull << 40;
++        cfg.live = h;
++        cfg.live_geom = it.geom;
++        cfg.stages = 1;
++        const bool started = st.start(cfg, why);
++        check(started && st.enabled(), "layout scan store starts");
++        check(st.indexed() == 1, "layout scan indexes only the v3 file");
++        st.shutdown();
++        fs::remove_all(dir, ec);
++        check(!ec && !fs::exists(dir), "layout scan tmp cleaned");
++    }
++    std::printf(g_fail ? "FAIL\n" : "PASS\n");
++    return g_fail ? 1 : 0;
++}
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index f6f55d8..570f329 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -808,6 +808,24 @@ int main() {
+         saved::KvLayerPayload noscale = i8.stages[0].kv[0];
+         noscale.ks.clear();
+         check(!saved::kv_prefix_ok(noscale, 9, i8.geom), "F2 int8 without scales rejected");
++        // K8V4: SavedState unsupported - the hybrid marker never validates (blob or prefix).
++        saved::KvLayerPayload hybrid = kv;
++        hybrid.fmt = saved::kKvHybrid;
++        check(!saved::kv_blob_ok(hybrid, 100, gen.geom), "K8V4 hybrid blob rejected");
++        check(!saved::kv_prefix_ok(hybrid, 60, gen.geom), "K8V4 hybrid prefix rejected");
++        // K8V4 chain policy (shared helpers the engine branches call): mounts stand on
++        // checkpoint_restore + kv_restore as upstream - no saved-boundary repair source required
++        // and no E2b repair block runs; int8 keeps the repair requirement.
++        check(saved::kv_saved_supported(false), "non-hybrid KV keeps SavedState support");
++        check(!saved::kv_saved_supported(true), "K8V4 disables SavedState support");
++        check(saved::kv_chain_mount_needs_repair(false), "int8 chain mounts require boundary repair");
++        check(!saved::kv_chain_mount_needs_repair(true), "K8V4 chain mounts without boundary repair");
++        saved::SavedStateStore empty;
++        std::vector<const saved::SavedItem*> skip_none;
++        const std::vector<int32_t> req60 = req_at(0, 60);
++        check(empty.find_best_except(req60, no_imgs, true, skip_none) == nullptr &&
++                  empty.find_exact(req60, no_imgs, true, 60) == nullptr,
++              "K8V4 empty store offers no repair source, yet the chain policy above lets it mount");
+     }
+     {   // F2 shared-MTP pair (the engine form): the prompt keeps cells/valid_from metadata only, rows come
+         // from the generation backing - entry bytes drop by the second MTP copy, both points still restore.
+@@ -1742,6 +1760,103 @@ int main() {
+         fs::remove_all("rootdisk-e3-tmp", ec);
+         check(!ec && !fs::exists("rootdisk-e3-tmp"), "e3 tmp cleaned");
+     }
++    {   // Sol review: startup mode gate truth table (pure policy). Defaults run SavedState; an
++        // opted-in upstream cache (mib>0 && slots>0 && prompt_cache>0) or any layer split turns it off.
++        using saved::saved_startup_mode_on;
++        check(saved_startup_mode_on(0, 4, 6, false), "mode defaults on (no conv cache, no split)");
++        check(!saved_startup_mode_on(512, 4, 6, false), "mode off when upstream cache opted in");
++        check(saved_startup_mode_on(512, 0, 6, false), "mode on when conv slots=0 (upstream disabled)");
++        check(saved_startup_mode_on(512, 4, 0, false), "mode on when prompt_cache=0 (upstream disabled)");
++        check(!saved_startup_mode_on(0, 4, 6, true), "mode off on layer split (no carve tags)");
++        check(!saved_startup_mode_on(512, 4, 6, true), "mode off on split+conv");
++    }
++    {   // Sol review: resolved rope identity is exact-bits (lossless) and fail-closed.
++        using strata::kernels::RopeScaling;
++        using strata::kernels::RopeScalingType;
++        RopeScaling a;   // resolved none: trained rotation, base only
++        a.freq_base = 1e7;
++        RopeScaling b = a;
++        check(saved::saved_rope_identity(a) == saved::saved_rope_identity(b), "rope identity stable");
++        RopeScaling c = a;
++        c.type = RopeScalingType::Linear;
++        c.factor = 2.0;
++        check(saved::saved_rope_identity(a) != saved::saved_rope_identity(c), "rope type+factor differ");
++        RopeScaling d = a;
++        d.freq_base = 500000.0;
++        check(saved::saved_rope_identity(a) != saved::saved_rope_identity(d), "rope base differs");
++        RopeScaling e = c;
++        e.beta_fast = 33.0;
++        check(saved::saved_rope_identity(c) != saved::saved_rope_identity(e), "rope yarn beta differs");
++        // Exact bits, not semantic equality: junk knobs under none (which the resolver zeroes before
++        // the header is built) still serialize differently - fail closed, never half-trusted.
++        RopeScaling junk;
++        junk.freq_base = 1e7;
++        junk.factor = 4.0;
++        check(saved::saved_rope_identity(a) != saved::saved_rope_identity(junk), "rope junk knobs differ");
++        // The disk header gates loads on the full numeric_flags string, rope part included.
++        saved::RootDiskHeader h1, h2;
++        h1.numeric_flags = "kvres=0;bits=0;rope=" + saved::saved_rope_identity(a);
++        h2.numeric_flags = "kvres=0;bits=0;rope=" + saved::saved_rope_identity(a);
++        check(h1.compatible_with(h2), "rope identical headers compatible");
++        h2.numeric_flags = "kvres=0;bits=0;rope=" + saved::saved_rope_identity(c);
++        check(!h1.compatible_with(h2), "rope different headers incompatible");
++    }
++    {   // GPU-acceptance regression (030 carve-aware checkpoint contract): the restore path rebuilds
++        // an upstream ConvCheckpoint from the payload, so dead/block_pos must ride along with exactly
++        // layers*z sizes. A 029-shaped payload (no dead/cursors) fails validation BEFORE any GPU
++        // mutation; a 030-shaped one passes, round-trips the disk codec, and old versions are refused.
++        saved::RecExpect exp;
++        exp.gdn = 8;
++        exp.tails = 6;
++        exp.dead = 4;
++        exp.block_pos = 2;
++        exp.ple = 0;
++        exp.ple_present = false;
++        saved::RecurrentPayload ok;
++        ok.gdn.resize(8);
++        ok.tails.resize(6);
++        ok.dead.resize(4);
++        ok.block_pos.resize(2);
++        check(saved::rec_sizes_ok(ok, exp), "030 rec sizes pass");
++        saved::RecurrentPayload old29 = ok;
++        old29.dead.clear();
++        old29.block_pos.clear();
++        check(!saved::rec_sizes_ok(old29, exp), "029-shaped rec (no dead/cursors) rejected");
++        saved::RecurrentPayload bad = ok;
++        bad.tails.push_back(0);
++        check(!saved::rec_sizes_ok(bad, exp), "wrong tails size rejected");
++        saved::RecurrentPayload pleflat = ok;
++        pleflat.ple.resize(3);
++        check(!saved::rec_sizes_ok(pleflat, exp), "PLE payload without live PLE rejected");
++        exp.ple_present = true;
++        exp.ple = 3;
++        check(saved::rec_sizes_ok(pleflat, exp), "PLE payload with live PLE passes");
++        // Disk codec carries the new blobs (030 layout roundtrip).
++        saved::SavedItem it = e3_canary_line(12, 0);
++        it.stages[0].rec.dead = {0xA6, 0xA7};
++        it.stages[0].rec.block_pos = {0xA8};
++        const saved::RootDiskHeader h = e3_header();
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "030 rec encodes");
++        saved::RootDiskHeader dh;
++        saved::SavedItem di;
++        check(saved::root_decode(buf.data(), buf.size(), dh, di, false, why), "030 rec decodes");
++        check(di.stages[0].rec.dead == it.stages[0].rec.dead &&
++                  di.stages[0].rec.block_pos == it.stages[0].rec.block_pos,
++              "030 dead/cursor bytes survive");
++        check(dh.compatible_with(h), "030 header compatible with itself");
++        // Old schema versions never decode: tamper the LE u32 version (bytes 4..7) 3 -> 2.
++        std::vector<uint8_t> oldv = buf;
++        oldv[4] = 2;
++        oldv[5] = 0;
++        oldv[6] = 0;
++        oldv[7] = 0;
++        check(!saved::root_decode(oldv.data(), oldv.size(), dh, di, false, why), "v2 schema refused");
++        saved::RootDiskHeader hv2 = h;
++        hv2.version = 2;
++        check(!hv2.compatible_with(h), "v2 header incompatible with v3");
++    }
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }
+-- 
+2.54.0.windows.1
+

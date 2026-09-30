@@ -1,0 +1,529 @@
+From b179092deb49fcd86e64fe6892a9b1a9f7d04fa0 Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:45:24 +0900
+Subject: [PATCH 3/9] Adaptive MTP draft window (--spec-adapt, default off)
+
+Squashed from branch v100-030 (6dcaf28..1e78b9d); history in docs/KNOWN-ISSUES.md and docs/ACCEPTANCE.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/spec/draft_policy.hpp |  41 +++++++-
+ src/program/generate.cpp             |  32 ++++--
+ src/spec/draft_policy.cpp            | 121 +++++++++++++++++++++--
+ src/spec/draft_policy_test.cpp       | 141 +++++++++++++++++++++++++++
+ 4 files changed, 319 insertions(+), 16 deletions(-)
+
+diff --git a/include/strata/spec/draft_policy.hpp b/include/strata/spec/draft_policy.hpp
+index c77b869..802b019 100644
+--- a/include/strata/spec/draft_policy.hpp
++++ b/include/strata/spec/draft_policy.hpp
+@@ -13,9 +13,21 @@
+ // and takes the lookup window only when its best E/cost beats the MTP's by `margin`. Costs are the measured round
+ // times per window size (EMA; sizes not seen yet are scaled from seen ones by a prior shape), so the policy adapts
+ // to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
++//
++// T4 (opt-in via set_adapt / --spec-adapt, default off): the MTP window cap itself adapts. Each round the
++// caller deals one cap via mtp_cap() over its min-p cutoff (and T=1 first windows) and passes the dealt size
++// to choose(), which is a pure query: it never deals and never mutates adapt state. mtp_cap() returns the best
++// measured E(t)/cost(t) over that bound, with exploration so the cap can grow back: after 3 consecutive
++// fully-accepted MTP windows at one size the next round probes one size higher (kept when that round also
++// fully accepts); after 2 consecutive zero-accept MTP rounds (size > 1) the anchor drops one immediately; a
++// size untried for ~64 rounds gets one probe (the stalest; ties go to the larger size). Only windows the
++// policy dealt count toward streaks and the stale clock, and every report consumes the outstanding deal (a
++// lookup, a mismatched size, or a duplicate report without a new deal advances nothing); streaks run per
++// dealt size, restarting when it changes. A lookup round breaks the streaks.
+ #pragma once
+ 
+ #include <array>
++#include <cstdint>
+ 
+ namespace strata::spec {
+ 
+@@ -26,13 +38,27 @@ public:
+ 
+     explicit DraftPolicy(int max_t, double margin = 0.03);
+ 
++    /// Adaptive MTP cap (T4): false = off (default; choose() behaves as before). True = mtp_cap() picks the
++    /// cap each round and choose() clamps the MTP side to it. `ceiling` is the largest MTP window adapt may use
++    /// (the caller passes its S_mtp: --mtp-max-t, else --spec).
++    void set_adapt(bool on, int ceiling = kMaxT);
++    bool adapt_on() const { return adapt_; }
++    /// Deal one adaptive cap for this round over `bound` (the caller's min-p cutoff). Exactly one deal per
++    /// round; the dealt size is what observe() must later report for streaks and the stale clock to advance.
++    int mtp_cap(int bound);
++    int adapt_ceiling() const { return adapt_cap_; }
++
+     struct Pick {
+         bool lookup = false;
+         int t = 1;                      // window size (1 + drafts)
+     };
+-    /// `t_mtp`: the MTP's window; `lookup_k`: the lookup proposal's length (0 = none); `match`: its match length.
++    /// Pure query over the already-dealt `t_mtp` (call mtp_cap() first): compares the lookup proposal against
++    /// the MTP side and never touches adapt state, so querying twice cannot deal twice.
++    /// `lookup_k`: the lookup proposal's length (0 = none); `match`: its match length.
+     Pick choose(int t_mtp, int lookup_k, int match) const;
+     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
++    /// Cost/token EMAs update for every report, but streaks, growth/shrink probes and the stale clock advance
++    /// only for the size the last mtp_cap() dealt (a lookup round only breaks the streaks).
+     void observe(bool lookup, int t, int accepted, int match, double round_ms);
+ 
+     double lookup_rate(int match) const;   // current q for a match length
+@@ -41,12 +67,25 @@ public:
+ private:
+     static int bucket(int match);
+     double mtp_tokens(int t) const;
++    int cap_for(int bound) const;   // the cap computation shared by mtp_cap() and choose(); deals nothing
+ 
+     int max_t_;
+     double margin_;
+     std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
+     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
+     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
++    // T4 adaptive MTP cap state (streak/probe counters; last-use rounds per size).
++    bool adapt_ = false;                  // default off
++    int adapt_cap_ = kMaxT;               // largest MTP window adapt may use (the caller's S_mtp)
++    int cur_ = 1;                         // sticky anchor: the argmax domain is [1, min(cur_, M)]
++    int streak_t_ = 0;                    // the size the streaks below were earned at (0 = none running)
++    int full_streak_ = 0;                 // consecutive fully-accepted MTP windows at the dealt size
++    int zero_streak_ = 0;                 // consecutive zero-accept MTP windows at the dealt size
++    bool grow_pending_ = false;           // a +1 growth probe is owed to the next MTP round
++    int grow_probe_ = 0;                  // the absolute probed size (one above the size that earned it)
++    int last_cap_ = 0;                  // size mtp_cap() last dealt (0 = none yet); streaks count only for it
++    int64_t round_ = 0;                   // MTP rounds observed (stale-size clock)
++    std::array<int64_t, kMaxT + 1> last_seen_{};   // last round each size was tried (0 = never)
+ };
+ 
+ }  // namespace strata::spec
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 75e874b..789938b 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -331,6 +331,8 @@ struct Options {
+     bool stop_eos = false;
+     std::vector<int64_t> eos_ids = {248044, 248046};
+     bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
++    /// T4: adapt the MTP window cap per round from measured E(t)/cost(t) (default off; A/B via --spec-adapt).
++    bool spec_adapt = false;
+     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
+     /// from each GPU's free VRAM); empty = one GPU
+     std::string layer_split;
+@@ -463,6 +465,7 @@ void usage() {
+                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
+                  "                       when it pays (default 3; 0 = MTP only)\n"
+                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
++                 "  --spec-adapt         adapt the MTP window cap per round from measured E(t)/cost(t) (default off)\n"
+                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
+                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
+                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
+@@ -1084,6 +1087,7 @@ int main(int argc, char** argv) {
+         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+         else if (a == "--stop-eos") o.stop_eos = true;
+         else if (a == "--spec-split") o.spec_split = true;
++        else if (a == "--spec-adapt") o.spec_adapt = true;
+         else if (a == "--layer-split") o.layer_split = next("--layer-split");
+         else if (a == "--split-device") o.split_device = next("--split-device");
+         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
+@@ -1143,6 +1147,7 @@ int main(int argc, char** argv) {
+             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
+         }
+         else if (a == "--no-spec-split") o.spec_split = false;
++        else if (a == "--no-spec-adapt") o.spec_adapt = false;
+         else if (a == "--eos-ids") {
+             std::string e;
+             if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
+@@ -4070,7 +4075,7 @@ int main(int argc, char** argv) {
+             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+-                        "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
++                        "spec_min_p=%.2f spec_adapt=%d conversation_cache_mib=%lld conversation_cache_slots=%d "
+                         "conversation_cache_min_free_mib=%lld engine=" STRATA_VERSION "\n",
+                         (long long) o.max_context, o.kv.c_str(),
+                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+@@ -4081,7 +4086,7 @@ int main(int argc, char** argv) {
+                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
+                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                         pool.workers(), o.pcie_frac,
+-                        o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
++                        o.spec_min_p, o.spec_adapt ? 1 : 0, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                         (long long) o.conversation_cache_min_free_mib);
+         }
+         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
+@@ -4120,6 +4125,7 @@ int main(int argc, char** argv) {
+         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
++        policy.set_adapt(o.spec_adapt, S_mtp);
+         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
+         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
+         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
+@@ -4723,13 +4729,19 @@ int main(int argc, char** argv) {
+                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
+                 bool from_sfx = false;
+                 int sfx_match = 0;
+-                if (o.suffix_draft > 0 && !first_window) {
+-                    const int k = sfx.propose(S - 1, sbuf.data());
+-                    sfx_match = sfx.last_match();
+-                    if (k > 0 && sbuf[0] == drafts[0]) {
+-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+-                        if (pk.lookup) { T = pk.t; from_sfx = true; }
++                if (!first_window) {
++                    int lk = 0;
++                    if (o.suffix_draft > 0) {
++                        const int k = sfx.propose(S - 1, sbuf.data());
++                        sfx_match = sfx.last_match();
++                        if (k > 0 && sbuf[0] == drafts[0]) lk = k;
+                     }
++                    // ONE cap decision per round: the caller deals the adaptive MTP cap here (a pass-through
++                    // when adapt is off); choose() only queries and must not deal again.
++                    T = policy.mtp_cap(T);
++                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, lk, sfx_match);
++                    T = pk.t;
++                    from_sfx = pk.lookup;
+                 }
+                 const bool timed_round = !first_window;
+                 const Clock::time_point round0 = Clock::now();
+@@ -5491,6 +5503,7 @@ int main(int argc, char** argv) {
+         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
++        policy.set_adapt(o.spec_adapt, S_mtp);
+         std::vector<int32_t> sbuf((size_t) o.spec, 0);
+         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+         if (o.suffix_draft > 0) {
+@@ -5507,6 +5520,7 @@ int main(int argc, char** argv) {
+                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+             }
+             if (first_window) T = 1;
++            else if (o.spec_adapt && use_mtp) T = policy.mtp_cap(T);   // T4: one deal per round; choose() below only queries
+             bool from_sfx = false;
+             int sfx_match = 0;
+             if (o.suffix_draft > 0 && !first_window) {
+@@ -5518,7 +5532,7 @@ int main(int argc, char** argv) {
+                 }
+             }
+             const bool timed_round = !first_window;
+-            ++window_hist[(size_t) T];
++            ++window_hist[(size_t) std::clamp(T, 1, o.spec)];
+             if (p + T > o.max_context) {
+                 std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) p);
+                 return 2;
+diff --git a/src/spec/draft_policy.cpp b/src/spec/draft_policy.cpp
+index 1ac7719..5fd463f 100644
+--- a/src/spec/draft_policy.cpp
++++ b/src/spec/draft_policy.cpp
+@@ -18,11 +18,71 @@ constexpr double kDecay = 0.97;       // lookup counts: older windows fade
+ constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
+ constexpr double kPriorN = 4.0;
+ constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
++// T4: the adaptive MTP cap's exploration rules.
++constexpr int kGrowAfter = 3;       // consecutive fully-accepted windows before a one-round +1 probe
++constexpr int kShrinkAfter = 2;     // consecutive zero-accept rounds before the anchor drops one
++constexpr int kStaleRounds = 64;    // a size untried this long gets one probe
+ 
+ }  // namespace
+ 
+ DraftPolicy::DraftPolicy(int max_t, double margin)
+-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
++    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
++    cur_ = max_t_;
++    last_seen_.fill(0);
++}
++
++void DraftPolicy::set_adapt(bool on, int ceiling) {
++    adapt_ = on;
++    adapt_cap_ = std::clamp(ceiling, 1, kMaxT);
++    cur_ = std::min(max_t_, adapt_cap_);
++    full_streak_ = zero_streak_ = grow_probe_ = last_cap_ = streak_t_ = 0;
++    grow_pending_ = false;
++}
++
++// The adaptive MTP cap: the best measured E(t)/cost(t) over [1, min(cur_, M)], where M is the tightest bound the
++// caller knows this round (min-p cutoff, first-window T=1) and cur_ is the sticky anchor the streak rules move.
++// One deal per round: the caller calls mtp_cap() once and passes the dealt size on; choose() only queries
++// through cap_for() and never deals, so a round cannot arm two probes or overwrite the dealt size. Streaks and
++// the stale clock count only windows the policy dealt (last_cap_): a caller that ignores the cap (or a lookup
++// round) only refreshes the EMAs. Exploration: after 3 consecutive fully-accepted MTP windows at one size the
++// next round probes one size higher (adopted when that round also fully accepts); after 2 consecutive
++// zero-accept MTP rounds at a size above 1 the anchor drops one immediately; a size untried for ~64 rounds
++// gets one probe (the stalest; ties go larger). Probes still report through observe(), so they only refresh
++// EMAs unless a streak rule adopts them.
++// Default off: mtp_cap(M) is just min(M, max_t_).
++int DraftPolicy::cap_for(int bound) const {
++    const int m = std::clamp(bound, 1, max_t_);
++    if (!adapt_) return m;
++    const int lim = std::min({m, cur_, adapt_cap_});
++    // one-round probes outrank the argmax: growth first, then a stale size.
++    if (grow_pending_ && grow_probe_ >= 1 && grow_probe_ <= m && grow_probe_ <= adapt_cap_)
++        return grow_probe_;
++    if (!grow_pending_) {
++        // the stalest size within reach (ties go larger) gets one probe once it lapses by ~64 rounds: the
++        // loop runs largest-first and only a strictly older size replaces the candidate.
++        int cand = 0;
++        int64_t oldest = round_;
++        for (int u = std::min(m, adapt_cap_); u >= 1; --u)
++            if (round_ - last_seen_[u] >= kStaleRounds && last_seen_[u] < oldest) {
++                oldest = last_seen_[u];
++                cand = u;
++            }
++        if (cand > 0) return cand;
++    }
++    int best = 1;
++    double best_r = -1.0;
++    for (int t = 1; t <= lim; ++t) {
++        const double r = mtp_tokens(t) / cost_ms(t);
++        if (r > best_r) { best_r = r; best = t; }
++    }
++    return best;
++}
++
++int DraftPolicy::mtp_cap(int bound) {
++    const int cap = cap_for(bound);
++    if (adapt_) last_cap_ = cap;
++    return cap;
++}
+ 
+ int DraftPolicy::bucket(int match) {
+     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
+@@ -54,7 +114,7 @@ double DraftPolicy::mtp_tokens(int t) const {
+ 
+ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
+     Pick p;
+-    p.t = std::clamp(t_mtp, 1, max_t_);
++    p.t = adapt_ ? cap_for(t_mtp) : std::clamp(t_mtp, 1, max_t_);
+     if (lookup_k <= 0) return p;
+     const double base = mtp_tokens(p.t) / cost_ms(p.t);
+     const double q = lookup_rate(match);
+@@ -91,10 +151,59 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
+         const int b = bucket(match);
+         ok_[b] = kDecay * ok_[b] + accepted;
+         bad_[b] = kDecay * bad_[b] + (accepted < t - 1 ? 1.0 : 0.0);
+-    } else {
+-        const double got = accepted + 1.0;
+-        mtp_tok_[t] = mtp_n_[t] > 0 ? (1.0 - kTokAlpha) * mtp_tok_[t] + kTokAlpha * got : got;
+-        mtp_n_[t] += 1.0;
++        // an MTP probe still flies as an MTP window (from_sfx=false), so a lookup round only breaks the streaks;
++        // the probe stays due until its MTP round reports. The lookup consumes the outstanding MTP deal: that
++        // window never flew, so a later report of its size without a new deal is undealt.
++        full_streak_ = zero_streak_ = streak_t_ = 0;
++        last_cap_ = 0;
++        return;
++    }
++    const double got = accepted + 1.0;
++    mtp_tok_[t] = mtp_n_[t] > 0 ? (1.0 - kTokAlpha) * mtp_tok_[t] + kTokAlpha * got : got;
++    mtp_n_[t] += 1.0;
++    if (!adapt_) return;
++    // only the size the last mtp_cap() dealt advances the streaks, arms probes, or moves the stale clock, and
++    // every report consumes that deal: a second report of the same size without a new deal (or a report with
++    // no deal at all) only refreshes the EMAs above. Whether this report matched is decided before clearing.
++    const bool dealt = last_cap_ != 0 && last_cap_ == t;
++    last_cap_ = 0;
++    if (!dealt) return;
++    ++round_;
++    last_seen_[t] = round_;
++    // a growth probe resolves here: a full accept adopts the new anchor, anything less releases it.
++    if (grow_pending_ && t == grow_probe_) {
++        grow_pending_ = false;
++        grow_probe_ = 0;
++        if (accepted == t - 1) {
++            cur_ = std::min(t, adapt_cap_);
++            full_streak_ = zero_streak_ = streak_t_ = 0;
++            return;
++        }
++        full_streak_ = zero_streak_ = streak_t_ = 0;   // the probe itself does not seed the next streak
++        return;
++    }
++    // streaks run per dealt size: consecutive full (or zero) accepts at one size restart when it changes.
++    if (t != streak_t_) {
++        full_streak_ = zero_streak_ = 0;
++        streak_t_ = t;
++    }
++    const bool full = accepted == t - 1, zero = accepted == 0;
++    full_streak_ = full ? full_streak_ + 1 : 0;
++    zero_streak_ = zero ? zero_streak_ + 1 : 0;
++    if (zero_streak_ >= kShrinkAfter && t > 1) {
++        // shrink immediately: the anchor drops one and both streaks reset so a further drop needs fresh evidence.
++        cur_ = std::max(1, std::min(cur_, t) - 1);
++        grow_pending_ = false;
++        grow_probe_ = 0;
++        full_streak_ = zero_streak_ = streak_t_ = 0;
++        return;
++    }
++    // 3 consecutive full accepts at one size earn a one-round +1 probe (the next round's mtp_cap deals it).
++    // Arming here (not on the next observe) keeps the "next round" promise even if the caller skips a deal.
++    if (full_streak_ >= kGrowAfter && !grow_pending_ && t + 1 <= std::min(max_t_, adapt_cap_)) {
++        grow_probe_ = t + 1;
++        grow_pending_ = true;
++        full_streak_ = 0;
+     }
+ }
+ 
+diff --git a/src/spec/draft_policy_test.cpp b/src/spec/draft_policy_test.cpp
+index e04b3de..512562d 100644
+--- a/src/spec/draft_policy_test.cpp
++++ b/src/spec/draft_policy_test.cpp
+@@ -6,6 +6,12 @@
+ //   3. lookup drafts that are always accepted are taken, and the window grows with them;
+ //   4. match-length buckets learn separately (short matches failing does not stop long ones);
+ //   5. the policy never proposes a window beyond its cap.
++// T4 (--spec-adapt, off by default) checks that
++//   6. default off: choose() keeps the caller's window exactly (no argmax, no probes);
++//   7. on: the cap is the best measured E(t)/cost(t) (a cheap small window beats a costly big one);
++//   8. on: 3 consecutive full accepts probe +1 for one round, and a full probe is kept;
++//   9. on: 2 consecutive zero-accept rounds shrink the anchor by one immediately;
++//   10. on: a size untried for ~64 rounds gets one probe (stalest; ties go larger).
+ #include "strata/spec/draft_policy.hpp"
+ 
+ #include <cstdio>
+@@ -19,6 +25,17 @@ void check(bool ok, const char* what) {
+     if (!ok) ++g_fail;
+ }
+ double cost(int t) { return 19.0 + 10.5 * (t - 1); }   // ms per round, measured shape
++// shapes where the best rate is unambiguous
++double cheap_small_cost(int t) { return t <= 2 ? 10.0 : 100.0; }
++void feed(DraftPolicy& p, int t, int accepted, int n, double c) {
++    for (int i = 0; i < n; ++i) p.observe(false, t, accepted, 0, c);
++}
++// one dealt round: ask the policy for the cap, then report that size's outcome.
++int round(DraftPolicy& p, int bound, int accepted, double c) {
++    const int t = p.mtp_cap(bound);
++    p.observe(false, t, accepted, 0, c);
++    return t;
++}
+ }  // namespace
+ 
+ int main() {
+@@ -58,6 +75,130 @@ int main() {
+         for (int i = 0; i < 3; ++i) p.observe(true, 6, 5, 40, 3.0 * cost(6));   // it turns out very expensive
+         check(!p.choose(4, 5, 40).lookup, "after the probes, the measured cost decides");
+     }
++    // T4: default off - the caller's window passes through untouched.
++    {
++        DraftPolicy p(6);
++        check(!p.adapt_on(), "adapt is off by default");
++        feed(p, 2, 1, 60, cheap_small_cost(2));   // size 2 commits 2 tok / 10 ms; size 6: 6 tok / 100 ms
++        feed(p, 6, 5, 60, cheap_small_cost(6));
++        const DraftPolicy::Pick k = p.choose(6, 0, 0);
++        check(!k.lookup && k.t == 6, "default off: the caller's window is kept (no argmax)");
++        check(p.mtp_cap(6) == 6, "default off: mtp_cap passes the bound through");
++    }
++    // T4: on - the cap maximizes measured E(t)/cost(t).
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        check(p.adapt_on(), "set_adapt(true) turns adapt on");
++        feed(p, 2, 1, 60, cheap_small_cost(2));
++        feed(p, 6, 5, 60, cheap_small_cost(6));
++        check(p.mtp_cap(6) == 2, "adapt on: the best E(t)/cost(t) wins over the bigger window");
++        check(p.choose(6, 0, 0).t == 2, "adapt on: choose() clamps the MTP side to the cap");
++        check(p.mtp_cap(4) == 2, "adapt on: the caller's tighter bound still applies");
++        p.set_adapt(false);
++        check(p.choose(6, 0, 0).t == 6, "set_adapt(false) restores the pass-through");
++    }
++    // T4: on - 3 consecutive full accepts at one size probe +1 for one round; a full probe is kept.
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        p.observe(false, 6, 5, 0, cost(6));   // seed every size's EMAs once so the mid-test deals stay put
++        for (int t = 5; t >= 3; --t) p.observe(false, t, t - 1, 0, cost(t));
++        for (int i = 0; i < 3; ++i) round(p, 2, 1, cost(2));   // 3 dealt full accepts at size 2 ...
++        check(p.mtp_cap(6) == 3, "3 full accepts: one round probes +1");
++        p.observe(false, 3, 2, 0, cost(3));   // the probe fully accepts: adopted
++        check(p.mtp_cap(6) == 3, "a fully-accepted probe is kept");
++        check(p.mtp_cap(6) != 4, "a kept probe does not jump twice in one round");
++    }
++    // T4: on - a rejected growth probe is released (no double probe).
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        p.observe(false, 6, 5, 0, cost(6));
++        for (int t = 5; t >= 3; --t) p.observe(false, t, t - 1, 0, cost(t));   // seed EMAs (no deals yet)
++        for (int i = 0; i < 3; ++i) round(p, 2, 1, cost(2));
++        check(p.mtp_cap(6) == 3, "growth probe is due");
++        p.observe(false, 3, 0, 0, cost(3));   // the probe rejects everything
++        check(p.mtp_cap(2) == 2, "a rejected probe falls back to the dealt size");
++    }
++    // T4: on - 2 consecutive zero-accept rounds shrink the anchor immediately.
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        feed(p, 2, 1, 60, cheap_small_cost(2));
++        feed(p, 6, 5, 60, cheap_small_cost(6));
++        check(p.mtp_cap(6) == 2, "shrink setup: the cap sits at 2");
++        round(p, 6, 0, cheap_small_cost(2));   // dealt a 2, zero accepts ...
++        check(p.mtp_cap(6) == 2, "one zero-accept round does not shrink yet");
++        p.observe(false, 2, 0, 0, cheap_small_cost(2));   // ... second zero at the dealt size
++        check(p.mtp_cap(6) == 1, "2 zero-accept rounds: the anchor drops one immediately");
++    }
++    // T4: on - a size untried for ~64 rounds gets one probe (stalest; ties go larger).
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        // idle at size 2 without arming growth (never 3 full in a row) or shrinking (never 2 zeros in a
++        // row). The seed full accept puts measured size 2 above unmeasured size 1's prior rate, so every idle
++        // round deals 2 while 1,3..6 go stale.
++        round(p, 2, 1, cheap_small_cost(2));
++        for (int i = 0; i < 63; ++i) round(p, 2, i % 2 == 0 ? 0 : 1, cheap_small_cost(2));
++        check(p.mtp_cap(6) == 6, "a stale size is probed (ties go larger)");
++        p.observe(false, 6, 1, 0, cheap_small_cost(6));   // partial: refreshes 6, seeds no streak
++        check(p.mtp_cap(6) == 5, "after the probe the next-stalest size is due");
++        p.observe(false, 5, 1, 0, cheap_small_cost(5));
++        // refresh 1,3,4 through tight bounds (each deals exactly that size) and re-assert 2: nothing is
++        // stale anymore, so the measured best rules again.
++        round(p, 1, 0, cheap_small_cost(1));
++        round(p, 3, 1, cheap_small_cost(3));
++        round(p, 4, 1, cheap_small_cost(4));
++        round(p, 2, 1, cheap_small_cost(2));
++        check(p.mtp_cap(6) == 2, "fresh sizes leave the argmax alone");
++    }
++    // T4: one deal feeds one report - a duplicate report of the same size without a new deal advances nothing.
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        feed(p, 2, 1, 20, cheap_small_cost(2));
++        feed(p, 6, 5, 20, cheap_small_cost(6));
++        round(p, 6, 1, cheap_small_cost(2));              // deals 2, full: a streak of 1 at size 2
++        p.observe(false, 2, 1, 0, cheap_small_cost(2));   // duplicate without a deal: ignored
++        round(p, 6, 1, cheap_small_cost(2));              // a streak of 2, not 3: no growth probe due
++        check(p.mtp_cap(6) == 2, "a duplicate observe without a deal does not extend the streak");
++    }
++    // T4: a lookup (or mismatched-size) report consumes the outstanding deal.
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        feed(p, 2, 1, 20, cheap_small_cost(2));
++        feed(p, 6, 5, 20, cheap_small_cost(6));
++        check(p.mtp_cap(6) == 2, "lookup setup deals size 2");
++        p.observe(true, 4, 2, 8, cheap_small_cost(4));    // a lookup flies instead: deal consumed, streaks broken
++        p.observe(false, 2, 1, 0, cheap_small_cost(2));   // undealt same-size report: ignored
++        round(p, 6, 1, cheap_small_cost(2));              // a streak of 1 ...
++        round(p, 6, 1, cheap_small_cost(2));              // ... then 2, not 3
++        check(p.mtp_cap(6) == 2, "a lookup consumes the deal: a later undealt report advances nothing");
++        check(p.mtp_cap(6) == 2, "mismatch setup deals size 2 again");
++        p.observe(false, 6, 0, 0, cheap_small_cost(6));   // mismatched size: deal consumed, streaks kept
++        p.observe(false, 2, 1, 0, cheap_small_cost(2));   // undealt same-size report: ignored
++        check(p.mtp_cap(6) == 2, "a mismatch consumes the deal too");
++    }
++    // T4: streaks run per dealt size - alternating sizes accumulate neither growth nor shrink evidence.
++    {
++        DraftPolicy p(6);
++        p.set_adapt(true, 6);
++        feed(p, 2, 1, 40, 10.0);   // size 2: 2 tok / 10 ms
++        feed(p, 3, 2, 40, 10.0);   // size 3: 3 tok / 10 ms, the measured best
++        check(round(p, 3, 2, 10.0) == 3, "alternation deals size 3");
++        check(round(p, 2, 1, 10.0) == 2, "alternation deals size 2");
++        check(round(p, 3, 2, 10.0) == 3, "alternation deals size 3 again");
++        check(round(p, 2, 1, 10.0) == 2, "alternation deals size 2 again");
++        check(round(p, 3, 2, 10.0) == 3, "three fulls across sizes");
++        check(round(p, 2, 1, 10.0) == 2, "six fulls across sizes");
++        check(p.mtp_cap(6) == 3, "alternating fulls at two sizes arm no +1 growth probe");
++        check(round(p, 3, 0, 10.0) == 3, "alternating zeros deal size 3");
++        check(round(p, 2, 0, 10.0) == 2, "alternating zeros deal size 2");
++        check(p.mtp_cap(6) == 3, "alternating zeros at two sizes shrink nothing");
++    }
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }
+-- 
+2.54.0.windows.1
+

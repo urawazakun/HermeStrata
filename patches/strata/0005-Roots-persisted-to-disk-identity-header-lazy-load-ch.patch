@@ -1,0 +1,3048 @@
+From c6d5c19c4c1b43e44345d9993ff0ea1bec4f2417 Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:45:26 +0900
+Subject: [PATCH 5/9] Roots persisted to disk: identity header, lazy load,
+ checksum, size cap (--root-dir, --no-root-disk)
+
+Squashed from branch v100-030 (2e34b7a..48ec4f9); history in docs/KNOWN-ISSUES.md and docs/ACCEPTANCE.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/hermes-cache-acceptance.md        |   17 +-
+ include/strata/program/saved_state.hpp |  199 +++-
+ src/program/generate.cpp               |  493 +++++++-
+ src/program/saved_state.cpp            | 1450 ++++++++++++++++++++++++
+ src/program/saved_state_test.cpp       |  614 +++++++++-
+ 5 files changed, 2726 insertions(+), 47 deletions(-)
+
+diff --git a/docs/hermes-cache-acceptance.md b/docs/hermes-cache-acceptance.md
+index 13e7b3a..dc89c79 100644
+--- a/docs/hermes-cache-acceptance.md
++++ b/docs/hermes-cache-acceptance.md
+@@ -3,7 +3,9 @@
+ Design: `H:\qwen38-v100\briefs\DESIGN-HERMES-CACHE.md` (user idea, Claude design).
+ Status: `H:\qwen38-v100\briefs\REPORT-HERMES-CACHE.md` (implemented: Muse / reviewed: Sol).
+ This recipe is the runnable form of the report's owner recipe. GPU measurements belong to the
+-owner and have not been run here. E3's actual disk-persistence tests are deferred to E3.
++owner and have not been run here. E3's CPU disk-persistence suite lives in
++`src/program/saved_state_test.cpp` (`ctest -R ^saved_state_test$`); cases 2/6 below are the GPU
++counterparts.
+ 
+ ## Ground rules
+ 
+@@ -16,22 +18,23 @@ owner and have not been run here. E3's actual disk-persistence tests are deferre
+ ## True-cold flags
+ 
+ Cold must disable every layer, not just the chain: `--prompt-cache 0 --tip-cache-gib 0
+---prompt-cache-root 0`. (`--prompt-cache 0` alone no longer suffices: root capture already
++--prompt-cache-root 0 --no-root-disk`. (`--prompt-cache 0` alone no longer suffices: root capture already
+ requires prompt_cache > 0 in generate.cpp, `--tip-cache-gib 0` turns tips off while roots stay
+-pinned, and `--prompt-cache-root 0` disables the root-pinning threshold.) When E3 lands, cold
+-runs must also disable root-disk loading; if E3 ships enabled by default, it must provide an
+-explicit disable flag and cold runs must pass it.
++pinned, `--prompt-cache-root 0` disables the root-pinning threshold, and `--no-root-disk`
++disables root-disk loading AND storing - without it a warm disk would serve the "cold" run.)
+ 
+ ## Cases
+ 
+ 1. Warm root + aux: fixed tools/system prefix session, then a title/aux request, then a second
+    session with the identical prefix and a different suffix. Require root reuse, second prefill
+    <= 2 s, and no tip from the aux request (main tip/root intact).
+-2. Disk root (PENDING E3 - do not run yet): after root persistence completes, restart only the
++2. Disk root: after root persistence completes, restart only the
+    dev engine with the same `--root-dir H:\qwen38-v100\strata-cache\roots`. New session on that
+    prefix must log `resume from root-disk` at the expected root length, prefill <= 5 s. In a
+    separate configuration, change one model/numeric identity field and confirm the
+-   incompatible root file is ignored.
++   incompatible root file is ignored. Cap shape: rerun with `--root-cap-gib 1` (or another bound
++   below two roots) and, after background writes settle, confirm the dir holds at most the cap
++   (oldest mtime first, recognized `root-*.hstr` only) and the surviving root still resumes.
+ 3. Alternation and fork: parent -> isolated child (other root) -> parent, then parent -> forked
+    child -> parent. The fork prompt must carry the parent's generated assistant tool-call tokens
+    plus the tool result. Require the parent tip length to include generated tokens, tip reuse at
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 3fc0614..81bfb01 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -33,7 +33,13 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <condition_variable>
++#include <map>
++#include <mutex>
++#include <queue>
++#include <set>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ namespace strata::program::saved_state {
+@@ -43,6 +49,36 @@ namespace strata::program::saved_state {
+ inline constexpr double kDefaultTipCacheGib = 8.0;
+ /// E3's --root-dir default. E1 parses the flag but does not write (interface ready).
+ inline const char* kDefaultRootDir = "H:\\qwen38-v100\\strata-cache\\roots";
++/// E3's --root-cap-gib default: the root directory is trimmed (oldest mtime first) past this.
++inline constexpr double kDefaultRootCapGib = 20.0;
++/// E3's per-file bound: a root file bigger than this is ignored at scan and never decoded.
++inline constexpr uint64_t kMaxRootFileBytes = 4ull * 1024 * 1024 * 1024;
++/// E3's decode bound for the ids array (4M tokens = 16 MiB): checked BEFORE any allocation.
++inline constexpr uint64_t kMaxRootIds = 4000000;
++/// E3's decode bound for one header string (engine version, paths, flags): checked BEFORE allocation.
++inline constexpr uint32_t kMaxRootString = 1u << 20;
++/// E3's decode bound for the image list (images are one entry per picture in the prefix).
++inline constexpr uint64_t kMaxRootImages = 1u << 16;
++/// E3's decode caps for the geometry/layout scalars. Real values are tiny (12 layers, head_dim <= 512,
++/// single-digit page/block sizes); anything above these is corrupt. Validating the geometry FIRST (before
++/// any loop or allocation) keeps every downstream size computation in u64 range and every allocation
++/// geometry-derived and exact.
++inline constexpr int64_t kMaxRootLayers = 1024;
++inline constexpr int64_t kMaxRootStages = 8;
++inline constexpr int64_t kMaxRootHeads = 4096;
++inline constexpr int64_t kMaxRootDim = 4096;
++inline constexpr int64_t kMaxRootBlock = 65536;
++/// E3's per-blob cap for the recurrent state (GDN + PLE + tails, ~113 MiB real). Unlike KV/indexer/MTP
++/// blobs its exact size is not derivable from SnapshotGeom at decode time (it needs the full model
++/// geometry, which E2's saved_validate_for_restore checks instead), so it carries an absolute cap.
++inline constexpr uint64_t kMaxRootRecBytes = 1ull << 30;
++/// E3's writer-queue bound: roots are a handful per process; past this new captures are dropped (nonfatal).
++inline constexpr size_t kMaxRootQueue = 64;
++/// E3's writer-queue byte bound: queued captures are full bulk copies in RAM. 64 x 4 GiB of queued
++/// roots would be far too much transient RAM (the pinned RAM root + the in-flight capture copy + the
++/// worker's codec buffer already hold ~3x one root); 8 GiB caps the queue at a fraction of host RAM
++/// while still holding a burst of real roots (~30 x 12K roots). Count and bytes both gate enqueue.
++inline constexpr uint64_t kMaxRootQueueBytes = 8ull * 1024 * 1024 * 1024;
+ 
+ /// An image among the ids: its first <|image_pad|> position plus the hash of its grid and embeddings.
+ /// Mirrors generate.cpp's ImgKey; compared exactly (section 1: validity needs the full picture, not a hash of
+@@ -273,11 +309,14 @@ struct SavedItem {
+     }
+ };
+ 
+-/// E3's on-disk header (interface only in E1): every field that changes numerics must match, else the file is
+-/// ignored. The capturer fills it; compatible_with() gates the load. Pure and CPU-testable.
++/// E3's on-disk header: every field that changes numerics must match, else the file is
++/// ignored. The engine fills it per process (see generate.cpp's root_*_identity helpers); compatible_with()
++/// gates the load. Pure and CPU-testable. ids_len/ids_hash never gate compatibility: the full-ids prefix
++/// rule applies after load (never hash-only).
+ struct RootDiskHeader {
+     static constexpr uint32_t kMagic = 0x48535452;   // 'HSTR' (Hermes strata root)
+-    static constexpr uint32_t kVersion = 1;
++    static constexpr uint32_t kVersion = 2;   // v2: trailing FNV-1a payload checksum (v1 files lack it:
++                                              // the decoder rejects them, fail closed, never half-trusted)
+     uint32_t magic = kMagic;
+     uint32_t version = kVersion;
+     std::string engine_version;           ///< STRATA_VERSION
+@@ -386,4 +425,158 @@ class SavedStateStore {
+     int n_stages_ = 1;
+ };
+ 
++// ---- E3: root disk persistence (DESIGN-HERMES-CACHE.md section 2, E3 bullet). -------------------
++//
++// Implemented: Muse / review: Sol. CPU-ONLY (this header + saved_state.cpp, no CUDA): a durable versioned
++// bounded binary serialization of RootDiskHeader + the full SavedItem (every E1 payload: ids, image/cvec
++// identity, geometry, all stages' recurrent/indexer/KV, the MTP rows with valid_from, the boundary row).
++//
++// Layout (all little-endian; strings/blobs are length + bytes):
++//   u32 magic, u32 version, 6 x (u32 len + bytes: engine_version, pack_path, kv_type, mtp_dir,
++//   model_fingerprint, numeric_flags), u64 ids_len, u64 ids_hash (FNV-1a over the ids, verified on
++//   decode), ids_len x i32 ids, u64 img count + (i64 start, u64 hash) pairs, u8 cvec, i64 n_stages,
++//   6 x i64 geometry, then per stage (rec gdn/ple/tails blobs + ple_prev, per-layer indexer + KV blobs),
++//   the MTP (cells, valid_from, 0/1 KV payloads), the boundary row (hc, n_embd, floats), and a
++//   trailing u64 FNV-1a checksum over every preceding payload byte (v2): same-length corruption
++//   anywhere in the recurrent/KV bulk that the ids hash cannot see fails the decode before any
++//   restore. The streaming scan cannot verify the checksum without reading bulk (multi-GB), so
++//   startup defers integrity to the bounded lazy load - but no corrupt bulk is ever restored.
++//
++// Every length is checked against the remaining bytes (and the kMaxRoot* caps) BEFORE any allocation, so
++// a corrupt/truncated/oversize file fails the decode without a large allocation. Mismatched headers,
++// failed decodes and incomplete payloads are ignored safely (never a partial item).
++//
++// Files: `root-<16 hex>.hstr` under the configured dir, where the stem is root_file_key() (FNV-1a over the
++// header compat fields + full ids + images + cvec + geometry + stage count). Only exactly that pattern
++// (plus the writer's `root-<hex>.tmp.*` temps) is ever created, touched or deleted: trimming never prunes
++// arbitrary user files. Writes go to a temp file and rename atomically; write errors are nonfatal.
++uint64_t root_fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull);
++/// Strict GiB flag parser (E3 review: --root-cap-gib must be finite with a bounded conversion,
++/// and a malformed string must error - never a silent atof invalid=>0 accidental purge).
++/// Full-string strtod: empty, trailing garbage, NaN/inf, negatives and values at/above the exact
++/// uint64-byte-conversion boundary (2^34 GiB: (double)UINT64_MAX rounds up to 2^64, so >= rejects
++/// the boundary itself) all fail. 0 is valid (keep nothing). Shared CPU helper (generate.cpp uses
++/// it for --root-cap-gib/--tip-cache-gib); unit-tested in saved_state_test.cpp.
++bool parse_gib_flag(const char* text, double& gib, std::string& err);
++inline uint64_t root_fnv1a_str(const std::string& s, uint64_t h = 1469598103934665603ull) {
++    return root_fnv1a(s.data(), s.size(), h);
++}
++std::string root_hex16(uint64_t h);
++/// The filename stem for a (header, item) pair: the full exact key (header compat fields, full ids,
++/// image/cvec identity, geometry, stage count) hashed. Equal keys mean the same cacheable bytes.
++std::string root_file_key(const RootDiskHeader& hdr, const SavedItem& item);
++/// True for exactly `root-<16 hex>.hstr` (ASCII, no directories): the only names the store deletes.
++bool root_file_name_ok(const std::string& name);
++/// True for exactly the writer's `root-<16 hex>.tmp.*` temps: the only other names the store deletes.
++bool root_temp_name_ok(const std::string& name);
++/// Serialize (worker thread; the item is immutable after the caller's copy). False = do not write.
++bool root_encode(const RootDiskHeader& hdr, const SavedItem& item, std::vector<uint8_t>& out,
++                 std::string& why);
++/// Deserialize. meta_only decodes the header + ids/imgs/cvec/geometry/scalar MTP fields and VALIDATES
++/// every bulk length without allocating the bulk (unit-test path); full mode allocates and verifies
++/// the ids hash. Both modes verify the trailing payload checksum first (it covers the ids too, so a
++/// same-length bulk corruption fails even in meta mode). Either way a corrupt/truncated/oversize/
++/// mismatched buffer fails safely. Full mode additionally requires exact geometry-derived blob sizes
++/// (no allocation before the geometry is proven sane) and rejects trailing bytes past the checksum.
++bool root_decode(const uint8_t* data, size_t size, RootDiskHeader& hdr, SavedItem& item, bool meta_only,
++                 std::string& why);
++/// Streaming metadata-only scan of one root file (the startup index): reads the header + ids/imgs/
++/// cvec/geometry/scalar fields and SEEK-SKIPS every bulk blob without reading or allocating it, so a
++/// multi-GB payload costs kilobytes of I/O at startup. On success `meta` holds the index metadata
++/// (bulk cleared) and the stem key check is the caller's. Fails on any truncation, oversize length,
++/// geometry violation or trailing bytes.
++bool root_scan_meta(const std::string& path, uint64_t fsize, RootDiskHeader& hdr, SavedItem& meta,
++                    std::string& why);
++/// A copy of `item` with every bulk byte vector cleared but all scalars (ids/imgs/cvec/geometry/cells/
++/// counts/formats/valid_from) kept: what the RAM index holds (payloads stay on disk until first use).
++void root_strip_bulk(SavedItem& item);
++
++/// The on-disk root cache: a RAM index of header+ids metadata at startup, payloads lazy-loaded on first
++/// exact (full-ids, never hash-only) match, and a serialized background writer for immutable captures.
++///
++/// Thread-safe (the serve loop enqueues/matches while the worker writes/trims); write errors are nonfatal
++/// (stderr + skip). The destructor drains the queue, joins the worker and trims: shutdown always joins.
++/// Single writer per directory: one store owns a root dir per process (temps are process-unique so two
++/// processes never clobber each other's temp; same-key files hold the same cacheable bytes, so a
++/// same-name racer resolves to identical content).
++class RootDiskStore {
++  public:
++    struct Config {
++        std::string dir;                    ///< --root-dir (created when missing)
++        uint64_t cap_bytes = (uint64_t)(kDefaultRootCapGib * 1073741824.0);   ///< --root-cap-gib
++        RootDiskHeader live;                ///< this process's identity: only matching files load
++        SnapshotGeom live_geom;             ///< index pre-filter (the restore re-validates everything)
++        int stages = 1;                     ///< index pre-filter (SavedItem::complete re-checks)
++    };
++    /// One indexed file: the compat header plus the stripped metadata (full ids for the prefix rule).
++    struct Entry {
++        RootDiskHeader hdr;
++        SavedItem meta;                     ///< bulk cleared: ids/imgs/cvec/geometry/scalars only
++        std::string path;                   ///< full file path
++        uint64_t file_bytes = 0;
++    };
++
++    RootDiskStore();
++    ~RootDiskStore();
++    RootDiskStore(const RootDiskStore&) = delete;
++    RootDiskStore& operator=(const RootDiskStore&) = delete;
++
++    /// Scan `cfg.dir` (streaming metadata only: bulk blobs are seek-skipped, never read) and start
++    /// the writer. Incompatible/corrupt/oversize files are ignored. False leaves the store disabled
++    /// (cold behaviour, nonfatal): check enabled().
++    bool start(const Config& cfg, std::string& why);
++    /// Drain the queue (every queued root is written), join the worker, enforce the cap. Idempotent.
++    void shutdown();
++    bool enabled() const;
++    size_t indexed() const;                 ///< files in the RAM index
++    size_t pending() const;                 ///< captures waiting in the writer queue
++    /// Longest index entry whose full ids prefix-match `ids` (exact images/cvec/geometry/compat), with
++    /// lo < ids_len < hi and path not in `skip`. Payload is NOT loaded here (lazy on load_item).
++    bool find_match(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
++                    const std::vector<std::string>& skip, int64_t lo, int64_t hi, Entry& out) const;
++    /// Bounded full decode of `e` + header compat + id binding + complete(): the payload the restore
++    /// validates and mounts. False = ignore this entry (add its path to the request's skip set).
++    bool load_item(const Entry& e, SavedItem& out, std::string& why) const;
++    /// A successful disk mount refreshes the file's mtime (the cap trim is LRU by mtime). Nonfatal.
++    void mark_used(const std::string& path) const;
++    /// Queue an immutable capture for the background writer. Takes a const reference and copies
++    /// only AFTER the cheap dedup/bound checks, so a disabled store or a duplicate never pays for a
++    /// multi-GB deep copy. Deduplicated by file key (already indexed or already queued roots are
++    /// skipped, so pinned roots never pile up unbounded) and bounded by kMaxRootQueue AND
++    /// kMaxRootQueueBytes; incomplete items and a disabled/stopped store are no-ops. Never throws
++    /// past the caller's copy: internal queue insertion failures are swallowed as nonfatal drops.
++    /// (The caller's own copy into the call can still throw under extreme pressure - generate.cpp
++    /// wraps the disk-only call separately so insert_root always runs.)
++    void enqueue(const SavedItem& item);
++    /// Enforce the cap now (the worker also runs it after every write): delete oldest-mtime recognized
++    /// cache files past the cap plus stale recognized temps. Never touches other names. False on error
++    /// (still deletes what it can); usable from CPU tests with a temp dir.
++    bool trim_now(std::string& why);
++    /// Drop the index entry pointing at `path` (load/validation failure repair): the next request
++    /// skips the bad file and a recaptured root for the same key can be queued again (enqueue
++    /// dedups against the index, so without this a corrupt file would pin its key forever).
++    /// No-op when no entry points at `path`. Never touches the filesystem.
++    void drop_path(const std::string& path);
++
++  private:
++    void worker_main();
++    /// Serialize + atomic temp->rename + index (worker thread only). False = skipped, nonfatal.
++    bool write_one(const std::string& key, const SavedItem& item, std::string& why);
++
++    mutable std::mutex mu_;
++    std::condition_variable cv_;
++    std::thread worker_;
++    bool started_ = false;
++    bool stop_ = false;
++    Config cfg_;
++    std::map<std::string, Entry> index_;   // file key -> indexed file
++    struct Queued {
++        std::string key;
++        SavedItem item;
++    };
++    std::queue<Queued> queue_;
++    std::set<std::string> queued_;         // keys currently in queue_ (marker held through write completion)
++    uint64_t queued_bytes_ = 0;            // retained bulk bytes currently in queue_ (byte-cap accounting)
++};
++
+ }  // namespace strata::program::saved_state
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ef45fd3..ba6a6da 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -369,8 +369,17 @@ struct Options {
+     /// 0 = tips off (roots still pin at the upstream system-prefix boundary).
+     /// Implemented: Muse / review: Sol.
+     double tip_cache_gib = strata::program::saved_state::kDefaultTipCacheGib;
+-    /// E3's --root-dir (interface-ready in E1): parsed and validated only, persistence lands in E3.
++    /// E3 (DESIGN-HERMES-CACHE.md): pinned roots persist under this directory (default
++    /// H:\qwen38-v100\strata-cache\roots): written by a background thread on root capture, indexed
++    /// (metadata only) at startup, payloads lazy-loaded on the longest exact-prefix match.
++    /// Implemented: Muse / review: Sol.
+     std::string root_dir = strata::program::saved_state::kDefaultRootDir;
++    /// E3: the root directory is trimmed (oldest mtime first, recognized cache files only) past this
++    /// cap in GiB (default 20). 0 = keep nothing (writes still land, then trim).
++    double root_cap_gib = strata::program::saved_state::kDefaultRootCapGib;
++    /// E3: false (--no-root-disk) disables root-disk loading AND storing: the true-cold configuration
++    /// for acceptance runs. Default true.
++    bool root_disk = true;
+     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
+     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
+     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
+@@ -470,7 +479,12 @@ void usage() {
+                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
+                   "  --tip-cache-gib N    --serve: SavedState tips live in host RAM under this LRU budget\n"
+                   "                       in GiB (default 8, 0 = tips off; roots still pin)\n"
+-                  "  --root-dir DIR       --serve: E3 roots directory (E1: parsed only, persistence lands in E3)\n"
++                  "  --root-dir DIR       --serve: E3 roots directory (default H:\\qwen38-v100\\strata-cache\\roots):\n"
++                  "                       background-persisted on root capture, indexed at startup, lazy-loaded\n"
++                  "                       on the longest exact-prefix match (resume from root-disk)\n"
++                  "  --root-cap-gib N     --serve: trim the roots directory past N GiB (default 20, oldest mtime\n"
++                  "                       first, recognized cache files only)\n"
++                  "  --no-root-disk       --serve: disable root-disk loading and storing (true-cold runs)\n"
+                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
+                  "                       of the batched prompt path (default 64, 0 = off)\n"
+                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
+@@ -818,6 +832,248 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull)
+     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+     return h;
+ }
++// Strict --root-cap-gib/--tip-cache-gib parsing lives in saved_state.{hpp,cpp} (shared CPU helper,
++// unit-tested in saved_state_test.cpp): strata::program::saved_state::parse_gib_flag.
++
++// ---- E3: root-disk identity (DESIGN-HERMES-CACHE.md section 2, E3 bullet). ----------------------
++// Implemented: Muse / review: Sol. The RootDiskHeader this process writes and accepts: the engine
++// version (STRATA_VERSION), the normalized absolute pack path, the --kv type, the MTP dir path plus
++// its contents fingerprint, the model fingerprint (pack listing + PLE/native shards as
++// name=size:mtime, FNV-hashed), and the numeric flags (kv-resident value, every --native-* bit,
++// stream-token/oracle bits, no-ple, the full cvec identity incl. file contents, MTP window, spec
++// width). Any difference ignores the file: a stale root never restores. All filesystem reads are
++// best-effort (a missing file fingerprints as missing: deterministic, so both runs agree).
++std::string root_norm_path(const std::string& p) {
++    try {
++        std::error_code ec;
++        std::filesystem::path q = std::filesystem::absolute(std::filesystem::path(p), ec);
++        if (ec) return p;
++        return q.lexically_normal().string();
++    } catch (...) {
++        return p;
++    }
++}
++
++// Recursive FNV-1a hex over a sorted listing of (role, relative-path, size, mtime) records.
++// Sizes+mtimes, not contents: the model shards are tens of GB (contents hashing is for the small
++// cvec files below). Directories are walked RECURSIVELY (a nested weights change must change the
++// fingerprint), paths are normalized relative paths with a role prefix, and every variable field
++// is length-prefixed in the hash mix so two different (role, path) splits never hash equal.
++// Symlinks/reparse points are never followed. Fail closed: any unreadable/missing/erroneous entry
++// (or an unreadable directory) sets ok=false - common 'err' fingerprints must never authorize
++// reuse. The caller disables disk when !ok (nonfatal: the engine serves from chain/tips only).
++struct RootFp {
++    std::string hex;
++    bool ok = false;
++};
++RootFp root_files_fingerprint(const std::vector<std::pair<std::string, std::string>>& role_paths) {
++    std::vector<std::string> rec;
++    bool ok = true;
++    auto mix_len = [](uint64_t& h, uint64_t v) { h = fnv1a(&v, 8, h); };
++    for (const auto& [role, p] : role_paths) {
++        try {
++            std::error_code ec;
++            const std::filesystem::path q(p);
++            const std::filesystem::file_status lst = std::filesystem::symlink_status(q, ec);
++            if (ec || lst.type() == std::filesystem::file_type::not_found) {
++                rec.push_back(role + ":" + p + "=missing;");
++                ok = false;
++                continue;
++            }
++            if (lst.type() != std::filesystem::file_type::regular &&
++                lst.type() != std::filesystem::file_type::directory) {
++                rec.push_back(role + ":" + p + "=special;");   // symlink/reparse: never followed
++                ok = false;
++                continue;
++            }
++            if (lst.type() == std::filesystem::file_type::directory) {
++                size_t entries = 0;
++                // Default options: no follow, no skip_permission_denied - an unreadable subtree
++                // surfaces as an iterator error below and fails closed (never silently skipped).
++                std::error_code wec;
++                std::filesystem::recursive_directory_iterator end;
++                for (std::filesystem::recursive_directory_iterator it(q, wec);
++                     !wec && it != end; it.increment(wec)) {
++                    if (++entries > (1u << 20)) { ok = false; break; }   // bounded walk
++                    // Separate codes per syscall: a later success must never overwrite an earlier
++                    // error, and every status/size/mtime failure fails closed.
++                    std::error_code e2, e3, e4;
++                    const std::filesystem::file_status est =
++                        std::filesystem::symlink_status(it->path(), e2);
++                    if (e2) { ok = false; continue; }   // status unreadable: fail closed
++                    if (est.type() == std::filesystem::file_type::directory) continue;   // descended
++                    if (est.type() != std::filesystem::file_type::regular) {
++                        ok = false;   // symlink/special: never followed, never authorized
++                        continue;
++                    }
++                    const std::string rel = it->path().lexically_relative(q).generic_string();
++                    const uint64_t sz = it->file_size(e3);
++                    const auto mt = std::filesystem::last_write_time(it->path(), e4);
++                    if (e3 || e4) { ok = false; continue; }
++                    rec.push_back(role + ":" + rel + "=" + std::to_string(sz) + ":" +
++                                  std::to_string((long long)mt.time_since_epoch().count()) + ";");
++                }
++                if (wec) ok = false;
++                continue;
++            }
++            std::error_code e2, e3;
++            const uint64_t sz = std::filesystem::file_size(q, e2);
++            const auto mt = std::filesystem::last_write_time(q, e3);
++            if (e2 || e3) {
++                rec.push_back(role + ":" + p + "=err;");
++                ok = false;
++                continue;
++            }
++            rec.push_back(role + ":" + std::filesystem::path(p).filename().string() + "=" +
++                          std::to_string(sz) + ":" +
++                          std::to_string((long long)mt.time_since_epoch().count()) + ";");
++        } catch (...) {
++            rec.push_back(role + ":" + p + "=exc;");
++            ok = false;
++        }
++    }
++    std::sort(rec.begin(), rec.end());
++    uint64_t h = 1469598103934665603ull;
++    for (const std::string& r : rec) {   // length-prefix every record: no split ambiguity
++        const uint64_t L = (uint64_t) r.size();
++        mix_len(h, L);
++        h = fnv1a(r.data(), r.size(), h);
++    }
++    if (rec.empty()) ok = false;   // no inputs at all: nothing proven, fail closed
++    char b[17];
++    std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
++    return RootFp{std::string(b), ok && !rec.empty()};
++}
++
++// The cvec identity: file paths + scales + layer range + mode + direction + a contents hash (the
++// files are ~1 MB: contents, not just sizes, because a same-size edited vector changes numerics).
++// Scales hash as EXACT float bits (%.6g collapses distinct scales: 1.0000001 vs 1.0 would share an
++// identity and restore wrong bytes). Any unreadable file fails closed (ok=false): the caller then
++// disables disk instead of authorizing reuse under a common 'err' fingerprint.
++std::string root_cvec_identity(const Options& o, bool& ok) {
++    ok = true;
++    if (o.cvec_files.empty()) return "none";
++    std::string out;   // human-readable path records (the hash below binds them exactly)
++    uint64_t h = 1469598103934665603ull;
++    for (const auto& [path, scale] : o.cvec_files) {
++        uint32_t bits = 0;   // exact float bits, never a rounded decimal
++        static_assert(sizeof(bits) == sizeof(scale), "float is 32 bits");
++        std::memcpy(&bits, &scale, sizeof bits);
++        char sc[16];
++        std::snprintf(sc, sizeof sc, "%08x", (unsigned)bits);
++        const std::string rec = root_norm_path(path) + ":bits=" + sc + ";";
++        out += rec;
++        const uint64_t L = (uint64_t) rec.size();   // length-prefix the role/path record
++        h = fnv1a(&L, 8, h);
++        h = fnv1a(rec.data(), rec.size(), h);
++        try {
++            std::error_code ec;
++            const std::filesystem::file_status lst =
++                std::filesystem::symlink_status(std::filesystem::path(path), ec);
++            if (ec || lst.type() != std::filesystem::file_type::regular) { ok = false; continue; }
++            const uint64_t sz = std::filesystem::file_size(std::filesystem::path(path), ec);
++            if (!ec && sz <= (1ull << 30)) {
++                std::ifstream f(path, std::ios::binary);
++                if (f) {
++                    std::vector<char> buf((size_t)sz);
++                    f.read(buf.data(), (std::streamsize)buf.size());
++                    if (f) h = fnv1a(buf.data(), buf.size(), h);
++                    else ok = false;
++                } else {
++                    ok = false;
++                }
++            } else {
++                ok = false;
++            }
++        } catch (...) {
++            ok = false;
++        }
++    }
++    char tail[128];
++    std::snprintf(tail, sizeof tail, "range=%d-%d;mode=%d;single=%d;", o.cvec_first, o.cvec_last,
++                  o.cvec_mode, o.cvec_single);
++    out += tail;
++    char hb[17];
++    std::snprintf(hb, sizeof hb, "%016llx", (unsigned long long)h);
++    return out + "content=" + hb;
++}
++
++std::string root_model_fingerprint(const Options& o, bool& ok) {
++    std::vector<std::pair<std::string, std::string>> files;
++    files.emplace_back("pack", o.pack);
++    if (!o.ple_gguf.empty()) files.emplace_back("ple", o.ple_gguf);
++    if (!o.native_preset.empty()) files.emplace_back("native-preset", o.native_preset);
++    int di = 0;
++    for (const std::string& s : o.native_dense_gguf)
++        files.emplace_back("native-dense-" + std::to_string(di++), s);
++    if (!o.native_head_gguf.empty()) files.emplace_back("native-head", o.native_head_gguf);
++    const RootFp fp = root_files_fingerprint(files);
++    ok = fp.ok;
++    return fp.hex;
++}
++
++std::string root_mtp_identity(const Options& o, bool& ok) {
++    ok = true;
++    if (o.mtp.empty()) return "";
++    const RootFp fp = root_files_fingerprint({{"mtp", o.mtp}});
++    ok = fp.ok;
++    return root_norm_path(o.mtp) + "|content=" + fp.hex;
++}
++
++std::string root_numeric_flags(const Options& o, bool& ok) {
++    // Every flag that changes the saved state's numerics. Fail-closed extras (vision, no_pool,
++    // spec_split, read strategy) only ever cause more misses, never a wrong restore: any
++    // difference ignores the file. Capacities (max_context), residency sizes (expert_cache) and
++    // drafting policy (suffix_draft, spec_adapt, spec_min_p) do not: the restore re-validates
++    // capacities and windows instead.
++    std::string s = "kvres=" + std::to_string((long long)o.kv_resident) + ";";
++    const bool* bits[14] = {&o.stream_token,
++                            &o.gr_fp32_activations,
++                            &o.gr_native_mmvf,
++                            &o.native_bf16,
++                            &o.native_bf16_extra,
++                            &o.native_ple_key,
++                            &o.native_moe_combine,
++                            &o.native_gdn,
++                            &o.native_flash_attn_short,
++                            &o.native_qsa_indexer,
++                            &o.native_qsa,
++                            &o.native_rope,
++                            &o.native_ple_postops,
++                            &o.native_router};
++    s += "bits=";
++    for (const bool* b : bits) s += *b ? '1' : '0';
++    s += std::string(";cpuq8=") + (o.cpu_oracle_q8_0 ? '1' : '0');
++    s += std::string(";nople=") + (o.no_ple ? '1' : '0');
++    // Ablations / execution-shape flags that alter the payload or its reductions (E3 review).
++    // keep_canonical loads canonical copies of natively served tensors (different bytes).
++    // no_prefill_borrow is deliberately excluded: buffer lending only changes scratch sourcing,
++    // never the captured reductions.
++    s += std::string(";vision=") + (o.vision ? '1' : '0');
++    s += std::string(";nopool=") + (o.no_pool ? '1' : '0');
++    s += std::string(";specsplit=") + (o.spec_split ? '1' : '0');
++    s += std::string(";keepcanon=") + (o.keep_canonical ? '1' : '0');
++    s += ";shortread=" + std::to_string((long long)o.short_read) + ";prefillchunk=" +
++         std::to_string((long long)o.prefill_chunk) + ";";
++    bool cok = true;
++    s += ";cvec=" + root_cvec_identity(o, cok);
++    ok = cok;
++    s += ";mtpwin=" + std::to_string((long long)o.mtp_window) + ";spec=" + std::to_string(o.spec) + ";";
++    return s;
++}
++
++strata::program::saved_state::RootDiskHeader root_live_header(const Options& o, bool& ok) {
++    strata::program::saved_state::RootDiskHeader h;
++    h.engine_version = STRATA_VERSION;
++    h.pack_path = root_norm_path(o.pack);
++    h.kv_type = o.kv;
++    bool mok = true, fok = true, nok = true;
++    h.mtp_dir = root_mtp_identity(o, mok);
++    h.model_fingerprint = root_model_fingerprint(o, fok);
++    h.numeric_flags = root_numeric_flags(o, nok);
++    ok = mok && fok && nok;   // any unreadable identity input fails closed (caller disables disk)
++    return h;
++}
+ 
+ using ConvStateSizes = strata::core::ConversationStateSizes;
+ 
+@@ -1532,8 +1788,22 @@ int main(int argc, char** argv) {
+         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
+-        else if (a == "--tip-cache-gib") o.tip_cache_gib = std::atof(next("--tip-cache-gib"));
++        else if (a == "--tip-cache-gib") {
++            std::string perr;
++            if (!saved::parse_gib_flag(next("--tip-cache-gib"), o.tip_cache_gib, perr)) {
++                std::fprintf(stderr, "strata generate: --tip-cache-gib: %s\n", perr.c_str());
++                return 2;
++            }
++        }
+         else if (a == "--root-dir") o.root_dir = next("--root-dir");
++        else if (a == "--root-cap-gib") {
++            std::string perr;
++            if (!saved::parse_gib_flag(next("--root-cap-gib"), o.root_cap_gib, perr)) {
++                std::fprintf(stderr, "strata generate: --root-cap-gib: %s\n", perr.c_str());
++                return 2;
++            }
++        }
++        else if (a == "--no-root-disk") o.root_disk = false;
+         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
+         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
+@@ -1787,6 +2057,10 @@ int main(int argc, char** argv) {
+         std::fprintf(stderr, "strata generate: --tip-cache-gib must be >= 0\n");
+         return 2;
+     }
++    if (!(o.root_cap_gib >= 0.0)) {
++        std::fprintf(stderr, "strata generate: --root-cap-gib must be >= 0\n");
++        return 2;
++    }
+     if (o.root_dir.empty()) {
+         std::fprintf(stderr, "strata generate: --root-dir must not be empty\n");
+         return 2;
+@@ -4144,6 +4418,44 @@ int main(int argc, char** argv) {
+         saved_states.set_tip_budget_gib(o.tip_cache_gib);
+         saved_states.set_stage_count((int) stages.size() + 1);
+         saved::ResumeStats saved_stats;   // E4: per-request resume stats; reset every GEN/GENI at the loop top
++        // E3: the on-disk root cache (DESIGN-HERMES-CACHE.md section 2). The startup scan indexes headers
++        // + ids metadata only (bulk blobs are seek-skipped, never read); payloads lazy-load on the first
++        // exact full-ids match. Disabled by --no-root-disk (true-cold) or when the scan fails (nonfatal:
++        // the engine then serves from chain/tips only). The destructor drains the writer and joins it.
++        saved::RootDiskStore root_disk_store;
++        if (o.root_disk) {
++            // Optional disk index/header init errors disable disk nonfatally (never a fatal serve
++            // error): the engine then serves from chain/tips only. Fail closed on unreadable
++            // identity inputs (a model shard that cannot be fingerprinted must not authorize reuse
++            // under a common 'err' fingerprint).
++            try {
++                saved::RootDiskStore::Config rcfg;
++                rcfg.dir = o.root_dir;
++                rcfg.cap_bytes = (uint64_t)(o.root_cap_gib * 1073741824.0);   // bounded by the flag parser
++                bool ident_ok = false;
++                rcfg.live = root_live_header(o, ident_ok);
++                if (!ident_ok) {
++                    std::fprintf(stderr, "strata serve: root-disk disabled "
++                                         "(model/identity fingerprint unreadable)\n");
++                } else {
++                    rcfg.live_geom = saved_live_geom(g);
++                    rcfg.stages = (int)stages.size() + 1;
++                    std::string rwhy;
++                    if (root_disk_store.start(std::move(rcfg), rwhy))
++                        std::fprintf(stderr,
++                                     "strata serve: root-disk: %zu roots indexed from %s (cap %.1f GiB)\n",
++                                     root_disk_store.indexed(), o.root_dir.c_str(), o.root_cap_gib);
++                    else
++                        std::fprintf(stderr, "strata serve: root-disk disabled (%s)\n", rwhy.c_str());
++                }
++            } catch (const std::exception& ex) {
++                std::fprintf(stderr, "strata serve: root-disk disabled (init threw: %s)\n", ex.what());
++            } catch (...) {
++                std::fprintf(stderr, "strata serve: root-disk disabled (init threw)\n");
++            }
++        } else {
++            std::fprintf(stderr, "strata serve: root-disk disabled by --no-root-disk\n");
++        }
+         // E1 final review: the MTP repair row R_(root_at-1) for roots. R rows are borrowed prompt-path scratch
+         // (batched chunks, verify windows), overwritten by the next chunk/window - so on_chunk/read_windows stash
+         // the boundary row inside the callback while it is valid. e1_root_at is published per request (from
+@@ -4990,6 +5302,10 @@ int main(int argc, char** argv) {
+             // over overwritten KV). Ties and shorter candidates stay on the live chain (no upload).
+             bool from_saved = false;
+             const saved::SavedItem* saved_hit = nullptr;
++            // E3: a disk-loaded mount lives here for the request (a local: no store mutation can move it).
++            saved::SavedItem disk_mount;
++            const saved::SavedItem* disk_hit = nullptr;
++            std::string disk_hit_path;
+             std::vector<int32_t> ids32;
+             ids32.reserve((size_t) n);
+             for (int64_t t : ids) ids32.push_back((int32_t) t);
+@@ -5000,41 +5316,90 @@ int main(int argc, char** argv) {
+             const auto e4_restore_t0 = Clock::now();
+             try {
+                 // accumulating skip set (blocker 5 review): each rejected candidate joins, so the walk is
+-                // longest-first without revisit and always terminates (cand==nullptr ends it).
++                // longest-first without revisit and always terminates (both sides exhausted ends it).
+                 std::vector<const saved::SavedItem*> cand_skip;
++                // E3: the disk side's own skip set (paths): a failed lazy load or validation tries the next
++                // shorter on-disk root, never the same file twice.
++                std::vector<std::string> disk_skip;
++                const bool use_disk = root_disk_store.enabled();
+                 for (;;) {
+                     const saved::SavedItem* cand =
+                         saved_states.find_best_except(ids32, req_simgs, cvec_cached, cand_skip);
+-                    if (cand == nullptr) break;
+-                    const int64_t sk = (int64_t) cand->ids.size();
+-                    if (sk <= resume) break;   // chain wins ties and beats shorter saved: nothing more to try
+-                    if (sk >= n) {
+-                        std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens skipped "
+-                                             "(at/past the request end)\n",
+-                                     (long long) sk);
+-                        cand_skip.push_back(cand);
+-                        continue;
+-                    }
+-                    std::string why;
+-                    if (!saved_validate_for_restore(*cand, ids32, req_simgs, cvec_cached, n, g, ss, stages,
+-                                                    mtp, why)) {
+-                        std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens ineligible "
+-                                             "(%s): trying shorter\n",
+-                                     (long long) sk, why.c_str());
+-                        cand_skip.push_back(cand);
+-                        continue;
++                    const int64_t sk_ram = cand == nullptr ? -1 : (int64_t)cand->ids.size();
++                    // E3: the longest on-disk root strictly above the chain resume and below n (chain wins
++                    // ties; k == n never mounts). Metadata-only: no payload is read until the entry is the
++                    // longest candidate.
++                    saved::RootDiskStore::Entry dent;
++                    const bool have_dent =
++                        use_disk && root_disk_store.find_match(ids32, req_simgs, cvec_cached,
++                                                               disk_skip, resume, n, dent);
++                    const int64_t sk_disk = have_dent ? (int64_t)dent.meta.ids.size() : -1;
++                    if (sk_ram <= resume && sk_disk <= resume) break;
++                    // The longer side mounts (disk wins strict-longer only: an equal-length RAM item needs
++                    // no disk read). Either side's rejection tries the next shorter on its own side.
++                    const saved::SavedItem* mount_src = nullptr;
++                    int64_t sk = -1;
++                    bool mount_disk = false;
++                    std::string dent_path;
++                    if (sk_disk > sk_ram) {
++                        std::string why;
++                        if (!root_disk_store.load_item(dent, disk_mount, why)) {
++                            std::fprintf(stderr, "strata serve: root-disk at %lld tokens unreadable "
++                                                 "(%s): trying shorter\n",
++                                          (long long)sk_disk, why.c_str());
++                            // Invalidate the index entry: without this the corrupt file pins its key
++                            // (enqueue dedups against the index) and a recaptured root could never
++                            // replace it. The file itself stays for trim; the rewrite replaces it.
++                            root_disk_store.drop_path(dent.path);
++                            disk_skip.push_back(dent.path);
++                            continue;
++                        }
++                        if (!saved_validate_for_restore(disk_mount, ids32, req_simgs, cvec_cached, n, g,
++                                                        ss, stages, mtp, why)) {
++                            std::fprintf(stderr, "strata serve: root-disk at %lld tokens ineligible "
++                                                 "(%s): trying shorter\n",
++                                          (long long)sk_disk, why.c_str());
++                            root_disk_store.drop_path(dent.path);
++                            disk_skip.push_back(dent.path);
++                            continue;
++                        }
++                        mount_src = &disk_mount;
++                        sk = sk_disk;
++                        mount_disk = true;
++                        dent_path = dent.path;
++                    } else {
++                        if (sk_ram >= n) {
++                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens skipped "
++                                                 "(at/past the request end)\n",
++                                         (long long)sk_ram);
++                            cand_skip.push_back(cand);
++                            continue;
++                        }
++                        std::string why;
++                        if (!saved_validate_for_restore(*cand, ids32, req_simgs, cvec_cached, n, g, ss,
++                                                        stages, mtp, why)) {
++                            std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens ineligible "
++                                                 "(%s): trying shorter\n",
++                                         (long long)sk_ram, why.c_str());
++                            cand_skip.push_back(cand);
++                            continue;
++                        }
++                        mount_src = cand;
++                        sk = sk_ram;
+                     }
+                     bool ok = cudaDeviceSynchronize() == cudaSuccess;
++                    std::string why;
+                     if (!ok) why = "device not idle";
+-                    if (ok && !saved_restore_stage(ss, g, cand->stages[0], cand->ids, sk, main_cs, why))
++                    if (ok && !saved_restore_stage(ss, g, mount_src->stages[0], mount_src->ids, sk, main_cs,
++                                                   why))
+                         ok = false;
+                     for (size_t i = 0; ok && i < stages.size(); ++i) {
+                         const strata::core::OnDevice on(stages[i]->dev);
+-                        if (!saved_restore_stage(stages[i]->ss, g, cand->stages[i + 1], cand->ids, sk,
+-                                                 (void*) stages[i]->stream, why))
++                        if (!saved_restore_stage(stages[i]->ss, g, mount_src->stages[i + 1],
++                                                 mount_src->ids, sk, (void*)stages[i]->stream, why))
+                             ok = false;
+                     }
+-                    if (ok && !saved_restore_mtp(mtp, g, cand->mtp, why)) ok = false;
++                    if (ok && !saved_restore_mtp(mtp, g, mount_src->mtp, why)) ok = false;
+                     if (ok) {   // order the streamed-slot resets before any later resolve reads them
+                         if (cudaDeviceSynchronize() != cudaSuccess) { why = "restore sync failed"; ok = false; }
+                         for (size_t i = 0; ok && i < stages.size(); ++i) {
+@@ -5048,7 +5413,7 @@ int main(int argc, char** argv) {
+                     if (!ok) {
+                         std::fprintf(stderr, "strata serve: SavedState restore at %lld tokens failed (%s): "
+                                              "cold prefill\n",
+-                                     (long long) sk, why.c_str());
++                                     (long long)sk, why.c_str());
+                         if (!cold_reset_all()) {
+                             std::printf("ERR SavedState cold reset failed after a failed mount\n");
+                             return 1;
+@@ -5057,7 +5422,12 @@ int main(int argc, char** argv) {
+                     } else {
+                         resume = sk;
+                         from_saved = true;
+-                        saved_hit = cand;
++                        if (mount_disk) {
++                            disk_hit = &disk_mount;
++                            disk_hit_path = dent_path;
++                        } else {
++                            saved_hit = cand;
++                        }
+                         live_bdry_L = -1;   // the session now holds the snapshot's line, not the old live one
+                     }
+                     break;
+@@ -5071,6 +5441,7 @@ int main(int argc, char** argv) {
+                 resume = 0;
+                 from_saved = false;
+                 saved_hit = nullptr;
++                disk_hit = nullptr;
+             } catch (...) {
+                 std::fprintf(stderr, "strata serve: SavedState selection threw: cold prefill\n");
+                 if (!cold_reset_all()) {
+@@ -5080,6 +5451,7 @@ int main(int argc, char** argv) {
+                 resume = 0;
+                 from_saved = false;
+                 saved_hit = nullptr;
++                disk_hit = nullptr;
+             }
+             saved_stats.restore_ms +=
+                 std::chrono::duration<double, std::milli>(Clock::now() - e4_restore_t0).count();
+@@ -5152,7 +5524,8 @@ int main(int argc, char** argv) {
+             // The suffix still starts at k. k==n never reaches here (rejected in selection: the decoder would
+             // double-feed the last prompt token), so tok_k always exists.
+             if (from_saved && reread_to <= 0 && resume < n) {
+-                const saved::BoundaryRow& b = saved_hit->boundary;
++                // E3: the repair row rides with the mount source (RAM store or the disk-loaded item).
++                const saved::BoundaryRow& b = disk_hit != nullptr ? disk_hit->boundary : saved_hit->boundary;
+                 const int32_t btok = (int32_t) ids[(size_t) resume];
+                 const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
+                 std::string be;
+@@ -5186,6 +5559,7 @@ int main(int argc, char** argv) {
+                     resume = 0;
+                     from_saved = false;
+                     saved_hit = nullptr;
++                    disk_hit = nullptr;
+                 }
+             }
+             // E2b (Sol final review): ALWAYS repair chain/live cell k-1 - no proven-older shortcut. The
+@@ -5246,8 +5620,35 @@ int main(int argc, char** argv) {
+                     }
+             }
+             if (from_saved && saved_hit != nullptr) saved_states.note_use(saved_hit);   // mounts count as use
+-            // E4: the source E2 chose (chain wins ties: saved_hit stays null then). k/suffix are final: the
+-            // boundary repairs above can still cold-reset resume to 0. RootDisk arrives with E3 (no loader yet).
++            // E3: a successful disk mount joins the RAM roots (later requests find it with no disk read)
++            // and refreshes the file's mtime for the LRU trim. insert_root re-validates the payload;
++            // mark_used is best-effort. Both run only on success (from_saved still true after repair).
++            // The promotion copy runs inside its own guard: a failure after a successful GPU restore
++            // must never abort the process - the restore and its stats stand either way.
++            if (from_saved && disk_hit != nullptr) {
++                try {
++                    saved::SavedItem for_ram = *disk_hit;
++                    const int64_t disk_len = (int64_t)disk_hit->ids.size();
++                    if (saved_states.insert_root(std::move(for_ram))) {
++                        const saved::SavedItem* now_ram =
++                            saved_states.find_exact(ids32, req_simgs, cvec_cached, disk_len);
++                        if (now_ram != nullptr) saved_states.note_use(now_ram);
++                    }
++                } catch (const std::exception& ex) {
++                    std::fprintf(stderr, "strata serve: root-disk promotion to RAM threw (%s): "
++                                         "disk restore stands\n", ex.what());
++                } catch (...) {
++                    std::fprintf(stderr, "strata serve: root-disk promotion to RAM threw: "
++                                         "disk restore stands\n");
++                }
++                try {
++                    root_disk_store.mark_used(disk_hit_path);
++                } catch (...) {
++                    // best-effort mtime refresh: never fatal.
++                }
++            }
++            // E4: the source E2 chose (chain wins ties: both hits stay null then). k/suffix are final: the
++            // boundary repairs above can still cold-reset resume to 0.
+             saved_stats.restore_ms +=
+                 std::chrono::duration<double, std::milli>(Clock::now() - e4_repair_t0).count();
+             if (reread_to > 0) {
+@@ -5257,9 +5658,11 @@ int main(int argc, char** argv) {
+                 saved_stats.k = 0;
+                 saved_stats.suffix = n;
+             } else {
+-                if (from_saved && saved_hit != nullptr) {
++                if (from_saved && disk_hit != nullptr) {
++                    saved_stats.source = saved::ResumeSource::RootDisk;
++                } else if (from_saved && saved_hit != nullptr) {
+                     saved_stats.source = saved_hit->kind == saved::Kind::Root ? saved::ResumeSource::Root
+-                                                                               : saved::ResumeSource::Tip;
++                                                                                : saved::ResumeSource::Tip;
+                 } else if (resume > 0) {
+                     saved_stats.source = saved::ResumeSource::Chain;
+                 } else {
+@@ -5541,10 +5944,30 @@ int main(int argc, char** argv) {
+                                                  "(boundary residual unavailable; chain still stands)\n",
+                                          (long long) root_at);
+                         } else if (!saved_snapshot(root_at, rids, req_imgs, cvec_cached, e1_root_row.data(),
+-                                                   g.hc, g.n_embd, root) ||
+-                                   !saved_states.insert_root(std::move(root)))
++                                                   g.hc, g.n_embd, root)) {
+                             std::fprintf(stderr, "strata serve: SavedState root snapshot at %lld tokens failed "
+                                                  "(the chain checkpoint above still stands)\n", (long long) root_at);
++                        } else {
++                            // E3: queue the immutable capture for the background disk writer first (one copy;
++                            // deduplicated by file key, bounded, no-op when root-disk is disabled - never fatal,
++                            // never blocking the reply), then move the original into the RAM store. The disk
++                            // call is wrapped separately: a disk queue/copy failure must never suppress the
++                            // successful RAM insert_root below (enqueue itself is nonfatal, but the caller's
++                            // copy under pressure could still throw - and then the root still pins in RAM).
++                            try {
++                                root_disk_store.enqueue(root);
++                            } catch (const std::exception& ex) {
++                                std::fprintf(stderr, "strata serve: root-disk enqueue threw (%s): "
++                                                     "RAM root still pins\n", ex.what());
++                            } catch (...) {
++                                std::fprintf(stderr, "strata serve: root-disk enqueue threw: "
++                                                     "RAM root still pins\n");
++                            }
++                            if (!saved_states.insert_root(std::move(root)))
++                                std::fprintf(stderr, "strata serve: SavedState root snapshot at %lld tokens "
++                                                     "failed (the chain checkpoint above still stands)\n",
++                                             (long long) root_at);
++                        }
+                     } catch (const std::exception& ex) {
+                         std::fprintf(stderr, "strata serve: SavedState root snapshot threw (%s): skipped\n",
+                                      ex.what());
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index c4973d7..2fa8d37 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -1,9 +1,30 @@
+ // src/program/saved_state.cpp - E1: the SavedState store policy (CPU-only, no CUDA).
+ //
+ // Implemented: Muse / review: Sol. See saved_state.hpp for the design contract.
++// E3 (same attribution): the RootDiskStore codec + disk cache (CPU-only: <filesystem>/<fstream>,
++// one background writer thread; no CUDA, no device code).
+ #include "strata/program/saved_state.hpp"
+ 
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ namespace strata::program::saved_state {
++namespace fs = std::filesystem;
+ 
+ SavedStateStore::SavedStateStore() = default;
+ 
+@@ -143,4 +164,1433 @@ void SavedStateStore::evict_tips() {
+     }
+ }
+ 
++// ---- E3: root disk persistence ------------------------------------------------
++
++uint64_t root_fnv1a(const void* data, size_t n, uint64_t h) {
++    const uint8_t* p = (const uint8_t*)data;
++    for (size_t i = 0; i < n; ++i) {
++        h ^= p[i];
++        h *= 1099511628211ull;
++    }
++    return h;
++}
++
++std::string root_hex16(uint64_t h) {
++    char b[17];
++    std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
++    return std::string(b);
++}
++
++bool parse_gib_flag(const char* text, double& gib, std::string& err) {
++    gib = 0.0;
++    if (text == nullptr || *text == '\0') {
++        err = "empty value";
++        return false;
++    }
++    errno = 0;
++    char* end = nullptr;
++    const double v = std::strtod(text, &end);
++    if (end == text || *end != '\0') {
++        err = "not a number";
++        return false;
++    }
++    if (errno == ERANGE) {
++        err = "out of range";
++        return false;
++    }
++    if (!(v >= 0.0) || !std::isfinite(v)) {
++        err = "must be a finite value >= 0";
++        return false;
++    }
++    // Exact-boundary reject: (double)UINT64_MAX rounds UP to 2^64, so the quotient rounds to 2^34
++    // GiB and a value == 2^34 GiB would convert to 2^64 bytes (undefined). >= rejects the boundary
++    // itself, not just above it.
++    if (v >= (double) UINT64_MAX / 1073741824.0) {
++        err = "too large";
++        return false;
++    }
++    gib = v;
++    return true;
++}
++
++namespace {
++// Little-endian append-only writer (encode side: sizes already validated by the caller).
++struct RootWriter {
++    std::vector<uint8_t> b;
++    void u8(uint8_t v) { b.push_back(v); }
++    void u32(uint32_t v) {
++        for (int i = 0; i < 4; ++i) b.push_back((uint8_t)(v >> (i * 8)));
++    }
++    void i32(int32_t v) { u32((uint32_t)v); }
++    void u64(uint64_t v) {
++        for (int i = 0; i < 8; ++i) b.push_back((uint8_t)(v >> (i * 8)));
++    }
++    void i64(int64_t v) { u64((uint64_t)v); }
++    void str(const std::string& s) {
++        u32((uint32_t)s.size());
++        b.insert(b.end(), s.begin(), s.end());
++    }
++    void blob(const std::vector<uint8_t>& v) {
++        u64((uint64_t)v.size());
++        b.insert(b.end(), v.begin(), v.end());
++    }
++    void floats(const std::vector<float>& v) {
++        u64((uint64_t)v.size());
++        const uint8_t* p = (const uint8_t*)v.data();
++        b.insert(b.end(), p, p + v.size() * 4);
++    }
++    void i32vec(const std::vector<int32_t>& v) {
++        u64((uint64_t)v.size());
++        const uint8_t* p = (const uint8_t*)v.data();
++        b.insert(b.end(), p, p + v.size() * 4);
++    }
++};
++
++// Bounded reader: every length is checked against the remaining bytes (and the kMaxRoot* caps)
++// BEFORE any allocation or advance, so corrupt/truncated/oversize input fails without growing.
++struct RootReader {
++    const uint8_t* p = nullptr;
++    size_t n = 0;
++    size_t pos = 0;
++    bool ok = true;
++    bool avail(uint64_t len) const { return len <= n && pos <= n - (size_t)len; }
++    uint8_t u8() {
++        if (!avail(1)) {
++            ok = false;
++            return 0;
++        }
++        return p[pos++];
++    }
++    uint32_t u32() {
++        if (!avail(4)) {
++            ok = false;
++            return 0;
++        }
++        uint32_t v = 0;
++        std::memcpy(&v, p + pos, 4);
++        pos += 4;
++        return v;
++    }
++    uint64_t u64() {
++        if (!avail(8)) {
++            ok = false;
++            return 0;
++        }
++        uint64_t v = 0;
++        std::memcpy(&v, p + pos, 8);
++        pos += 8;
++        return v;
++    }
++    int32_t i32() { return (int32_t)u32(); }
++    int64_t i64() { return (int64_t)u64(); }
++    bool str(std::string& s, std::string& why) {
++        const uint32_t L = u32();
++        if (!ok) {
++            why = "truncated string";
++            return false;
++        }
++        if (L > kMaxRootString || !avail(L)) {
++            ok = false;
++            why = "oversize string";
++            return false;
++        }
++        s.assign((const char*)p + pos, L);
++        pos += L;
++        return true;
++    }
++    bool blob(std::vector<uint8_t>& v, bool want, std::string& why,
++              uint64_t cap = kMaxRootFileBytes) {
++        const uint64_t L = u64();
++        if (!ok) {
++            why = "truncated blob length";
++            return false;
++        }
++        // The cap binds the allocation BEFORE it happens (callers pass kMaxRootRecBytes for the
++        // recurrent blobs, whose exact size is not geometry-derived).
++        if (L > cap || !avail(L)) {
++            ok = false;
++            why = "oversize blob";
++            return false;
++        }
++        if (want) v.assign(p + pos, p + pos + (size_t)L);
++        pos += (size_t)L;
++        return true;
++    }
++    // Geometry-derived exact blob: the length must equal the size the (already validated) geometry
++    // dictates, so the allocation below is exact and bounded before it happens. Used for every blob
++    // whose size SnapshotGeom determines (KV codes/scales, indexer pools/keys); the recurrent state
++    // keeps the absolute kMaxRootRecBytes cap (its exact size needs the full model geometry, which
++    // E2's saved_validate_for_restore checks against the live session instead).
++    bool blob_exact(std::vector<uint8_t>& v, bool want, uint64_t expected, std::string& why) {
++        const uint64_t L = u64();
++        if (!ok) {
++            why = "truncated blob length";
++            return false;
++        }
++        if (L != expected || !avail(L)) {
++            ok = false;
++            why = "blob size mismatch";
++            return false;
++        }
++        if (want) v.assign(p + pos, p + pos + (size_t)L);
++        pos += (size_t)L;
++        return true;
++    }
++    bool floats(std::vector<float>& v, bool want, std::string& why) {
++        const uint64_t L = u64();
++        if (!ok) {
++            why = "truncated float length";
++            return false;
++        }
++        if (L > (kMaxRootFileBytes / 4) || !avail(L * 4)) {
++            ok = false;
++            why = "oversize float array";
++            return false;
++        }
++        if (want) {
++            v.resize((size_t)L);
++            std::memcpy(v.data(), p + pos, (size_t)L * 4);
++        }
++        pos += (size_t)L * 4;
++        return true;
++    }
++    bool i32vec(std::vector<int32_t>& v, bool want, uint64_t cap, std::string& why) {
++        const uint64_t L = u64();
++        if (!ok) {
++            why = "truncated int length";
++            return false;
++        }
++        if (L > cap || !avail(L * 4)) {
++            ok = false;
++            why = "oversize int array";
++            return false;
++        }
++        if (want) {
++            v.resize((size_t)L);
++            std::memcpy(v.data(), p + pos, (size_t)L * 4);
++        }
++        pos += (size_t)L * 4;
++        return true;
++    }
++};
++
++bool root_write_kv(RootWriter& w, const KvLayerPayload& k) {
++    w.i32(k.fmt);
++    w.i64(k.cells);
++    w.blob(k.k);
++    w.blob(k.v);
++    w.blob(k.ks);
++    w.blob(k.vs);
++    return true;
++}
++
++bool root_read_kv(RootReader& r, KvLayerPayload& k, bool want, int64_t L, const SnapshotGeom& gm,
++                 bool is_mtp, std::string& why) {
++    k.fmt = r.i32();
++    k.cells = r.i64();
++    if (!r.ok) {
++        why = "truncated KV header";
++        return false;
++    }
++    if (k.fmt != kKvF16 && k.fmt != kKvInt8 && k.fmt != kKvQ4) {
++        why = "unknown KV format";
++        return false;
++    }
++    // Exact cell counts (the encoder only writes these): main layers hold [0, L), the single MTP layer
++    // holds the L-1 real pairs (L == 1 carries no MTP layer at all, enforced at the count below).
++    const int64_t want_cells = is_mtp ? L - 1 : L;
++    if (k.cells != want_cells) {
++        why = "KV cell count mismatch";
++        return false;
++    }
++    // Exact byte sizes from the already-validated geometry (gm caps keep this arithmetic in u64 range):
++    // a corrupt length fails here, before any allocation, and the allocation below is then exact.
++    const uint64_t code = kv_pool_bytes(k.fmt, k.cells, gm.n_head_kv, gm.head_dim, gm.page_size, false);
++    const uint64_t sc =
++        k.fmt == kKvInt8 ? kv_pool_bytes(k.fmt, k.cells, gm.n_head_kv, gm.head_dim, gm.page_size, true) : 0;
++    return r.blob_exact(k.k, want, code, why) && r.blob_exact(k.v, want, code, why) &&
++           r.blob_exact(k.ks, want, sc, why) && r.blob_exact(k.vs, want, sc, why);
++}
++}  // namespace
++
++std::string root_file_key(const RootDiskHeader& hdr, const SavedItem& item) {
++    // Length-prefix every variable field: two different (field, value) splits must never hash equal.
++    uint64_t h = 1469598103934665603ull;
++    auto mix_str = [&](const std::string& s) {
++        const uint64_t L = (uint64_t)s.size();
++        h = root_fnv1a(&L, 8, h);
++        h = root_fnv1a(s.data(), s.size(), h);
++    };
++    auto mix_i64 = [&](int64_t v) {
++        const uint64_t u = (uint64_t)v;
++        h = root_fnv1a(&u, 8, h);
++    };
++    mix_str(hdr.engine_version);
++    mix_str(hdr.pack_path);
++    mix_str(hdr.kv_type);
++    mix_str(hdr.mtp_dir);
++    mix_str(hdr.model_fingerprint);
++    mix_str(hdr.numeric_flags);
++    const uint64_t nl = (uint64_t)item.ids.size();
++    h = root_fnv1a(&nl, 8, h);
++    h = root_fnv1a(item.ids.data(), item.ids.size() * 4, h);
++    const uint64_t ni = (uint64_t)item.imgs.size();
++    h = root_fnv1a(&ni, 8, h);
++    for (const ImgKey& k : item.imgs) {
++        mix_i64(k.start);
++        h = root_fnv1a(&k.hash, 8, h);
++    }
++    const uint8_t c = item.cvec ? 1 : 0;
++    h = root_fnv1a(&c, 1, h);
++    mix_i64(item.geom.n_qsa_layers);
++    mix_i64(item.geom.n_head_kv);
++    mix_i64(item.geom.head_dim);
++    mix_i64(item.geom.idx_dim);
++    mix_i64(item.geom.idx_block);
++    mix_i64(item.geom.page_size);
++    mix_i64(item.n_stages);
++    return root_hex16(h);
++}
++
++namespace {
++bool is_hex16(const char* s) {
++    for (int i = 0; i < 16; ++i) {
++        const char c = s[i];
++        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
++    }
++    return true;
++}
++}  // namespace
++
++bool root_file_name_ok(const std::string& name) {
++    // exactly "root-" (5) + 16 lowercase hex + ".hstr" (5) = 26 chars: ASCII only, no directories.
++    if (name.size() != 26) return false;
++    if (name.compare(0, 5, "root-") != 0) return false;
++    if (name.compare(21, 5, ".hstr") != 0) return false;
++    return is_hex16(name.data() + 5);
++}
++
++bool root_temp_name_ok(const std::string& name) {
++    // exactly the writer's "root-" + 16 hex + ".tmp." + nonempty suffix.
++    if (name.size() <= 26) return false;
++    if (name.compare(0, 5, "root-") != 0) return false;
++    if (!is_hex16(name.data() + 5)) return false;
++    if (name.compare(21, 5, ".tmp.") != 0) return false;
++    for (size_t i = 26; i < name.size(); ++i) {
++        const char c = name[i];
++        if (c == '/' || c == '\\') return false;
++    }
++    return true;
++}
++
++bool root_encode(const RootDiskHeader& hdr, const SavedItem& item, std::vector<uint8_t>& out,
++                 std::string& why) {
++    if (!item.complete()) {
++        why = "incomplete payload";
++        return false;
++    }
++    if (hdr.magic != RootDiskHeader::kMagic || hdr.version != RootDiskHeader::kVersion) {
++        why = "unsupported header version";
++        return false;
++    }
++    const std::string* strs[6] = {&hdr.engine_version, &hdr.pack_path,     &hdr.kv_type,
++                                  &hdr.mtp_dir,        &hdr.model_fingerprint, &hdr.numeric_flags};
++    for (const std::string* s : strs)
++        if (s->size() > kMaxRootString) {
++            why = "header string too long";
++            return false;
++        }
++    if (item.ids.size() > kMaxRootIds || item.imgs.size() > kMaxRootImages) {
++        why = "ids/images too long";
++        return false;
++    }
++    // Size bound BEFORE building the output: the writer below would otherwise allocate the full
++    // buffer first and check after. payload_bytes() sums already-allocated vector sizes, so this
++    // early-out costs nothing and never allocates.
++    if (item.payload_bytes() + 8 > kMaxRootFileBytes) {
++        why = "item exceeds the per-file bound";
++        return false;
++    }
++    RootWriter w;
++    w.u32(hdr.magic);
++    w.u32(hdr.version);
++    for (const std::string* s : strs) w.str(*s);
++    w.u64((uint64_t)item.ids.size());
++    w.u64(root_fnv1a(item.ids.data(), item.ids.size() * 4));
++    for (int32_t id : item.ids) w.i32(id);
++    w.u64((uint64_t)item.imgs.size());
++    for (const ImgKey& k : item.imgs) {
++        w.i64(k.start);
++        w.u64(k.hash);
++    }
++    w.u8(item.cvec ? 1 : 0);
++    w.i64(item.n_stages);
++    w.i64(item.geom.n_qsa_layers);
++    w.i64(item.geom.n_head_kv);
++    w.i64(item.geom.head_dim);
++    w.i64(item.geom.idx_dim);
++    w.i64(item.geom.idx_block);
++    w.i64(item.geom.page_size);
++    for (const StagePayload& s : item.stages) {
++        w.blob(s.rec.gdn);
++        w.blob(s.rec.ple);
++        w.blob(s.rec.tails);
++        w.i32(s.rec.ple_prev[0]);
++        w.i32(s.rec.ple_prev[1]);
++        for (const IndexerPayload& x : s.idx) {
++            w.i64(x.pooled_rows);
++            w.blob(x.pooled);
++            w.i32vec(x.block_pos);
++            w.blob(x.dead_key);
++        }
++        for (const KvLayerPayload& k : s.kv) root_write_kv(w, k);
++    }
++    w.i64(item.mtp.cells);
++    w.i64(item.mtp.valid_from);
++    w.u64((uint64_t)item.mtp.kv.size());
++    for (const KvLayerPayload& k : item.mtp.kv) root_write_kv(w, k);
++    w.i64(item.boundary.hc);
++    w.i64(item.boundary.n_embd);
++    w.floats(item.boundary.row);
++    // Versioned integrity: FNV-1a over every preceding payload byte. The ids hash binds the ids;
++    // this binds the whole bulk (recurrent/KV/indexer/MTP/boundary), so same-length corruption in
++    // any bulk byte fails the decode before any restore. Verified before any bulk allocation.
++    w.u64(root_fnv1a(w.b.data(), w.b.size()));
++    if (w.b.size() > kMaxRootFileBytes) {
++        why = "item exceeds the per-file bound";
++        return false;
++    }
++    out = std::move(w.b);
++    return true;
++}
++
++bool root_decode(const uint8_t* data, size_t size, RootDiskHeader& hdr, SavedItem& item, bool meta_only,
++                 std::string& why) {
++    hdr = RootDiskHeader{};
++    item = SavedItem{};
++    if (data == nullptr || size < 16 || size > kMaxRootFileBytes) {
++        why = "file size out of range";
++        return false;
++    }
++    // Payload integrity FIRST, before any allocation: the trailing u64 checksums every preceding
++    // byte (v2). A same-length corruption in any bulk byte - invisible to the ids hash - fails here.
++    // v1 files (no checksum) fail closed: their last 8 payload bytes hash-mismatch, never trusted.
++    uint64_t want_hash = 0;
++    std::memcpy(&want_hash, data + size - 8, 8);
++    if (root_fnv1a(data, size - 8) != want_hash) {
++        why = "payload hash mismatch";
++        return false;
++    }
++    const size_t payload = size - 8;
++    RootReader r{data, payload, 0, true};
++    hdr.magic = r.u32();
++    hdr.version = r.u32();
++    if (!r.ok || hdr.magic != RootDiskHeader::kMagic) {
++        why = "bad magic";
++        return false;
++    }
++    if (hdr.version != RootDiskHeader::kVersion) {
++        why = "version mismatch";
++        return false;
++    }
++    std::string* strs[6] = {&hdr.engine_version, &hdr.pack_path,     &hdr.kv_type,
++                            &hdr.mtp_dir,        &hdr.model_fingerprint, &hdr.numeric_flags};
++    for (std::string* s : strs)
++        if (!r.str(*s, why)) return false;
++    const uint64_t ids_len = r.u64();
++    const uint64_t ids_hash = r.u64();
++    if (!r.ok) {
++        why = "truncated ids header";
++        return false;
++    }
++    if (ids_len == 0 || ids_len > kMaxRootIds || !r.avail(ids_len * 4)) {
++        why = "ids length out of range";
++        return false;
++    }
++    item.ids.resize((size_t)ids_len);
++    std::memcpy(item.ids.data(), data + r.pos, (size_t)ids_len * 4);
++    r.pos += (size_t)ids_len * 4;
++    if (root_fnv1a(item.ids.data(), item.ids.size() * 4) != ids_hash) {
++        item.ids.clear();
++        why = "ids hash mismatch";
++        return false;
++    }
++    hdr.ids_len = (int64_t)ids_len;
++    hdr.ids_hash = ids_hash;
++    const uint64_t n_imgs = r.u64();
++    if (!r.ok || n_imgs > kMaxRootImages || !r.avail(n_imgs * 16)) {
++        why = "image list out of range";
++        return false;
++    }
++    item.imgs.reserve((size_t)n_imgs);
++    for (uint64_t i = 0; i < n_imgs; ++i) {
++        ImgKey k{r.i64(), r.u64()};
++        item.imgs.push_back(k);
++    }
++    if (!r.ok) {
++        why = "truncated image list";
++        return false;
++    }
++    const uint8_t c = r.u8();
++    if (!r.ok || c > 1) {
++        why = "bad cvec flag";
++        return false;
++    }
++    item.cvec = c != 0;
++    // Check BEFORE the narrowing cast: a stored i64 like 2^32+1 would cast to int 1 and pass a
++    // post-cast range check (low-bit accepted overflow). The loop below is bounded by this check.
++    const int64_t n_stages = r.i64();
++    if (!r.ok || n_stages < 1 || n_stages > (int64_t)kMaxRootStages) {
++        why = "stage count out of range";
++        return false;
++    }
++    item.n_stages = (int)n_stages;
++    item.geom.n_qsa_layers = r.i64();
++    item.geom.n_head_kv = r.i64();
++    item.geom.head_dim = r.i64();
++    item.geom.idx_dim = r.i64();
++    item.geom.idx_block = r.i64();
++    item.geom.page_size = r.i64();
++    if (!r.ok) {
++        why = "truncated geometry";
++        return false;
++    }
++    // Geometry FIRST, before any loop or allocation: every scalar must be positive and within the
++    // kMaxRoot* caps. The caps keep all downstream size arithmetic in u64 range (worst case
++    // kv_pool_bytes stays below 2^64: 4M cells x 4096 heads x 64K page x 8K row), and the exact-size
++    // checks below then make every allocation geometry-derived. complete() re-checks consistency.
++    const SnapshotGeom& gm = item.geom;
++    if (item.n_stages < 1 || item.n_stages > (int)kMaxRootStages || gm.n_qsa_layers < 1 ||
++        gm.n_qsa_layers > kMaxRootLayers || gm.n_head_kv < 1 || gm.n_head_kv > kMaxRootHeads ||
++        gm.head_dim < 1 || gm.head_dim > kMaxRootDim || gm.idx_dim < 1 || gm.idx_dim > kMaxRootBlock ||
++        gm.idx_block < 1 || gm.idx_block > kMaxRootBlock || gm.page_size < 1 ||
++        gm.page_size > kMaxRootBlock) {
++        why = "geometry out of range";
++        return false;
++    }
++    const int64_t L = (int64_t)ids_len;
++    const bool want = !meta_only;
++    item.stages.reserve((size_t)item.n_stages);
++    for (int s = 0; s < item.n_stages; ++s) {
++        StagePayload sp;
++        // Recurrent cap enforced INSIDE blob() before allocation (exact size needs the full model
++        // geometry, so these carry the absolute kMaxRootRecBytes cap rather than a derived size).
++        if (!r.blob(sp.rec.gdn, want, why, kMaxRootRecBytes)) return false;
++        if (!r.blob(sp.rec.ple, want, why, kMaxRootRecBytes)) return false;
++        if (!r.blob(sp.rec.tails, want, why, kMaxRootRecBytes)) return false;
++        sp.rec.ple_prev[0] = r.i32();
++        sp.rec.ple_prev[1] = r.i32();
++        if (!r.ok) {
++            why = "truncated recurrent tail";
++            return false;
++        }
++        sp.idx.reserve((size_t)item.geom.n_qsa_layers);
++        for (int64_t i = 0; i < item.geom.n_qsa_layers; ++i) {
++            IndexerPayload x;
++            x.pooled_rows = r.i64();
++            if (!r.ok) {
++                why = "truncated indexer header";
++                return false;
++            }
++            // Exact indexer shape for L tokens (the capturer writes exactly this): rows, pool bytes,
++            // one cursor, one dead-key row. Checked u64 arithmetic (capped geometry above).
++            if (x.pooled_rows != L / gm.idx_block + 1) {
++                why = "indexer row count mismatch";
++                return false;
++            }
++            const uint64_t pooled_exp = (uint64_t)x.pooled_rows * (uint64_t)gm.idx_dim * 4;
++            const uint64_t dead_exp = (uint64_t)gm.idx_dim * 4;
++            if (!r.blob_exact(x.pooled, want, pooled_exp, why)) return false;
++            if (!r.i32vec(x.block_pos, want, 1, why)) return false;
++            if (!r.blob_exact(x.dead_key, want, dead_exp, why)) return false;
++            sp.idx.push_back(std::move(x));
++        }
++        sp.kv.reserve((size_t)item.geom.n_qsa_layers);
++        for (int64_t i = 0; i < item.geom.n_qsa_layers; ++i) {
++            KvLayerPayload k;
++            if (!root_read_kv(r, k, want, L, gm, false, why)) return false;
++            if (want) sp.kv.push_back(std::move(k));
++        }
++        if (want) item.stages.push_back(std::move(sp));
++    }
++    item.mtp.cells = r.i64();
++    item.mtp.valid_from = r.i64();
++    if (!r.ok || item.mtp.cells < 0 || item.mtp.cells > L || item.mtp.valid_from < 0 ||
++        item.mtp.valid_from > item.mtp.cells) {
++        why = "MTP counts out of range";
++        return false;
++    }
++    const uint64_t n_mtp = r.u64();
++    // Exactly the encoder's shapes: L == 1 carries no MTP layer; L > 1 carries exactly one.
++    if (!r.ok || n_mtp != (L == 1 ? 0u : 1u) || (L > 1 && item.mtp.cells != L - 1) ||
++        (L == 1 && item.mtp.cells != 0)) {
++        why = "MTP layer count mismatch";
++        return false;
++    }
++    for (uint64_t i = 0; i < n_mtp; ++i) {
++        KvLayerPayload k;
++        if (!root_read_kv(r, k, want, L, gm, true, why)) return false;
++        if (want) item.mtp.kv.push_back(std::move(k));
++    }
++    item.boundary.hc = r.i64();
++    item.boundary.n_embd = r.i64();
++    if (!r.ok || item.boundary.hc < 1 || item.boundary.n_embd < 1 ||
++        item.boundary.hc > (1 << 20) || item.boundary.n_embd > (1 << 20)) {
++        why = "boundary layout out of range";
++        return false;
++    }
++    // Exact repair-row size (checked: both factors <= 2^20, product fits u64; then avail-checked,
++    // so the allocation below is exact and bounded before it happens).
++    const uint64_t n_row = r.u64();
++    if (!r.ok || n_row != (uint64_t)item.boundary.hc * (uint64_t)item.boundary.n_embd ||
++        !r.avail(n_row * 4)) {
++        why = "boundary row size mismatch";
++        return false;
++    }
++    if (want) {
++        item.boundary.row.resize((size_t)n_row);
++        std::memcpy(item.boundary.row.data(), data + r.pos, (size_t)n_row * 4);
++    }
++    r.pos += (size_t)(n_row * 4);
++    if (!meta_only && !item.complete()) {
++        why = "incomplete payload";
++        return false;
++    }
++    if (r.pos != r.n) {
++        why = "trailing bytes";
++        return false;
++    }
++    return true;
++}
++
++namespace {
++// Streaming metadata reader for the startup index: scalar reads go through `read()`, every bulk blob
++// is skipped with `skip_blob()` (length validated against the file size, then seekg past it) without
++// reading or allocating it. `pos` is tracked arithmetically (never trusted from the stream), so all
++// bounds are checked before any read, seek or allocation.
++struct RootStreamReader {
++    std::istream& in;
++    uint64_t fsize = 0;
++    uint64_t pos = 0;
++    bool ok = true;
++    bool read(void* dst, uint64_t len, std::string& why) {
++        if (len > fsize || pos > fsize - len) {
++            ok = false;
++            why = "length past end";
++            return false;
++        }
++        in.read((char*)dst, (std::streamsize)len);
++        if (!in || (uint64_t)in.gcount() != len) {
++            ok = false;
++            why = "short read";
++            return false;
++        }
++        pos += len;
++        return true;
++    }
++    uint8_t u8(std::string& why) {
++        uint8_t v = 0;
++        if (!read(&v, 1, why)) ok = false;
++        return v;
++    }
++    uint32_t u32(std::string& why) {
++        uint32_t v = 0;
++        if (!read(&v, 4, why)) ok = false;
++        return v;
++    }
++    uint64_t u64(std::string& why) {
++        uint64_t v = 0;
++        if (!read(&v, 8, why)) ok = false;
++        return v;
++    }
++    int32_t i32(std::string& why) { return (int32_t)u32(why); }
++    int64_t i64(std::string& why) { return (int64_t)u64(why); }
++    bool str(std::string& s, std::string& why) {
++        const uint32_t L = u32(why);   // u32: the writer (RootWriter::str) and the full decoder both
++                                       // use u32 string lengths; u64 here misaligned every valid file.
++        if (!ok) {
++            why = "truncated string";
++            return false;
++        }
++        if (L > kMaxRootString) {
++            ok = false;
++            why = "oversize string";
++            return false;
++        }
++        // Remaining-bytes check BEFORE the assign: no allocation before the length is proven to fit
++        // the rest of the file.
++        if (pos > fsize || (uint64_t)L > fsize - pos) {
++            ok = false;
++            why = "string past end";
++            return false;
++        }
++        s.assign((size_t)L, '\0');
++        return read(s.data(), L, why);
++    }
++    // Validate a bulk length and seek past it: the bytes are never read.
++    bool skip_blob(std::string& why) {
++        const uint64_t L = u64(why);
++        if (!ok) {
++            why = "truncated blob length";
++            return false;
++        }
++        return skip(L, why);
++    }
++    bool skip(uint64_t len, std::string& why) {
++        if (len > fsize || pos > fsize - len) {
++            ok = false;
++            why = "skip past end";
++            return false;
++        }
++        if (len == 0) return true;
++        in.seekg((std::streamoff)len, std::ios::cur);
++        if (!in) {
++            ok = false;
++            why = "seek failed";
++            return false;
++        }
++        pos += len;
++        return true;
++    }
++    // Skip one KV payload's shape (fmt + cells scalars, four bulk blobs) with light validation; exact
++    // geometry-derived sizes are the full decoder's job (it runs on the bounded lazy load instead).
++    bool skip_kv(std::string& why) {
++        const int32_t fmt = i32(why);
++        const int64_t cells = i64(why);
++        if (!ok) {
++            why = "truncated KV header";
++            return false;
++        }
++        if (fmt != kKvF16 && fmt != kKvInt8 && fmt != kKvQ4) {
++            why = "unknown KV format";
++            return false;
++        }
++        if (cells < 0 || (uint64_t)cells > kMaxRootIds) {
++            why = "KV cell count out of range";
++            return false;
++        }
++        return skip_blob(why) && skip_blob(why) && skip_blob(why) && skip_blob(why);
++    }
++};
++}  // namespace
++
++bool root_scan_meta(const std::string& path, uint64_t fsize, RootDiskHeader& hdr, SavedItem& meta,
++                    std::string& why) {
++    hdr = RootDiskHeader{};
++    meta = SavedItem{};
++    if (fsize < 8 || fsize > kMaxRootFileBytes) {
++        why = "file size out of range";
++        return false;
++    }
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        why = "cannot open file";
++        return false;
++    }
++    RootStreamReader r{in, fsize, 0, true};
++    hdr.magic = r.u32(why);
++    hdr.version = r.u32(why);
++    if (!r.ok || hdr.magic != RootDiskHeader::kMagic) {
++        why = "bad magic";
++        return false;
++    }
++    if (hdr.version != RootDiskHeader::kVersion) {
++        why = "version mismatch";
++        return false;
++    }
++    std::string* strs[6] = {&hdr.engine_version, &hdr.pack_path,     &hdr.kv_type,
++                            &hdr.mtp_dir,        &hdr.model_fingerprint, &hdr.numeric_flags};
++    for (std::string* s : strs)
++        if (!r.str(*s, why)) return false;
++    const uint64_t ids_len = r.u64(why);
++    const uint64_t ids_hash = r.u64(why);
++    if (!r.ok) {
++        why = "truncated ids header";
++        return false;
++    }
++    if (ids_len == 0 || ids_len > kMaxRootIds) {
++        why = "ids length out of range";
++        return false;
++    }
++    // Remaining-bytes check BEFORE the resize: no ids allocation before the byte count is proven
++    // to fit the rest of the file (ids_len <= 4M so ids_len*4 cannot overflow u64).
++    if (r.pos > r.fsize || ids_len * 4 > r.fsize - r.pos) {
++        why = "ids past end";
++        return false;
++    }
++    meta.ids.resize((size_t)ids_len);
++    if (!r.read(meta.ids.data(), ids_len * 4, why)) {
++        meta.ids.clear();
++        return false;
++    }
++    if (root_fnv1a(meta.ids.data(), meta.ids.size() * 4) != ids_hash) {
++        meta.ids.clear();
++        why = "ids hash mismatch";
++        return false;
++    }
++    hdr.ids_len = (int64_t)ids_len;
++    hdr.ids_hash = ids_hash;
++    const uint64_t n_imgs = r.u64(why);
++    if (!r.ok || n_imgs > kMaxRootImages) {
++        why = "image list out of range";
++        return false;
++    }
++    meta.imgs.reserve((size_t)n_imgs);
++    for (uint64_t i = 0; i < n_imgs; ++i) {
++        const int64_t start = r.i64(why);
++        const uint64_t hash = r.u64(why);
++        if (!r.ok) {
++            why = "truncated image list";
++            return false;
++        }
++        meta.imgs.push_back(ImgKey{start, hash});
++    }
++    const uint8_t c = r.u8(why);
++    if (!r.ok || c > 1) {
++        why = "bad cvec flag";
++        return false;
++    }
++    meta.cvec = c != 0;
++    // Check BEFORE the narrowing cast (same low-bit overflow as the full decoder: 2^32+1 must not
++    // become int 1). The stage skip loop below is bounded by this check.
++    const int64_t scan_stages = r.i64(why);
++    if (!r.ok || scan_stages < 1 || scan_stages > (int64_t)kMaxRootStages) {
++        why = "stage count out of range";
++        return false;
++    }
++    meta.n_stages = (int)scan_stages;
++    meta.geom.n_qsa_layers = r.i64(why);
++    meta.geom.n_head_kv = r.i64(why);
++    meta.geom.head_dim = r.i64(why);
++    meta.geom.idx_dim = r.i64(why);
++    meta.geom.idx_block = r.i64(why);
++    meta.geom.page_size = r.i64(why);
++    if (!r.ok) {
++        why = "truncated geometry";
++        return false;
++    }
++    // Bounds before the skip loops (same caps as the full decoder): loop iterations stay bounded and
++    // every skip is range-checked against the file size, so no bulk byte is ever read here.
++    const SnapshotGeom& gm = meta.geom;
++    if (meta.n_stages < 1 || meta.n_stages > (int)kMaxRootStages || gm.n_qsa_layers < 1 ||
++        gm.n_qsa_layers > kMaxRootLayers || gm.n_head_kv < 1 || gm.n_head_kv > kMaxRootHeads ||
++        gm.head_dim < 1 || gm.head_dim > kMaxRootDim || gm.idx_dim < 1 || gm.idx_dim > kMaxRootBlock ||
++        gm.idx_block < 1 || gm.idx_block > kMaxRootBlock || gm.page_size < 1 ||
++        gm.page_size > kMaxRootBlock) {
++        why = "geometry out of range";
++        return false;
++    }
++    for (int s = 0; s < meta.n_stages; ++s) {
++        if (!r.skip_blob(why) || !r.skip_blob(why) || !r.skip_blob(why)) return false;   // rec
++        r.i32(why);
++        r.i32(why);   // ple_prev
++        if (!r.ok) {
++            why = "truncated recurrent tail";
++            return false;
++        }
++        for (int64_t i = 0; i < gm.n_qsa_layers; ++i) {
++            r.i64(why);   // pooled_rows
++            if (!r.ok) {
++                why = "truncated indexer header";
++                return false;
++            }
++            if (!r.skip_blob(why)) return false;   // pooled
++            const uint64_t n_bp = r.u64(why);      // block_pos
++            if (!r.ok || n_bp > 1024) {
++                why = "block_pos out of range";
++                return false;
++            }
++            if (!r.skip(n_bp * 4, why)) return false;
++            if (!r.skip_blob(why)) return false;   // dead_key
++        }
++        for (int64_t i = 0; i < gm.n_qsa_layers; ++i)
++            if (!r.skip_kv(why)) return false;
++    }
++    meta.mtp.cells = r.i64(why);
++    meta.mtp.valid_from = r.i64(why);
++    if (!r.ok) {
++        why = "truncated MTP header";
++        return false;
++    }
++    const uint64_t n_mtp = r.u64(why);
++    if (!r.ok || n_mtp > 1) {
++        why = "MTP layer count out of range";
++        return false;
++    }
++    for (uint64_t i = 0; i < n_mtp; ++i)
++        if (!r.skip_kv(why)) return false;
++    meta.boundary.hc = r.i64(why);
++    meta.boundary.n_embd = r.i64(why);
++    if (!r.ok) {
++        why = "truncated boundary header";
++        return false;
++    }
++    const uint64_t n_row = r.u64(why);
++    if (!r.ok) {
++        why = "truncated boundary length";
++        return false;
++    }
++    if (n_row > kMaxRootFileBytes / 4) {
++        why = "boundary row too large";
++        return false;
++    }
++    if (!r.skip(n_row * 4, why)) return false;   // the repair row: never read at scan time
++    // Trailing v2 payload checksum: presence-checked only (8 bytes, no trailing garbage). Bulk is
++    // never read at scan time, so integrity verification stays deferred to the bounded lazy load -
++    // but the exact size bind means a truncated/corrupt checksum fails here, and load_item's full
++    // decode verifies it before any restore.
++    r.u64(why);   // payload checksum (verified on lazy load, not at scan)
++    if (!r.ok) {
++        why = "truncated payload checksum";
++        return false;
++    }
++    if (r.pos != r.fsize) {
++        why = "trailing bytes";
++        return false;
++    }
++    return true;
++}
++
++void root_strip_bulk(SavedItem& item) {
++    for (StagePayload& s : item.stages) {
++        s.rec.gdn.clear();
++        s.rec.gdn.shrink_to_fit();
++        s.rec.ple.clear();
++        s.rec.ple.shrink_to_fit();
++        s.rec.tails.clear();
++        s.rec.tails.shrink_to_fit();
++        for (IndexerPayload& x : s.idx) {
++            x.pooled.clear();
++            x.pooled.shrink_to_fit();
++            x.dead_key.clear();
++            x.dead_key.shrink_to_fit();
++        }
++        for (KvLayerPayload& k : s.kv) {
++            k.k.clear();
++            k.k.shrink_to_fit();
++            k.v.clear();
++            k.v.shrink_to_fit();
++            k.ks.clear();
++            k.ks.shrink_to_fit();
++            k.vs.clear();
++            k.vs.shrink_to_fit();
++        }
++    }
++    for (KvLayerPayload& k : item.mtp.kv) {
++        k.k.clear();
++        k.k.shrink_to_fit();
++        k.v.clear();
++        k.v.shrink_to_fit();
++        k.ks.clear();
++        k.ks.shrink_to_fit();
++        k.vs.clear();
++        k.vs.shrink_to_fit();
++    }
++    item.boundary.row.clear();
++    item.boundary.row.shrink_to_fit();
++    item.bytes = 0;
++}
++
++RootDiskStore::RootDiskStore() = default;
++
++RootDiskStore::~RootDiskStore() { shutdown(); }
++
++namespace {
++std::string root_join(const std::string& dir, const std::string& name) {
++    return (fs::path(dir) / fs::path(name)).string();
++}
++/// Owned-regular check: exactly a regular file, never a symlink/reparse point. symlink_status (not
++/// status) so a symlink to a recognized name - pointing outside the configured root - is never
++/// scanned, read, touched or deleted. Fail closed: any error means "not owned".
++bool root_owned_regular(const fs::path& p) {
++    std::error_code ec;
++    const fs::file_status st = fs::symlink_status(p, ec);
++    return !ec && st.type() == fs::file_type::regular;
++}
++/// Genuine atomic file replacement: the old final is never removed first (it survives any failure
++/// below). Windows: MoveFileExW with REPLACE_EXISTING|WRITE_THROUGH (std::filesystem::rename does
++/// not overwrite there). POSIX: rename(2), atomic on the same filesystem. Same directory means
++/// same filesystem, so the replace is atomic. Only the caller's own temp is ever cleaned up.
++bool root_atomic_replace(const std::string& tmp_p, const std::string& final_p) {
++#ifdef _WIN32
++    const std::wstring wtmp = fs::path(tmp_p).wstring();
++    const std::wstring wfinal = fs::path(final_p).wstring();
++    return ::MoveFileExW(wtmp.c_str(), wfinal.c_str(),
++                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
++#else
++    std::error_code ec;
++    fs::rename(tmp_p, final_p, ec);
++    return !ec;
++#endif
++}
++bool root_read_all(const std::string& path, uint64_t size, std::vector<uint8_t>& buf) {
++    buf.assign((size_t)size, 0);
++    std::ifstream f(path, std::ios::binary);
++    if (!f) return false;
++    f.read((char*)buf.data(), (std::streamsize)buf.size());
++    return (bool)f && (size_t)f.gcount() == buf.size();
++}
++}  // namespace
++
++bool RootDiskStore::start(const Config& cfg, std::string& why) {
++    std::unique_lock<std::mutex> lk(mu_);
++    if (started_) {
++        why = "already started";
++        return false;
++    }
++    if (cfg.dir.empty()) {
++        why = "empty dir";
++        return false;
++    }
++    if (cfg.stages < 1) {
++        why = "bad stage count";
++        return false;
++    }
++    std::error_code ec;
++    fs::create_directories(cfg.dir, ec);
++    if (ec) {
++        why = "cannot create dir: " + ec.message();
++        return false;
++    }
++    cfg_ = cfg;
++    // The startup index is genuinely lazy: root_scan_meta streams each file's header + ids metadata and
++    // SEEK-SKIPS every bulk blob without reading or allocating it, so a multi-GB payload costs kilobytes
++    // of I/O here. Payloads load only on a request's exact full-ids match (load_item). Incompatible,
++    // corrupt, truncated, oversize, foreign-name and renamed (stem != content key) files are ignored.
++    std::map<std::string, Entry> fresh;
++    fs::directory_iterator end;
++    for (fs::directory_iterator it(cfg.dir, ec); !ec && it != end; it.increment(ec)) {
++        const std::string name = it->path().filename().string();
++        if (!root_file_name_ok(name)) continue;
++        if (!root_owned_regular(it->path())) continue;   // never follow symlinks/reparse points out
++        std::error_code e2;
++        const uint64_t fsize = it->file_size(e2);
++        if (e2 || fsize == 0 || fsize > kMaxRootFileBytes) continue;
++        RootDiskHeader hdr;
++        SavedItem meta;
++        std::string derr;
++        if (!root_scan_meta(it->path().string(), fsize, hdr, meta, derr)) continue;
++        if (!hdr.compatible_with(cfg_.live)) continue;
++        if (meta.ids.empty() || !(meta.geom == cfg_.live_geom) || meta.n_stages != cfg_.stages) continue;
++        if (name.substr(5, 16) != root_file_key(hdr, meta)) continue;
++        const std::string key = name.substr(5, 16);
++        auto dup = fresh.find(key);
++        if (dup == fresh.end()) {
++            fresh.emplace(key, Entry{hdr, std::move(meta), it->path().string(), fsize});
++            continue;
++        }
++        // Same key twice (a leftover rename/copy): keep the newer mtime, ignore the other.
++        std::error_code e3;
++        const fs::file_time_type t_old = fs::last_write_time(dup->second.path, e3);
++        const bool old_ok = !e3;
++        const fs::file_time_type t_new = fs::last_write_time(it->path(), e3);
++        if (e3 || (old_ok && t_new > t_old))
++            dup->second = Entry{hdr, std::move(meta), it->path().string(), fsize};
++    }
++    if (ec) {
++        why = "dir scan failed: " + ec.message();
++        return false;
++    }
++    index_ = std::move(fresh);
++    stop_ = false;
++    started_ = true;
++    try {
++        worker_ = std::thread(&RootDiskStore::worker_main, this);
++    } catch (const std::exception& ex) {
++        started_ = false;
++        index_.clear();
++        why = std::string("worker start failed: ") + ex.what();
++        return false;
++    }
++    // Startup cap enforce: the scan above only indexes, so without this a restart over cap would
++    // keep every stale root until the next write/shutdown. Runs OUTSIDE mu_ (trim_now locks it
++    // itself); nonfatal either way. The worker also trims after every write.
++    lk.unlock();
++    try {
++        std::string terr;
++        if (!trim_now(terr))
++            std::fprintf(stderr, "strata serve: root-disk: startup trim incomplete (%s)\n", terr.c_str());
++    } catch (const std::exception& ex) {
++        std::fprintf(stderr, "strata serve: root-disk: startup trim threw (%s)\n", ex.what());
++    } catch (...) {
++        std::fprintf(stderr, "strata serve: root-disk: startup trim threw\n");
++    }
++    return true;
++}
++
++void RootDiskStore::shutdown() {
++    {
++        std::unique_lock<std::mutex> lk(mu_);
++        if (!started_) return;
++        stop_ = true;   // the worker drains the queue first, then exits: shutdown always joins
++    }
++    cv_.notify_all();
++    if (worker_.joinable()) worker_.join();
++    // Destructor shutdown must remain nonfatal even if the final filesystem trim allocates or throws.
++    try {
++        std::string why;
++        if (!trim_now(why))
++            std::fprintf(stderr, "strata serve: root-disk: shutdown trim incomplete (%s)\n", why.c_str());
++    } catch (const std::exception& ex) {
++        std::fprintf(stderr, "strata serve: root-disk: shutdown trim threw (%s)\n", ex.what());
++    } catch (...) {
++        std::fprintf(stderr, "strata serve: root-disk: shutdown trim threw\n");
++    }
++    std::unique_lock<std::mutex> lk(mu_);
++    started_ = false;
++    stop_ = false;
++}
++
++bool RootDiskStore::enabled() const {
++    std::unique_lock<std::mutex> lk(mu_);
++    return started_;
++}
++
++size_t RootDiskStore::indexed() const {
++    std::unique_lock<std::mutex> lk(mu_);
++    return index_.size();
++}
++
++size_t RootDiskStore::pending() const {
++    std::unique_lock<std::mutex> lk(mu_);
++    return queue_.size();
++}
++
++bool RootDiskStore::find_match(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
++                               const std::vector<std::string>& skip, int64_t lo, int64_t hi,
++                               Entry& out) const {
++    std::unique_lock<std::mutex> lk(mu_);
++    if (!started_) return false;
++    bool found = false;
++    size_t best = 0;
++    for (const auto& [key, e] : index_) {
++        bool skipped = false;
++        for (const std::string& s : skip)
++            if (s == e.path) {
++                skipped = true;
++                break;
++            }
++        if (skipped) continue;
++        const int64_t L = (int64_t)e.meta.ids.size();
++        if (L <= lo || L >= hi) continue;   // chain wins ties (<= resume); k == n never mounts
++        if (!e.hdr.compatible_with(cfg_.live)) continue;
++        if (!(e.meta.geom == cfg_.live_geom) || e.meta.n_stages != cfg_.stages) continue;
++        if (e.meta.cvec != cvec) continue;
++        if (!is_prefix(e.meta.ids, ids)) continue;   // full exact ids: never hash-only
++        if (imgs_below(imgs, L) != e.meta.imgs) continue;
++        if (!found || e.meta.ids.size() > best) {
++            out = e;
++            best = e.meta.ids.size();
++            found = true;
++        }
++    }
++    return found;
++}
++
++bool RootDiskStore::load_item(const Entry& e, SavedItem& out, std::string& why) const {
++    RootDiskHeader live;
++    SnapshotGeom geom;
++    int stages = 1;
++    {
++        std::unique_lock<std::mutex> lk(mu_);
++        if (!started_) {
++            why = "store stopped";
++            return false;
++        }
++        live = cfg_.live;
++        geom = cfg_.live_geom;
++        stages = cfg_.stages;
++    }
++    std::error_code ec;
++    if (!root_owned_regular(e.path)) {   // fail closed: a swapped-in symlink is never read
++        why = "not an owned regular file";
++        return false;
++    }
++    const uint64_t fsize = fs::file_size(e.path, ec);
++    // The size bind: a replaced file (same name, different bytes) is refused, never half-trusted.
++    if (ec || fsize == 0 || fsize > kMaxRootFileBytes || fsize != e.file_bytes) {
++        why = "file changed since the index";
++        return false;
++    }
++    std::vector<uint8_t> buf;
++    if (!root_read_all(e.path, fsize, buf)) {
++        why = "cannot read file";
++        return false;
++    }
++    RootDiskHeader hdr;
++    SavedItem item;
++    if (!root_decode(buf.data(), buf.size(), hdr, item, false, why)) return false;
++    if (!hdr.compatible_with(live)) {
++        why = "header no longer compatible";
++        return false;
++    }
++    if (!(item.geom == geom) || item.n_stages != stages) {
++        why = "geometry changed";
++        return false;
++    }
++    if (item.ids != e.meta.ids || item.imgs != e.meta.imgs || item.cvec != e.meta.cvec) {
++        why = "payload does not match the index";
++        return false;
++    }
++    out = std::move(item);
++    return true;
++}
++
++void RootDiskStore::mark_used(const std::string& path) const {
++    {
++        std::unique_lock<std::mutex> lk(mu_);
++        if (!started_) return;
++    }
++    // The cap trim is LRU by mtime: a successful disk mount refreshes it. Best effort, nonfatal.
++    // Never touches a symlink/reparse point (a swapped-in link is not followed out of the root).
++    std::error_code ec;
++    if (!root_owned_regular(path)) return;
++    fs::last_write_time(path, fs::file_time_type::clock::now(), ec);
++}
++
++void RootDiskStore::enqueue(const SavedItem& item) {
++    // Cheap gates first (no bulk copied yet): completeness, started/stopped, then the file-key
++    // dedup. Only the final push copies the bulk - a disabled store or a duplicate returns before
++    // any multi-GB deep copy. Internal failures below are nonfatal drops (never throw past here).
++    try {
++        if (!item.complete()) return;   // never queue an inconsistent/incomplete payload
++        std::unique_lock<std::mutex> lk(mu_);
++        if (!started_ || stop_) return;
++        // Deduplicate by file key: a pinned root already on disk or already queued is skipped, so
++        // repeated snapshots of the same prefix never pile up unbounded in the writer queue. The
++        // queued_ marker is held through write completion (worker erases after write_one), so a
++        // duplicate arriving while the first root is still in flight is skipped too.
++        const std::string key = root_file_key(cfg_.live, item);
++        if (index_.count(key) != 0 || queued_.count(key) != 0) return;
++        const uint64_t bytes = item.payload_bytes();
++        if (queue_.size() >= kMaxRootQueue || queued_bytes_ + bytes > kMaxRootQueueBytes) {
++            std::fprintf(stderr, "strata serve: root-disk: writer queue full: capture dropped (nonfatal)\n");
++            return;
++        }
++        queue_.push(Queued{key, item});
++        queued_.insert(key);
++        queued_bytes_ += bytes;
++    } catch (const std::exception& ex) {
++        std::fprintf(stderr, "strata serve: root-disk: enqueue failed (%s): capture dropped (nonfatal)\n",
++                     ex.what());
++        return;
++    } catch (...) {
++        std::fprintf(stderr, "strata serve: root-disk: enqueue failed: capture dropped (nonfatal)\n");
++        return;
++    }
++    cv_.notify_one();
++}
++
++bool RootDiskStore::trim_now(std::string& why) {
++    std::string dir;
++    uint64_t cap = 0;
++    {
++        std::unique_lock<std::mutex> lk(mu_);
++        if (cfg_.dir.empty()) {
++            why = "no dir";
++            return false;
++        }
++        dir = cfg_.dir;
++        cap = cfg_.cap_bytes;
++    }
++    struct F {
++        std::string name, path;
++        uint64_t size = 0;
++        fs::file_time_type mtime{};
++    };
++    std::vector<F> files;
++    std::vector<F> tmps;
++    std::error_code ec;
++    fs::directory_iterator end;
++    for (fs::directory_iterator it(dir, ec); !ec && it != end; it.increment(ec)) {
++        const std::string name = it->path().filename().string();
++        const bool cache = root_file_name_ok(name);
++        const bool tmp = !cache && root_temp_name_ok(name);
++        if (!cache && !tmp) continue;   // never prune arbitrary user files
++        if (!root_owned_regular(it->path())) continue;   // never touch symlinks/reparse points
++        std::error_code e2;
++        F f;
++        f.name = name;
++        f.path = it->path().string();
++        f.size = it->file_size(e2);
++        if (e2) continue;
++        f.mtime = fs::last_write_time(it->path(), e2);
++        if (e2) continue;
++        (cache ? files : tmps).push_back(std::move(f));
++    }
++    if (ec) {
++        why = "dir scan failed: " + ec.message();
++        return false;
++    }
++    // Oldest-mtime-first past the cap: a successful disk mount refreshes mtime (mark_used), so live
++    // roots survive and stale ones leave. Only recognized cache files are ever deleted.
++    std::sort(files.begin(), files.end(),
++              [](const F& a, const F& b) { return a.mtime < b.mtime; });
++    uint64_t total = 0;
++    for (const F& f : files) total += f.size;
++    bool ok = true;
++    for (const F& f : files) {
++        if (total <= cap) break;
++        std::error_code e2;
++        fs::remove(f.path, e2);
++        if (e2) {
++            ok = false;   // keep going: delete what can be deleted
++            continue;
++        }
++        total -= f.size;
++        // Drop the index entry only when it points at the file just deleted (a duplicate key may
++        // legitimately point elsewhere after the scan's newer-mtime choice).
++        std::unique_lock<std::mutex> lk(mu_);
++        auto ein = index_.find(f.name.substr(5, 16));
++        if (ein != index_.end() && ein->second.path == f.path) index_.erase(ein);
++    }
++    // Stale recognized temps (a crashed writer's leftovers, older than an hour): same ownership rule.
++    const auto now = fs::file_time_type::clock::now();
++    for (const F& f : tmps) {
++        std::error_code e2;
++        const auto age = now - f.mtime;
++        if (age < std::chrono::hours(1)) continue;
++        fs::remove(f.path, e2);   // best effort: a leftover temp never fails the trim
++    }
++    if (!ok) why = "some deletions failed";
++    return ok;
++}
++
++void RootDiskStore::drop_path(const std::string& path) {
++    std::unique_lock<std::mutex> lk(mu_);
++    // Filesystem-path comparison (not raw strings): the index stores directory-iterator spellings
++    // while callers may pass root_join spellings, and `/` vs `\` differ textually on Windows.
++    for (auto it = index_.begin(); it != index_.end(); ++it) {
++        bool same = false;
++        try {
++            same = fs::path(it->second.path) == fs::path(path);
++        } catch (...) {
++            same = it->second.path == path;
++        }
++        if (same) {
++            index_.erase(it);
++            return;
++        }
++    }
++}
++
++void RootDiskStore::worker_main() {
++    // Serialized single writer: one root at a time, immutable captures, nonfatal errors. Shutdown
++    // sets stop_ and joins: the loop drains every queued capture first, then exits - no dropped
++    // writes. The destructor is effectively noexcept: per-task/per-trim exceptions (bad_alloc,
++    // filesystem, ...) are caught and logged, never propagated to terminate the process.
++    for (;;) {
++        Queued q;
++        uint64_t qbytes = 0;
++        {
++            std::unique_lock<std::mutex> lk(mu_);
++            cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
++            if (queue_.empty()) {
++                if (stop_) return;   // drained: shutdown always joins after every capture lands
++                continue;
++            }
++            q = std::move(queue_.front());
++            queue_.pop();
++            qbytes = q.item.payload_bytes();
++            // NOTE: queued_ keeps q.key until the write below completes, so a duplicate arriving
++            // while this root is in flight is skipped by enqueue instead of piling up.
++        }
++        try {
++            std::string why;
++            if (!write_one(q.key, q.item, why))
++                std::fprintf(stderr, "strata serve: root-disk: write %s skipped (%s)\n", q.key.c_str(),
++                             why.c_str());
++        } catch (const std::exception& ex) {
++            std::fprintf(stderr, "strata serve: root-disk: write %s threw (%s)\n", q.key.c_str(),
++                         ex.what());
++        } catch (...) {
++            std::fprintf(stderr, "strata serve: root-disk: write %s threw\n", q.key.c_str());
++        }
++        try {
++            std::string terr;
++            if (!trim_now(terr))
++                std::fprintf(stderr, "strata serve: root-disk: trim incomplete (%s)\n", terr.c_str());
++        } catch (const std::exception& ex) {
++            std::fprintf(stderr, "strata serve: root-disk: trim threw (%s)\n", ex.what());
++        } catch (...) {
++            std::fprintf(stderr, "strata serve: root-disk: trim threw\n");
++        }
++        // Release the dedup marker (and byte accounting) only now that the write finished.
++        std::unique_lock<std::mutex> lk(mu_);
++        queued_.erase(q.key);
++        queued_bytes_ -= std::min(queued_bytes_, qbytes);
++    }
++}
++
++bool RootDiskStore::write_one(const std::string& key, const SavedItem& item, std::string& why) {
++    RootDiskHeader live;
++    std::string dir;
++    {
++        // No stop_ early-out: shutdown drains the queue (every queued capture lands), so a write
++        // in flight during shutdown must complete, not report "stopping" and drop the root.
++        std::unique_lock<std::mutex> lk(mu_);
++        live = cfg_.live;
++        dir = cfg_.dir;
++    }
++    if (key != root_file_key(live, item)) {
++        why = "key mismatch";
++        return false;
++    }
++    std::vector<uint8_t> buf;
++    if (!root_encode(live, item, buf, why)) return false;   // worker-side serialize, off the serve path
++    // Atomic temp->replace in the same directory (same filesystem, so the replace is atomic). The
++    // old final is NEVER removed first and never adopted unverified: root_atomic_replace overwrites
++    // it in place (or fails leaving it intact). A same-key file always holds the same cacheable
++    // bytes - the key binds the header compat fields, full ids, images, cvec, geometry and stage
++    // count, and the full decode re-verifies header/key/payload before any restore, so a
++    // same-length key collision can never substitute mismatched ids/header. Only this call's own
++    // temp is ever cleaned up.
++    // Temps carry a process-unique suffix (single writer per directory is the documented
++    // ownership rule; unique temps keep two processes from clobbering each other's temp): a
++    // per-process atomic sequence plus nanosecond time plus the writer thread's hash.
++    static std::atomic<uint64_t> seq{0};
++    const std::string final_p = root_join(dir, "root-" + key + ".hstr");
++    uint64_t now_ns = 0;
++    try {
++        now_ns = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
++    } catch (...) {
++    }
++    const uint64_t th = (uint64_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
++    const std::string tmp_p =
++        root_join(dir, "root-" + key + ".tmp." + std::to_string(seq.fetch_add(1)) + "-" +
++                         root_hex16(now_ns ^ (th + 0x9e3779b97f4a7c15ull)));
++    {
++        std::ofstream o(tmp_p, std::ios::binary | std::ios::trunc);
++        if (!o) {
++            why = "cannot open temp";
++            return false;
++        }
++        o.write((const char*)buf.data(), (std::streamsize)buf.size());
++        o.close();
++        if (!o) {
++            std::error_code ec;
++            fs::remove(tmp_p, ec);
++            why = "temp write failed";
++            return false;
++        }
++    }
++    if (!root_atomic_replace(tmp_p, final_p)) {
++        // Replace failed (the old final, if any, is intact - never removed first). Only our own
++        // temp is removed. Nonfatal either way.
++        std::error_code e2;
++        fs::remove(tmp_p, e2);
++        why = "replace failed";
++        return false;
++    }
++    {
++        // Publish the stripped metadata (bulk stays in the caller's copy / on disk, never duplicated
++        // into the index): the next request's find_match sees this root without any read.
++        std::unique_lock<std::mutex> lk(mu_);
++        SavedItem meta = item;
++        root_strip_bulk(meta);
++        index_[key] = Entry{live, std::move(meta), final_p, (uint64_t)buf.size()};
++    }
++    return true;
++}
++
+ }  // namespace strata::program::saved_state
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index 2ca16af..172f852 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -12,18 +12,33 @@
+ // (section 7: parent and forked-child tips coexist, no prefix collapsing), duplicate replacement, stage
+ // mismatch, drop tips preserving roots, header mismatch, and incomplete/malformed KV/scales/MTP/boundary
+ // rejection. Fixture sizes below are hand-derived literals (see the geometry comments), not calls into the
+-// implementation's own size helpers, so the tests check the policy rather than re-stating it. E3's actual
+-// disk persistence tests are deferred to E3 (only the header gate is covered here).
++// implementation's own size helpers, so the tests check the policy rather than re-stating it.
++//
++// E3 (DESIGN-HERMES-CACHE.md section 2, same attribution): the disk-persistence suite below - codec
++// roundtrip/meta/corruption/trailing/bounds, filename gates, streaming scan, index ignore + exact-match
++// rules, background writer lifecycle, cap trim ownership, disabled no-ops.
++//
++// E3 (DESIGN-HERMES-CACHE.md section 2): root disk persistence - versioned bounded binary codec,
++// streaming metadata scan, RAM index with lazy payloads (never hash-only), background writer lifecycle,
++// mtime LRU cap, recognized-files-only trimming. All filesystem work happens in temp dirs under the
++// test's working directory (inside the workspace build tree): the real default root dir is never
++// touched here.
+ //
+ // Implemented: Muse / reviewed: Sol.
+ #include "strata/program/saved_state.hpp"
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <filesystem>
++#include <fstream>
+ #include <functional>
++#include <string>
++#include <thread>
+ #include <vector>
+ 
+ namespace saved = strata::program::saved_state;
++namespace fs = std::filesystem;
+ 
+ namespace {
+ int g_fail = 0;
+@@ -262,6 +277,86 @@ void rejects(saved::SavedItem good, const std::function<void(saved::SavedItem&)>
+     saved::SavedStateStore st;
+     check(!st.insert_tip(good, false) && st.tips() == 0, what_ins);
+ }
++
++// ---- E3 helpers ---------------------------------------------------------------
++
++saved::RootDiskHeader e3_header() {
++    saved::RootDiskHeader h;
++    h.engine_version = "0.1.21";
++    h.pack_path = "pack/full";
++    h.kv_type = "fp16";
++    h.mtp_dir = "";
++    h.model_fingerprint = "sizes+mtimes";
++    h.numeric_flags = "native+resident";
++    return h;
++}
++
++saved::RootDiskStore::Config e3_config(const std::string& dir, uint64_t cap) {
++    saved::RootDiskStore::Config c;
++    c.dir = dir;
++    c.cap_bytes = cap;
++    c.live = e3_header();
++    c.live_geom.n_qsa_layers = 1;
++    c.live_geom.n_head_kv = 1;
++    c.live_geom.head_dim = 8;
++    c.live_geom.idx_dim = 4;
++    c.live_geom.idx_block = 4;
++    c.live_geom.page_size = 4;
++    c.stages = 1;
++    return c;
++}
++
++void e3_put_le32(std::vector<uint8_t>& b, uint32_t v) {
++    for (int i = 0; i < 4; ++i) b.push_back((uint8_t)(v >> (i * 8)));
++}
++
++void e3_put_le64(std::vector<uint8_t>& b, uint64_t v) {
++    for (int i = 0; i < 8; ++i) b.push_back((uint8_t)(v >> (i * 8)));
++}
++
++void e3_write(const std::string& path, const std::vector<uint8_t>& buf) {
++    std::ofstream o(path, std::ios::binary | std::ios::trunc);
++    o.write((const char*)buf.data(), (std::streamsize)buf.size());
++    o.close();
++}
++
++void e3_write_text(const std::string& path, const std::string& text) {
++    std::ofstream o(path, std::ios::binary | std::ios::trunc);
++    o.write(text.data(), (std::streamsize)text.size());
++    o.close();
++}
++
++bool e3_wait_for(const std::function<bool()>& pred, int ms) {
++    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
++    for (;;) {
++        if (pred()) return true;
++        if (std::chrono::steady_clock::now() >= end) return false;
++        std::this_thread::sleep_for(std::chrono::milliseconds(25));
++    }
++}
++
++bool e3_age_hours(const std::string& path, int hours) {
++    const auto t = fs::file_time_type::clock::now() - std::chrono::hours(hours);
++    std::error_code ec;
++    fs::last_write_time(path, t, ec);
++    return !ec;
++}
++
++// A complete fp16 line with canary bytes (first byte of each bulk blob set): roundtrips must preserve
++// every payload byte, not just the sizes.
++saved::SavedItem e3_canary_line(int L, int base) {
++    saved::SavedItem it = make_line(L, base);
++    it.stages[0].rec.gdn[0] = 0xA1;
++    it.stages[0].rec.tails[0] = 0xA2;
++    it.stages[0].kv[0].k[0] = 0xA3;
++    it.stages[0].kv[0].v[0] = 0xA4;
++    if (!it.mtp.kv.empty()) {
++        it.mtp.kv[0].k[0] = 0xA5;
++        it.mtp.kv[0].v[0] = 0xA6;
++    }
++    it.boundary.row[0] = 1.25f;
++    return it;
++}
+ }  // namespace
+ 
+ int main() {
+@@ -646,6 +741,521 @@ int main() {
+         rejects(q4, [](saved::SavedItem& m) { m.stages[0].kv[0].ks.push_back(1); }, "q4 with scales incomplete",
+                 "q4 with scales refused");
+     }
++    {   // E3: codec roundtrip preserves every payload byte (canaries), the header, and the scalar
++        // MTP/boundary fields; the file key is stable across the roundtrip.
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(12, 0);
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "e3 roundtrip encodes");
++        saved::RootDiskHeader dh;
++        saved::SavedItem di;
++        check(saved::root_decode(buf.data(), buf.size(), dh, di, false, why), "e3 roundtrip decodes");
++        check(dh.compatible_with(h) && dh.ids_len == 12, "e3 header survives (compat + ids_len)");
++        check(di.complete(), "e3 decoded item is complete");
++        check(di.ids == it.ids && di.cvec == it.cvec && di.geom == it.geom && di.n_stages == 1,
++              "e3 ids/cvec/geometry/stages survive");
++        check(di.stages[0].rec.gdn == it.stages[0].rec.gdn &&
++                  di.stages[0].rec.tails == it.stages[0].rec.tails,
++              "e3 recurrent bytes survive");
++        check(di.stages[0].kv[0].k == it.stages[0].kv[0].k &&
++                  di.stages[0].kv[0].v == it.stages[0].kv[0].v,
++              "e3 KV bytes survive");
++        check(di.stages[0].idx[0].pooled == it.stages[0].idx[0].pooled &&
++                  di.stages[0].idx[0].dead_key == it.stages[0].idx[0].dead_key &&
++                  di.stages[0].idx[0].block_pos == it.stages[0].idx[0].block_pos,
++              "e3 indexer bytes survive");
++        check(di.mtp.cells == 11 && di.mtp.valid_from == 0 && di.mtp.kv.size() == 1 &&
++                  di.mtp.kv[0].k == it.mtp.kv[0].k,
++              "e3 MTP cells/valid_from/rows survive");
++        check(di.boundary.hc == 2 && di.boundary.n_embd == 4 && di.boundary.row == it.boundary.row,
++              "e3 boundary row survives");
++        check(saved::root_file_key(h, it) == saved::root_file_key(dh, di), "e3 file key stable");
++    }
++    {   // E3: meta decode validates without allocating bulk; the meta is never complete (so it can
++        // never become a restorable item) but still carries every index scalar.
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(12, 0);
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "e3 meta fixture encodes");
++        saved::RootDiskHeader mh;
++        saved::SavedItem meta;
++        check(saved::root_decode(buf.data(), buf.size(), mh, meta, true, why), "e3 meta decodes");
++        check(mh.compatible_with(h) && meta.ids == it.ids && meta.imgs == it.imgs &&
++                  meta.cvec == it.cvec && meta.geom == it.geom && meta.n_stages == 1,
++              "e3 meta carries header+ids+identity");
++        check(meta.stages.empty() && meta.mtp.kv.empty() && meta.boundary.row.empty(),
++              "e3 meta allocates no bulk");
++        check(meta.mtp.cells == 11 && meta.mtp.valid_from == 0 && meta.boundary.hc == 2 &&
++                  meta.boundary.n_embd == 4,
++              "e3 meta carries MTP/boundary scalars");
++        check(!meta.complete(), "e3 meta is never complete");
++        check(saved::root_file_key(h, it) == saved::root_file_key(mh, meta),
++              "e3 file key computable from meta");
++    }
++    {   // E3: encode refuses incomplete payloads (a partial item is never written).
++        const saved::RootDiskHeader h = e3_header();
++        saved::SavedItem bad = e3_canary_line(12, 0);
++        bad.stages[0].rec.gdn.clear();
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(!saved::root_encode(h, bad, buf, why), "e3 encode refuses incomplete payload");
++    }
++    {   // E3: corruption fails safely with no large allocation: bad magic/version, truncation (short
++        // file, dropped tail byte), an ids length over the 4M cap (claims no 16MB: the cap precedes
++        // the allocation), ids longer than the buffer, a flipped id byte (hash bind), trailing bytes.
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(12, 0);
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "e3 corruption fixture encodes");
++        saved::RootDiskHeader dh;
++        saved::SavedItem di;
++        std::vector<uint8_t> mut = buf;
++        mut[0] ^= 0xFF;
++        check(!saved::root_decode(mut.data(), mut.size(), dh, di, false, why), "e3 bad magic rejected");
++        mut = buf;
++        mut[4] = 7;   // version field (LE u32 at offset 4)
++        check(!saved::root_decode(mut.data(), mut.size(), dh, di, false, why),
++              "e3 bad version rejected");
++        check(!saved::root_decode(buf.data(), 32, dh, di, false, why), "e3 short file rejected");
++        check(!saved::root_decode(buf.data(), buf.size() - 1, dh, di, false, why),
++              "e3 dropped tail byte rejected");
++        mut = buf;
++        mut.push_back(0x00);
++        check(!saved::root_decode(mut.data(), mut.size(), dh, di, false, why),
++              "e3 trailing byte rejected");
++        // Flip an ids byte: ids start after magic(4)+ver(4)+6 strings(4+len each; the fixture's strings
++        // are engine 6, pack 9, kv 4, mtp 0, fp 12, flags 15) + ids_len(8) + ids_hash(8).
++        const size_t ids_off = 8 + (4 + 6) + (4 + 9) + (4 + 4) + (4 + 0) + (4 + 12) + (4 + 15) + 16;
++        mut = buf;
++        mut[ids_off] ^= 0x01;
++        check(!saved::root_decode(mut.data(), mut.size(), dh, di, false, why),
++              "e3 flipped id byte rejected (hash bind)");
++        // Same-length bulk corruption (ids hash cannot see it): flip a KV byte and a boundary-row
++        // byte. The trailing payload checksum rejects both, in full AND meta mode, with no restore.
++        mut = buf;
++        mut[buf.size() / 2] ^= 0x01;
++        check(!saved::root_decode(mut.data(), mut.size(), dh, di, false, why),
++              "e3 flipped bulk byte rejected (payload checksum)");
++        check(!saved::root_decode(mut.data(), mut.size(), dh, di, true, why),
++              "e3 flipped bulk byte rejected in meta mode too");
++        mut = buf;
++        mut[buf.size() - 9] ^= 0x01;   // last boundary-row byte (just before the checksum)
++        check(!saved::root_decode(mut.data(), mut.size(), dh, di, false, why),
++              "e3 flipped boundary byte rejected (payload checksum)");
++        std::vector<uint8_t> huge;
++        e3_put_le32(huge, 0x48535452);
++        e3_put_le32(huge, 1);
++        for (int i = 0; i < 6; ++i) e3_put_le32(huge, 0);
++        e3_put_le64(huge, (uint64_t)saved::kMaxRootIds + 1);
++        e3_put_le64(huge, 0);
++        check(!saved::root_decode(huge.data(), huge.size(), dh, di, false, why),
++              "e3 over-cap ids length rejected");
++        check(!saved::root_decode(huge.data(), huge.size(), dh, di, true, why),
++              "e3 over-cap ids length rejected in meta mode too");
++    }
++    {   // E3: filename gates: only exactly owned names are ever created, touched or deleted.
++        // Positive regression on a REAL key: `root-` (5) + 16 hex + `.hstr` (5) = 26 bytes total.
++        const saved::SavedItem it = e3_canary_line(12, 0);
++        const std::string key = saved::root_file_key(e3_header(), it);
++        check(key.size() == 16, "e3 real file key is 16 hex chars");
++        const std::string name = "root-" + key + ".hstr";
++        check(name.size() == 26, "e3 real cache name is 26 bytes");
++        check(name.substr(21, 5) == ".hstr" && name.substr(21).size() == 5,
++              "e3 real cache suffix is 5-char .hstr");
++        check(saved::root_file_name_ok(name), "e3 real cache name accepted");
++        check(saved::root_file_name_ok("root-0123456789abcdef.hstr"), "e3 cache name accepted");
++        check(!saved::root_file_name_ok("root-0123456789ABCDEF.hstr"), "e3 uppercase hex rejected");
++        check(!saved::root_file_name_ok("root-0123456789abcde.hstr"), "e3 short stem rejected");
++        check(!saved::root_file_name_ok("root-0123456789abcdef.hstrx"), "e3 long suffix rejected");
++        check(!saved::root_file_name_ok("notes.txt"), "e3 foreign name rejected");
++        check(!saved::root_file_name_ok("root-0123456789abcdef.tmp.1"), "e3 temp is not a cache file");
++        check(saved::root_temp_name_ok("root-0123456789abcdef.tmp.3"), "e3 temp name accepted");
++        check(!saved::root_temp_name_ok("root-0123456789abcdef.hstr"), "e3 cache file is not a temp");
++        check(!saved::root_temp_name_ok("root-0123456789abcdef.tmp."), "e3 empty temp suffix rejected");
++        check(!saved::root_temp_name_ok("root-xyz.tmp.1"), "e3 non-hex temp rejected");
++    }
++    {   // E3: streaming scan (root_scan_meta) indexes metadata while seek-skipping bulk: the meta has
++        // full ids and no bulk; truncation and trailing bytes fail.
++        const std::string sub = "rootdisk-e3-tmp/scan";
++        std::error_code ec;
++        fs::remove_all("rootdisk-e3-tmp", ec);   // a crashed run's leftovers never pollute this one
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 scan tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(40, 0);
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "e3 scan fixture encodes");
++        const std::string key = saved::root_file_key(h, it);
++        const std::string path = sub + "/root-" + key + ".hstr";
++        e3_write(path, buf);
++        saved::RootDiskHeader sh;
++        saved::SavedItem sm;
++        const bool scan_ok = saved::root_scan_meta(path, buf.size(), sh, sm, why);
++        if (!scan_ok) std::fprintf(stderr, "e3 scan why: %s (file %s, %llu bytes)\n", why.c_str(),
++                                    path.c_str(), (unsigned long long)buf.size());
++        check(scan_ok, "e3 scan succeeds");
++        check(sh.compatible_with(h) && sm.ids == it.ids && sm.imgs == it.imgs && sm.cvec == it.cvec &&
++                  sm.geom == it.geom && sm.n_stages == 1,
++              "e3 scan meta carries header+ids+identity");
++        check(sm.stages.empty() && sm.mtp.kv.empty() && sm.boundary.row.empty(),
++              "e3 scan reads no bulk");
++        check(sm.mtp.cells == 39 && sm.mtp.valid_from == 0 && sm.boundary.hc == 2 &&
++                  sm.boundary.n_embd == 4,
++              "e3 scan carries MTP/boundary scalars");
++        check(saved::root_file_key(sh, sm) == key, "e3 scan meta reproduces the key");
++        std::vector<uint8_t> half(buf.begin(), buf.begin() + buf.size() / 2);
++        const std::string hpath = sub + "/root-aaaaaaaaaaaaaaaa.hstr";
++        e3_write(hpath, half);
++        check(!saved::root_scan_meta(hpath, half.size(), sh, sm, why), "e3 scan rejects truncation");
++        std::vector<uint8_t> trail = buf;
++        trail.push_back(0x00);
++        const std::string tpath = sub + "/root-bbbbbbbbbbbbbbbb.hstr";
++        e3_write(tpath, trail);
++        check(!saved::root_scan_meta(tpath, trail.size(), sh, sm, why),
++              "e3 scan rejects trailing bytes");
++    }
++    {   // E3: store scan ignores incompatible/corrupt/foreign/renamed files; matching is full-ids
++        // (never hash-only) with exact image/cvec identity and strict lo < len < hi bounds.
++        const std::string sub = "rootdisk-e3-tmp/index";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 index tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem a = e3_canary_line(40, 0);
++        std::vector<uint8_t> abuf;
++        std::string why;
++        check(saved::root_encode(h, a, abuf, why), "e3 index fixture encodes");
++        const std::string akey = saved::root_file_key(h, a);
++        e3_write(sub + "/root-" + akey + ".hstr", abuf);
++        saved::RootDiskHeader hb = h;
++        hb.kv_type = "int8";   // same ids, incompatible identity: ignored, never loaded
++        std::vector<uint8_t> bbuf;
++        check(saved::root_encode(hb, a, bbuf, why), "e3 incompatible fixture encodes");
++        e3_write(sub + "/root-" + saved::root_file_key(hb, a) + ".hstr", bbuf);
++        std::vector<uint8_t> half(abuf.begin(), abuf.begin() + abuf.size() / 2);
++        e3_write(sub + "/root-aaaaaaaaaaaaaaaa.hstr", half);   // corrupt: ignored
++        e3_write_text(sub + "/notes.txt", "user file");        // foreign: ignored
++        e3_write_text(sub + "/root-xyz.hstr", "user file");    // foreign: ignored
++        e3_write(sub + "/root-ffffffffffffffff.hstr", abuf);   // renamed: stem != key, ignored
++        saved::SavedItem im = e3_canary_line(20, 1000);
++        im.imgs = {{3, 99}};
++        std::vector<uint8_t> ibuf;
++        check(saved::root_encode(h, im, ibuf, why), "e3 image fixture encodes");
++        e3_write(sub + "/root-" + saved::root_file_key(h, im) + ".hstr", ibuf);
++        saved::RootDiskStore st;
++        check(st.start(e3_config(sub, 1ull << 40), why) && st.enabled() && st.indexed() == 2,
++              "e3 scan indexes the two compatible files only");
++        saved::RootDiskStore::Entry e;
++        check(st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e) &&
++                  e.meta.ids.size() == 40,
++              "e3 longest prefix matches");
++        std::vector<int32_t> div = req_at(0, 60);
++        div[5] = 999;
++        check(!st.find_match(div, no_imgs, true, {}, 0, 60, e), "e3 divergent ids never match");
++        check(!st.find_match(req_at(0, 60), no_imgs, false, {}, 0, 60, e), "e3 cvec flip misses");
++        check(!st.find_match(req_at(0, 60), no_imgs, true, {}, 40, 100, e),
++              "e3 tie bound excludes (chain wins ties)");
++        check(st.find_match(req_at(0, 45), no_imgs, true, {}, 0, 45, e) && e.meta.ids.size() == 40,
++              "e3 shorter window still matches");
++        check(st.find_match(req_at(1000, 40), std::vector<saved::ImgKey>{{3, 99}}, true, {}, 0, 40,
++                            e) &&
++                  e.meta.ids.size() == 20,
++              "e3 identical image hits");
++        check(!st.find_match(req_at(1000, 40), no_imgs, true, {}, 0, 40, e), "e3 missing image misses");
++        check(!st.find_match(req_at(1000, 40), std::vector<saved::ImgKey>{{3, 100}}, true, {}, 0, 40,
++                             e),
++              "e3 changed image hash misses");
++        check(st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e), "e3 re-match for load");
++        saved::SavedItem loaded;
++        check(st.load_item(e, loaded, why) && loaded.complete() && loaded.ids == a.ids &&
++                  loaded.stages[0].kv[0].k == a.stages[0].kv[0].k,
++              "e3 lazy payload loads complete with intact bytes");
++        check(!st.find_match(req_at(0, 60), no_imgs, true, {e.path}, 0, 60, e),
++              "e3 skip set exhausts the candidate");
++        st.shutdown();
++    }
++    {   // E3: background writer lifecycle: enqueue -> file appears -> dedupe -> mark_used -> join.
++        const std::string sub = "rootdisk-e3-tmp/bg";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 bg tmpdir created");
++        saved::RootDiskStore st;
++        std::string why;
++        check(st.start(e3_config(sub, 1ull << 40), why), "e3 bg store starts");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(40, 0);
++        const std::string key = saved::root_file_key(h, it);
++        st.enqueue(it);
++        check(e3_wait_for([&] { return st.indexed() == 1; }, 10000), "e3 background write lands");
++        check(e3_wait_for([&] { return st.pending() == 0; }, 10000), "e3 writer queue drains");
++        size_t nfiles = 0;
++        std::string fpath;
++        for (fs::directory_iterator jt(sub, ec); !ec && jt != fs::directory_iterator(); jt.increment(ec))
++            if (saved::root_file_name_ok(jt->path().filename().string())) {
++                ++nfiles;
++                fpath = jt->path().string();
++            }
++        check(!ec && nfiles == 1 && fs::path(fpath).filename().string() == "root-" + key + ".hstr",
++              "e3 exactly the owned file appears");
++        saved::RootDiskStore::Entry e;
++        check(st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e), "e3 written root matches");
++        saved::SavedItem loaded;
++        check(st.load_item(e, loaded, why) && loaded.complete() && loaded.ids == it.ids,
++              "e3 written payload loads");
++        st.enqueue(it);   // duplicate: index already holds the key
++        std::this_thread::sleep_for(std::chrono::milliseconds(400));
++        size_t nfiles2 = 0;
++        for (fs::directory_iterator jt(sub, ec); !ec && jt != fs::directory_iterator(); jt.increment(ec))
++            if (saved::root_file_name_ok(jt->path().filename().string())) ++nfiles2;
++        check(nfiles2 == 1, "e3 duplicate enqueue writes nothing");
++        check(e3_age_hours(fpath, 2), "e3 file aged for the mtime check");
++        const auto t_old = fs::last_write_time(fpath, ec);
++        st.mark_used(fpath);
++        const auto t_new = fs::last_write_time(fpath, ec);
++        check(!ec && t_new > t_old, "e3 mark_used refreshes mtime");
++        st.shutdown();
++        st.shutdown();   // idempotent
++        check(!st.enabled(), "e3 shutdown disables");
++    }
++    {   // E3: cap trim deletes oldest-mtime recognized cache files past the cap plus stale recognized
++        // temps, and never touches anything else.
++        const std::string sub = "rootdisk-e3-tmp/cap";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 cap tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem i20 = e3_canary_line(20, 0);
++        const saved::SavedItem i30 = e3_canary_line(30, 0);
++        const saved::SavedItem i40 = e3_canary_line(40, 0);
++        std::vector<uint8_t> b20, b30, b40;
++        std::string why;
++        check(saved::root_encode(h, i20, b20, why) && saved::root_encode(h, i30, b30, why) &&
++                  saved::root_encode(h, i40, b40, why),
++              "e3 cap fixtures encode");
++        const std::string k20 = saved::root_file_key(h, i20);
++        const std::string k30 = saved::root_file_key(h, i30);
++        const std::string k40 = saved::root_file_key(h, i40);
++        const std::string p20 = sub + "/root-" + k20 + ".hstr";
++        const std::string p30 = sub + "/root-" + k30 + ".hstr";
++        const std::string p40 = sub + "/root-" + k40 + ".hstr";
++        e3_write(p20, b20);
++        e3_write(p30, b30);
++        e3_write(p40, b40);
++        check(e3_age_hours(p20, 3) && e3_age_hours(p30, 2) && e3_age_hours(p40, 1), "e3 cap files aged");
++        const std::string stale_tmp = sub + "/root-" + k20 + ".tmp.7";
++        const std::string fresh_tmp = sub + "/root-" + k30 + ".tmp.8";
++        e3_write_text(stale_tmp, "leftover");
++        e3_write_text(fresh_tmp, "active");
++        check(e3_age_hours(stale_tmp, 2), "e3 stale temp aged");
++        e3_write_text(sub + "/notes.txt", "user file");
++        e3_write_text(sub + "/root-bad.hstr", "user file");
++        const uint64_t cap = fs::file_size(p30) + fs::file_size(p40);   // room for exactly two newest
++        saved::RootDiskStore st;
++        // Startup enforce: start() itself trims the oldest (no writes yet), so the index holds two.
++        check(st.start(e3_config(sub, cap), why) && st.indexed() == 2,
++              "e3 cap store starts over cap and startup-trims to two");
++        check(!fs::exists(p20) && fs::exists(p30) && fs::exists(p40),
++              "e3 oldest cache file trimmed at startup");
++        check(st.trim_now(why), "e3 trim runs");
++        check(!fs::exists(stale_tmp) && fs::exists(fresh_tmp), "e3 only the stale temp goes");
++        check(fs::exists(sub + "/notes.txt") && fs::exists(sub + "/root-bad.hstr"),
++              "e3 foreign files untouched");
++        check(st.indexed() == 2, "e3 index drops the trimmed file");
++        saved::RootDiskStore::Entry e;
++        check(!st.find_match(req_at(0, 25), no_imgs, true, {}, 0, 25, e),
++              "e3 trimmed root no longer matches");
++        uint64_t total = 0;
++        for (fs::directory_iterator jt(sub, ec); !ec && jt != fs::directory_iterator(); jt.increment(ec))
++            if (saved::root_file_name_ok(jt->path().filename().string())) total += jt->file_size();
++        check(!ec && total <= cap, "e3 dir within cap after trim");
++        st.shutdown();
++    }
++    {   // E3: shutdown drains (enqueue then immediate shutdown loses nothing); a restart sees the
++        // written file with no further writes (the writer published before the join returned).
++        const std::string sub = "rootdisk-e3-tmp/drain";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 drain tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(40, 0);
++        const std::string key = saved::root_file_key(h, it);
++        {
++            saved::RootDiskStore st;
++            std::string why;
++            check(st.start(e3_config(sub, 1ull << 40), why), "e3 drain store starts");
++            st.enqueue(it);
++            st.shutdown();   // immediate: no wait_for, the join drains the queue
++            check(fs::exists(sub + "/root-" + key + ".hstr"), "e3 drained write landed before join");
++        }
++        {
++            saved::RootDiskStore st;   // restart: sees the file, trims nothing (within cap)
++            std::string why;
++            check(st.start(e3_config(sub, 1ull << 40), why) && st.indexed() == 1,
++                  "e3 restart indexes the drained file");
++            saved::RootDiskStore::Entry e;
++            check(st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e) &&
++                      e.meta.ids.size() == 40,
++                  "e3 restarted root matches");
++            saved::SavedItem loaded;
++            check(st.load_item(e, loaded, why) && loaded.complete() && loaded.ids == it.ids,
++                  "e3 restarted payload loads complete");
++            st.shutdown();
++        }
++    }
++    {   // E3: the startup scan enforces the cap itself (no writes needed): three files on disk, cap
++        // for the two newest - start() alone trims the oldest and the index drops it.
++        const std::string sub = "rootdisk-e3-tmp/startcap";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 startcap tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem i20 = e3_canary_line(20, 0);
++        const saved::SavedItem i30 = e3_canary_line(30, 0);
++        const saved::SavedItem i40 = e3_canary_line(40, 0);
++        std::vector<uint8_t> b20, b30, b40;
++        std::string why;
++        check(saved::root_encode(h, i20, b20, why) && saved::root_encode(h, i30, b30, why) &&
++                  saved::root_encode(h, i40, b40, why),
++              "e3 startcap fixtures encode");
++        const std::string p20 = sub + "/root-" + saved::root_file_key(h, i20) + ".hstr";
++        const std::string p30 = sub + "/root-" + saved::root_file_key(h, i30) + ".hstr";
++        const std::string p40 = sub + "/root-" + saved::root_file_key(h, i40) + ".hstr";
++        e3_write(p20, b20);
++        e3_write(p30, b30);
++        e3_write(p40, b40);
++        check(e3_age_hours(p20, 3) && e3_age_hours(p30, 2) && e3_age_hours(p40, 1),
++              "e3 startcap files aged");
++        const uint64_t cap = fs::file_size(p30) + fs::file_size(p40);   // room for exactly two newest
++        saved::RootDiskStore st;
++        check(st.start(e3_config(sub, cap), why), "e3 startcap store starts");
++        check(!fs::exists(p20) && fs::exists(p30) && fs::exists(p40),
++              "e3 startup trim removed the oldest with no writes");
++        check(st.indexed() == 2, "e3 startup index holds the two survivors");
++        saved::RootDiskStore::Entry e;
++        check(!st.find_match(req_at(0, 25), no_imgs, true, {}, 0, 25, e),
++              "e3 startup-trimmed root no longer matches");
++        st.shutdown();
++    }
++    {   // E3: strict GiB parsing (shared helper): malformed/inf/nan/negative/exact-boundary
++        // reject, sane values accept. The exact boundary is 2^34 GiB ((double)UINT64_MAX rounds up
++        // to 2^64): it must reject with >=, since == already converts to 2^64 bytes (undefined).
++        double gib = -1.0;
++        std::string err;
++        check(!saved::parse_gib_flag(nullptr, gib, err), "e3 gib null rejects");
++        check(!saved::parse_gib_flag("", gib, err), "e3 gib empty rejects");
++        check(!saved::parse_gib_flag("abc", gib, err), "e3 gib non-numeric rejects");
++        check(!saved::parse_gib_flag("12x", gib, err), "e3 gib trailing garbage rejects");
++        check(!saved::parse_gib_flag("12 ", gib, err), "e3 gib trailing space rejects");
++        check(!saved::parse_gib_flag("-1", gib, err), "e3 gib negative rejects");
++        check(saved::parse_gib_flag("-0.0", gib, err) && gib == 0.0,
++              "e3 gib negative zero accepts as zero");
++        check(!saved::parse_gib_flag("nan", gib, err), "e3 gib nan rejects");
++        check(!saved::parse_gib_flag("inf", gib, err), "e3 gib inf rejects");
++        check(!saved::parse_gib_flag("-inf", gib, err), "e3 gib -inf rejects");
++        check(!saved::parse_gib_flag("1e999", gib, err), "e3 gib overflow rejects");
++        check(!saved::parse_gib_flag("17179869184", gib, err), "e3 gib exact 2^34 boundary rejects");
++        check(!saved::parse_gib_flag("20000000000", gib, err), "e3 gib past boundary rejects");
++        check(saved::parse_gib_flag("0", gib, err) && gib == 0.0, "e3 gib zero accepts");
++        check(saved::parse_gib_flag("20", gib, err) && gib == 20.0, "e3 gib integer accepts");
++        check(saved::parse_gib_flag("0.5", gib, err) && gib == 0.5, "e3 gib fraction accepts");
++        check(saved::parse_gib_flag("1e3", gib, err) && gib == 1000.0, "e3 gib exponent accepts");
++        check(saved::parse_gib_flag("17179869183", gib, err) && gib == 17179869183.0,
++              "e3 gib just below boundary accepts");
++    }
++    {   // E3: a corrupt same-key file is atomically replaced by the recaptured root (startup scan
++        // ignores it, so enqueue proceeds; the rewrite overwrites it in place, old bytes never
++        // trusted). No temp leftovers, payload loads complete.
++        const std::string sub = "rootdisk-e3-tmp/replace";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 replace tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(40, 0);
++        const std::string key = saved::root_file_key(h, it);
++        const std::string final_p = sub + "/root-" + key + ".hstr";
++        e3_write_text(final_p, std::string(128, '\x7f'));   // corrupt same-key file (bad magic)
++        saved::RootDiskStore st;
++        std::string why;
++        check(st.start(e3_config(sub, 1ull << 40), why) && st.indexed() == 0,
++              "e3 corrupt file ignored at startup");
++        st.enqueue(it);
++        check(e3_wait_for([&] { return st.indexed() == 1; }, 10000),
++              "e3 recaptured root replaces the corrupt file");
++        saved::RootDiskStore::Entry e;
++        check(st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e),
++              "e3 replaced file matches");
++        saved::SavedItem loaded;
++        check(st.load_item(e, loaded, why) && loaded.complete() && loaded.ids == it.ids,
++              "e3 replaced payload loads complete");
++        bool tmp_left = false;
++        for (fs::directory_iterator jt(sub, ec); !ec && jt != fs::directory_iterator(); jt.increment(ec))
++            if (saved::root_temp_name_ok(jt->path().filename().string())) tmp_left = true;
++        check(!ec && !tmp_left, "e3 no temp leftovers after replace");
++        st.shutdown();
++    }
++    {   // E3: replacing an existing GOOD file is safe (valid before and after, mtime refreshed),
++        // and drop_path repairs a bad index entry so the same key can be recaptured and queued.
++        const std::string sub = "rootdisk-e3-tmp/repair";
++        std::error_code ec;
++        fs::create_directories(sub, ec);
++        check(!ec, "e3 repair tmpdir created");
++        const saved::RootDiskHeader h = e3_header();
++        const saved::SavedItem it = e3_canary_line(40, 0);
++        const std::string key = saved::root_file_key(h, it);
++        std::vector<uint8_t> buf;
++        std::string why;
++        check(saved::root_encode(h, it, buf, why), "e3 repair fixture encodes");
++        const std::string final_p = sub + "/root-" + key + ".hstr";
++        e3_write(final_p, buf);
++        check(e3_age_hours(final_p, 2), "e3 repair file aged");
++        const auto t_old = fs::last_write_time(final_p, ec);
++        saved::RootDiskStore st;
++        check(st.start(e3_config(sub, 1ull << 40), why) && st.indexed() == 1,
++              "e3 repair store indexes the good file");
++        st.drop_path(final_p);   // simulate a load-failure invalidation
++        check(st.indexed() == 0, "e3 drop_path removes the entry");
++        saved::RootDiskStore::Entry e;
++        check(!st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e),
++              "e3 dropped entry no longer matches");
++        st.enqueue(it);   // recapture now queues (no index dedup blocking it)
++        check(e3_wait_for([&] { return st.indexed() == 1; }, 10000),
++              "e3 recaptured root re-lands after drop");
++        check(st.find_match(req_at(0, 60), no_imgs, true, {}, 0, 60, e),
++              "e3 re-landed file matches");
++        saved::SavedItem loaded;
++        check(st.load_item(e, loaded, why) && loaded.complete() && loaded.ids == it.ids,
++              "e3 re-landed payload loads complete");
++        const auto t_new = fs::last_write_time(final_p, ec);
++        check(!ec && t_new > t_old, "e3 replace refreshed the good file");
++        st.shutdown();
++    }
++    {   // E3: a never-started store is a safe no-op everywhere (true-cold shape without the engine).
++        saved::RootDiskStore d;
++        std::string why;
++        check(!d.enabled(), "e3 disabled store reports off");
++        d.enqueue(e3_canary_line(12, 0));
++        check(d.pending() == 0 && d.indexed() == 0, "e3 disabled enqueue is a no-op");
++        saved::RootDiskStore::Entry e;
++        check(!d.find_match(req_at(0, 20), no_imgs, true, {}, 0, 20, e), "e3 disabled find misses");
++        saved::SavedItem o;
++        check(!d.load_item(e, o, why), "e3 disabled load fails");
++        d.mark_used("whatever");   // must not crash
++        check(!d.trim_now(why), "e3 disabled trim fails");
++        d.shutdown();   // must not crash
++        check(!d.enabled(), "e3 disabled shutdown stays off");
++    }
++    {   // E3 filesystem lifecycle stays inside ./rootdisk-e3-tmp (workspace build tree): the real
++        // default root dir is never touched by any test above.
++        const std::string probe = saved::kDefaultRootDir;
++        check(probe == "H:\\qwen38-v100\\strata-cache\\roots", "e3 default root dir unchanged");
++        std::error_code ec;
++        fs::remove_all("rootdisk-e3-tmp", ec);
++        check(!ec && !fs::exists("rootdisk-e3-tmp"), "e3 tmp cleaned");
++    }
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }
+-- 
+2.54.0.windows.1
+

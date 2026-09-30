@@ -26,17 +26,20 @@ one line is the right trade-off. With 128 GB host RAM and an agent harness, seve
 
 | Layer | Change | Where |
 |---|---|---|
-| Strata | V100 / CUDA 11.8 port (sm_70 floor, Windows fixes) | `patches/strata/0001-0002` |
-| Strata server | auxiliary requests (titles: no tools + `response_format`) wait for the main turn and never evict its state | `0003` |
-| Strata | adaptive MTP draft window (`--spec-adapt`) from measured acceptance and cost | `0004` |
-| Strata | **saved states**: pinned *roots* (fixed prefix = tools + system prompt) and LRU *tips* (end of each conversation line) in host RAM, restore of the longest validated prefix, per-request resume/snapshot stats | `0005-0008` |
-| Strata | roots persisted to disk (lazy load, identity check, size cap, `--no-root-disk`), aux composition tests, `/v1/cache` inventory + DELETE of non-pinned tips | `0009-0011` |
-| Strata | fixes from GPU acceptance: fall back to the next valid restore point instead of cold (F1); tips keep a restore point at the last turn boundary of the prompt, not only the generation end (F2/F2b) | `0012-0016` |
-| Strata server | **prefix keeper** (`--prefix-keeper`): keeps Hermes requests append-only for the cache — volatile system lines become a trailing `[context update]`, pruned history is restored; idea by the owner | `0017` (live: new session after a workspace change resumes the root) |
+| Strata | V100 (sm_70) / CUDA 11.8 / Windows port, with docs | `patches/strata/0001` |
+| Strata server | auxiliary requests (titles: no tools + `response_format`) wait for the main turn and never evict its state | `0002` |
+| Strata | adaptive MTP draft window (`--spec-adapt`, off; no gain measured on V100) | `0003` |
+| Strata | **saved states**: pinned *roots* (fixed prefix = tools + system prompt) and LRU *tips* (end of each conversation line) in host RAM, restore of the longest validated prefix, per-request resume/snapshot stats | `0004` |
+| Strata | roots persisted to disk (identity header, lazy load, checksum, size cap, `--root-dir`, `--no-root-disk`) | `0005` |
+| Strata | aux composition tests, authenticated `/v1/cache` inventory + DELETE of non-pinned tips | `0006` |
+| Strata | fixes from GPU acceptance: fall back to the next valid restore point instead of cold (F1); tips restorable at the last turn boundary of the prompt (F2/F2b) | `0007` |
+| Strata server | **prefix keeper** (`--prefix-keeper`): keeps Hermes requests append-only for the cache — volatile system lines become a trailing `[context update]`, pruned history is restored; idea by the owner | `0008` |
+| Strata | upstream 0.1.29/0.1.30 follow-ups: 0.1.30's `dead`/`block_pos` recurrent state carried through capture/restore/disk (disk schema v3), K8V4 KV explicitly unsupported for saved states, single MTP prefill, mutual exclusion with upstream's opt-in conversation cache | `0009` |
 | Hermes | fixed prefix discipline: git workspace snapshot moved to the volatile tail (`HERMES_WORKSPACE_LATE=1`), title generated after the turn (`HERMES_TITLE_AFTER_TURN=1`) | `patches/hermes-agent/0001` |
 | Hermes | `delegate_task` **fork mode**: a child starts from the parent's exact prompt (+ its tool call + a tool result carrying the task), so the engine resumes it from the parent's saved state; blocked tools and depth limit are refused at call time instead of being removed from `tools[]` | `patches/hermes-agent/0002` |
 | Hermes | **work deadline** tools (`set_work_deadline` / `finish_work`): "work until 18:00" keeps the agent going until the deadline; run budget stays the ceiling | `patches/hermes-agent/0003` (experimental) |
 | Hermes | fix a delegation **deadlock** (a finished child blocked in a process-wide telemetry flush while the parent waited for it); **`ask_document`** tool = cache-augmented reading: the document is a byte-stable system prefix, so the engine keeps it as a root on disk and the 2nd question on the same document skips re-reading it (live: 165 s -> 43 s end to end, 26K-token document) | `patches/hermes-agent/0004` |
+| Hermes | fork mode refactor: a `ForkContext` dataclass replaces the private attributes a fork child carried (behaviour-preserving; recorded first-request parity test); from a ChatGPT readability review | `patches/hermes-agent/0005` |
 
 Design: [docs/DESIGN.md](docs/DESIGN.md). How the fixes were found: [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 Acceptance ledger: [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Live Hermes runs and what they exposed: [docs/LIVE-HERMES.md](docs/LIVE-HERMES.md).
@@ -63,10 +66,15 @@ kernels + KV paging drift run to run). Decode speed unchanged: 26.7 vs 26.5 tok/
 showed no measurable gain here and stays off.
 
 Not yet measured on GPU: tip-budget eviction under pressure (item 6 of the ledger).
+## 2026-10-01: rebased onto upstream Strata 0.1.30
+
+Production now runs the 0.1.30-based series (GPU acceptance on V100, same settings as above): saved states, root-disk, parent/child/fork and planted-fact recall all pass; Japanese answers +12-15% vs the 0.1.21 build (0.1.27 CJK draft head); a 39K-token prompt reads 12% faster; 8K-doc decode 25.1 vs 23.2 tok/s (0.1.29). Known gap: an identical repeated request resumes in ~1.3 s (was 0.1-0.5 s). The 0.1.21 series and its history stay in `patches/strata-0.1.21/`.
+
 ## Layout
 
 ```
-patches/strata/         git format-patch from Niko1221/Strata 0.1.21 base (f1b1d961...)
+patches/strata/         9 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
+patches/strata-0.1.21/  the earlier 17-patch series on 0.1.21 (history)
 patches/hermes-agent/   git format-patch against the Hermes Agent snapshot used by this project
 docs/                   design, fix history, acceptance ledger
 scripts/                server launcher (PowerShell), Hermes launcher (.cmd), GPU acceptance driver
@@ -83,9 +91,7 @@ the patches were generated from.
 
 ## Patch bases
 
-The Strata series is pinned to upstream commit
-`f1b1d961537fd66d37fee68a60015701375b7b5a` (Strata 0.1.21). The preimage blob IDs in
-`patches/strata/0001-*.patch` match that commit for every file it changes. Do not assume the series applies
+The Strata series is pinned to upstream tag v0.1.30 (`30ec18ec7094550fcc594fd948220d511d80464e`); scripts/materialize.ps1 rebuilds exactly the tree production runs (tree hash checked). Do not assume the series applies
 cleanly to current Strata `main`; upstream has moved since this snapshot.
 
 The Hermes patches likewise carry their exact preimage blob IDs in the format-patch headers, but this repository

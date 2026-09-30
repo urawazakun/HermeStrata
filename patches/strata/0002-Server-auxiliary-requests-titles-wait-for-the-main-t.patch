@@ -1,0 +1,548 @@
+From c187aaee230bb6208e1630f5b0ff74047a7a284e Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:45:23 +0900
+Subject: [PATCH 2/9] Server: auxiliary requests (titles) wait for the main
+ turn and never evict its state
+
+Squashed from branch v100-030 (26c13f8..6dcaf28); history in docs/KNOWN-ISSUES.md and docs/ACCEPTANCE.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/server.py      | 225 +++++++++++++++++++++++++++++--------------
+ serve/test_server.py | 224 +++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 374 insertions(+), 75 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index e03379e..c135b3e 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -612,6 +612,18 @@ class Detokenizer:
+         return delta
+ 
+ 
++AUX_WAIT_S = 180.0            # an aux request waits this long at most for the main turn to finish
++AUX_GRACE_S = 1.5             # ... then gives a just-finished main turn this long to take the engine again
++AUX_POLL_S = 0.05             # how often a waiting aux request looks at the status
++
++
++def is_aux_request(req: dict, tools) -> bool:
++    """An aux request: no tools, but a response_format (a small structured side request, e.g. a session title).
++
++    Aux runs after the main turn (Service._yield_to_main_turn), without thinking and outside the MCP tool loop."""
++    return not tools and bool(req.get("response_format"))
++
++
+ class Service:
+     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+                  vision: Vision | None = None, sampling_defaults: dict | None = None,
+@@ -634,6 +646,7 @@ class Service:
+         self.last_request_at = None                      # when a request last started or finished
+         self.started_at = time.time()
+         self.status_lock = threading.Lock()
++        self._mcp_turns = 0                              # active MCP turns, including gaps between engine runs
+         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
+         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
+@@ -975,6 +988,41 @@ class Service:
+                   f"{el:.0f} s", flush=True)
+         return now
+ 
++    def _yield_to_main_turn(self, cancel, wait=None, grace=None) -> bool:
++        """Hold an aux request until no main request holds or waits for the engine, so it runs after the main turn.
++
++        Reads only status["busy"]/status["queued"] under status_lock (no second busy counter); the FIFO still
++        serializes the actual run.  Waits up to `wait` seconds (AUX_WAIT_S), then a `grace` window (AUX_GRACE_S) in
++        which a just-finished main turn (e.g. its next MCP round) may take the engine again - if it does, waiting
++        resumes.  True when the engine stayed idle through the grace window, False on timeout or cancel."""
++        if wait is None:
++            wait = AUX_WAIT_S
++        if grace is None:
++            grace = AUX_GRACE_S
++        t0, deadline = time.time(), time.time() + wait
++        while True:
++            with self.status_lock:
++                occupied = bool(self.status.get("busy")) or self.status.get("queued", 0) > 0 or self._mcp_turns > 0
++            if not occupied:
++                end = time.time() + grace
++                while True:
++                    if cancel.is_set():
++                        return False
++                    time.sleep(min(AUX_POLL_S, max(0.0, end - time.time())))
++                    with self.status_lock:
++                        occupied = bool(self.status.get("busy")) or self.status.get("queued", 0) > 0 or \
++                            self._mcp_turns > 0
++                    if occupied:
++                        break
++                    if time.time() >= end:
++                        waited = time.time() - t0
++                        if waited >= AUX_POLL_S:
++                            print(f"[strata] aux request waited {waited:.1f} s for the main turn", flush=True)
++                        return True
++            if cancel.is_set() or time.time() >= deadline:
++                return False
++            time.sleep(AUX_POLL_S)
++
+     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
+         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
+@@ -1139,84 +1187,95 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
+ 
+     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
+     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
+-    could not reach the model before the client's)."""
++    could not reach the model before the client's).
++
++    An aux request (no tools + response_format) never enters this loop: `run_with_mcp` refuses it, and the yield in
++    `_openai`/`_anthropic` happens before the loop is built, so aux waits for the whole turn of another request and
++    then runs once, outside any tool loop."""
++    if not tools:
++        raise ValueError("run_with_mcp needs at least one tool (an aux request does not enter the MCP tool loop)")
+     max_rounds = int(hub.settings["max_rounds"])
+     total, rounds, done = 0, 0, None
+     messages = list(messages)
+-    while True:
+-        text, reasoning, calls, own_calls = [], [], [], 0
+-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
+-            if kind == "done":
+-                done = x
+-                continue
+-            if kind == "event":
+-                ev: Event = x
+-                if ev.call is not None and ev.call.name in mcp_names:
+-                    if ev.kind == "tool_start":          # the model has started writing a call: say so at once
+-                        yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
+-                    elif ev.kind == "tool_call":
+-                        calls.append(ev.call)
+-                    continue                             # its argument pieces are not streamed to the client
+-                if ev.kind == "tool_call":
+-                    own_calls += 1
+-                elif ev.kind == "content":
+-                    text.append(ev.text)
+-                elif ev.kind == "reasoning":
+-                    reasoning.append(ev.text)
+-            yield kind, x
+-        total += done["completion_tokens"]
+-        run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
+-        if run_them and rounds >= max_rounds:
+-            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+-            run_them = False
+-        if not run_them:
+-            for c in calls:                              # announced, never run: close them in the client's view
+-                yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
+-                              "chars": 0, "truncated": False, "ms": 0}
+-            break
+-        rounds += 1
+-        results = []
+-        for c in calls:
+-            s, tool = hub.routes().get(c.name, (None, c.name))
+-            yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
+-                          "tool": tool, "arguments": c.arguments, "round": rounds}
+-            # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
+-            # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
+-            box = {}
+-
+-            def work(c=c, box=box):
++    with svc.status_lock:
++        svc._mcp_turns += 1                         # aux yields across every round of each active MCP turn
++    try:
++        while True:
++            text, reasoning, calls, own_calls = [], [], [], 0
++            for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
++                if kind == "done":
++                    done = x
++                    continue
++                if kind == "event":
++                    ev: Event = x
++                    if ev.call is not None and ev.call.name in mcp_names:
++                        if ev.kind == "tool_start":          # the model has started writing a call: say so at once
++                            yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
++                        elif ev.kind == "tool_call":
++                            calls.append(ev.call)
++                        continue                             # its argument pieces are not streamed to the client
++                    if ev.kind == "tool_call":
++                        own_calls += 1
++                    elif ev.kind == "content":
++                        text.append(ev.text)
++                    elif ev.kind == "reasoning":
++                        reasoning.append(ev.text)
++                yield kind, x
++            total += done["completion_tokens"]
++            run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
++            if run_them and rounds >= max_rounds:
++                yield "mcp", {"event": "limit", "max_rounds": max_rounds}
++                run_them = False
++            if not run_them:
++                for c in calls:                              # announced, never run: close them in the client's view
++                    yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
++                                  "chars": 0, "truncated": False, "ms": 0}
++                break
++            rounds += 1
++            results = []
++            for c in calls:
++                s, tool = hub.routes().get(c.name, (None, c.name))
++                yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
++                              "tool": tool, "arguments": c.arguments, "round": rounds}
++                # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
++                # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
++                box = {}
++
++                def work(c=c, box=box):
++                    try:
++                        box["r"] = hub.call(c.name, c.arguments, cancel)
++                    except McpCancelled:
++                        box["cancelled"] = True
++                worker = threading.Thread(target=work, daemon=True)
++                worker.start()
+                 try:
+-                    box["r"] = hub.call(c.name, c.arguments, cancel)
+-                except McpCancelled:
+-                    box["cancelled"] = True
+-            worker = threading.Thread(target=work, daemon=True)
+-            worker.start()
+-            try:
+-                while worker.is_alive():
+-                    worker.join(1.0)
+-                    if worker.is_alive():
+-                        yield "ping", None
+-            except GeneratorExit:
+-                cancel.set()                             # the client is gone: stop the tool too
+-                raise
+-            if "r" not in box:
++                    while worker.is_alive():
++                        worker.join(1.0)
++                        if worker.is_alive():
++                            yield "ping", None
++                except GeneratorExit:
++                    cancel.set()                             # the client is gone: stop the tool too
++                    raise
++                if "r" not in box:
++                    break
++                r = box["r"]
++                print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
++                      f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
++                results.append(r["text"])
++                yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
++            if cancel.is_set() or len(results) < len(calls):
++                done = {**done, "finish": "cancel"}
+                 break
+-            r = box["r"]
+-            print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+-                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
+-            results.append(r["text"])
+-            yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+-        if cancel.is_set() or len(results) < len(calls):
+-            done = {**done, "finish": "cancel"}
+-            break
+-        messages.append({"role": "assistant", "content": "".join(text).strip(),
+-                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+-                         "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+-        messages += [{"role": "tool", "content": r} for r in results]
+-        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
++            messages.append({"role": "assistant", "content": "".join(text).strip(),
++                             **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
++                             "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
++            messages += [{"role": "tool", "content": r} for r in results]
++            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
++    finally:
++        with svc.status_lock:
++            svc._mcp_turns -= 1
+     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
+ 
+-
+ # ------------------------------------------------------------------------------------------------ OpenAI
+ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
+@@ -1622,7 +1681,8 @@ def make_handler(svc: Service):
+             req = svc.with_shared(req, "openai")
+             messages, tools, kw = openai_to_messages(req)
+             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
++            aux = is_aux_request(req, tools)      # decided before MCP tools merge in: aux never takes the tool loop
++            use_mcp = not aux and req.get("strata_mcp") is True and svc.mcp is not None   # the web app's opt-in
+             own = {t.get("name") for t in tools or []}
+             if use_mcp:
+                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
+@@ -1631,9 +1691,18 @@ def make_handler(svc: Service):
+                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                 use_mcp = bool(extra)
+                 tools = (tools or []) + extra or None
++            if aux:
++                # thinking off, and wait for the main turn before the MCP loop is built - so aux runs once, after
++                # it, outside any tool loop
++                kw = {**kw, "enable_thinking": False}
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
++            _debug_req("openai-aux" if aux else "openai", req, messages, tools, max_new, thinking, len(ids))
+             cancel = threading.Event()
++            if aux and not svc._yield_to_main_turn(cancel):
++                if cancel.is_set():
++                    return                            # the client went away while waiting: nothing to answer
++                # still busy after AUX_WAIT_S: run queued behind it - the fifo still puts aux after the main turn
++                print("[strata] aux request timed out waiting for the main turn; running it queued", flush=True)
+             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                {t["name"] for t in extra}) if use_mcp else None
+             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
+@@ -1662,9 +1731,17 @@ def make_handler(svc: Service):
+             req = svc.with_shared(req, "anthropic")
+             messages, tools, kw = anthropic_to_messages(req)
+             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
++            aux = is_aux_request(req, tools)      # no MCP loop on this path; aux just waits for the main request
++            if aux:
++                kw = {**kw, "enable_thinking": False}
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+-            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
++            _debug_req("anthropic-aux" if aux else "anthropic", req, messages, tools, max_new, thinking, len(ids))
+             cancel = threading.Event()
++            if aux and not svc._yield_to_main_turn(cancel):
++                if cancel.is_set():
++                    return                            # the client went away while waiting: nothing to answer
++                # still busy after AUX_WAIT_S: run queued behind it - the fifo still puts aux after the main turn
++                print("[strata] aux request timed out waiting for the main turn; running it queued", flush=True)
+             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+             if not req.get("stream"):
+                 return self._json(200, anthropic_collect(events))
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 9b0762f..93f6eec 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -17,7 +17,7 @@ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from serve.frontend import ChatTemplate  # noqa: E402
+-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine, request_timings, serve  # noqa: E402
++from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine, is_aux_request, request_timings, serve  # noqa: E402
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ CTX = 4096
+@@ -922,6 +922,228 @@ class UsageAndStatus(unittest.TestCase):
+             httpd.server_close()
+ 
+ 
++class AuxGatedEngine(MockEngine):
++    """Holds the engine until released: a main turn occupying the fifo."""
++
++    def __init__(self, tok, script, max_context, gate):
++        super().__init__(tok, script, max_context=max_context)
++        self.gate, self.entered = gate, threading.Event()
++
++    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++        self.entered.set()
++        self.gate.wait(30)
++        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
++
++
++class AuxYield(unittest.TestCase):
++    """Aux requests (no tools + response_format): thinking off, wait for the main turn over both APIs."""
++
++    AUX_OPENAI = {"model": "m", "messages": [{"role": "user", "content": "title this chat"}],
++                  "response_format": {"type": "json_object"}, "max_tokens": 20}
++    AUX_ANTHROPIC = {"model": "x", "messages": [{"role": "user", "content": "title this chat"}],
++                     "response_format": {"type": "json_object"}, "max_tokens": 20}
++
++    def setUp(self):
++        tok = ByteTokenizer()
++        self.gate = threading.Event()
++        self.engine = AuxGatedEngine(tok, "</think>\n\nok", max_context=CTX, gate=self.gate)
++        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        self.httpd = serve(self.svc, port=0)
++        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
++
++    def tearDown(self):
++        self.gate.set()
++        self.httpd.shutdown()
++        self.httpd.server_close()
++
++    def post(self, path, body):
++        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json"})
++        try:
++            with urllib.request.urlopen(req, timeout=30) as r:
++                return r.status, json.loads(r.read())
++        except urllib.error.HTTPError as e:
++            with e:
++                return e.code, json.loads(e.read())
++
++    def start_main(self):
++        """A main request (no response_format) on a thread; -> (thread, box) once it holds the engine."""
++        box = {}
++        body = {"model": "m", "messages": [{"role": "user", "content": "write a long story"}], "max_tokens": 20}
++
++        def work():
++            try:
++                box["r"] = self.post("/v1/chat/completions", body)
++            except Exception as e:  # noqa: BLE001 - record thread errors for the main thread to raise
++                box["e"] = e
++
++        t = threading.Thread(target=work, daemon=True)
++        t.start()
++        self.assertTrue(self.engine.entered.wait(30))
++        return t, box
++
++    def run_thread(self, fn):
++        """fn on a thread with its result/exception recorded; -> (thread, box, done event)."""
++        box, done = {}, threading.Event()
++
++        def work():
++            try:
++                box["r"] = fn()
++            except Exception as e:  # noqa: BLE001 - as above
++                box["e"] = e
++            finally:
++                done.set()
++
++        t = threading.Thread(target=work, daemon=True)
++        t.start()
++        return t, box, done
++
++    def test_is_aux_request(self):
++        rf = {"type": "json_object"}
++        self.assertTrue(is_aux_request({"response_format": rf}, None))
++        self.assertFalse(is_aux_request({"response_format": rf}, [{"name": "t"}]))  # tools: a main request
++        self.assertFalse(is_aux_request({}, None))                                   # no format: a main request
++        self.assertFalse(is_aux_request({"response_format": None}, None))
++
++    def aux_case(self, path, aux):
++        t, box = self.start_main()
++        _, out, done = self.run_thread(lambda: self.post(path, aux))
++        try:
++            self.assertFalse(done.wait(1.0))                # still waiting while the main turn holds the fifo
++            self.gate.set()
++            t.join(30)
++            self.assertTrue(done.wait(30), out)
++            self.assertNotIn("e", box, box.get("e"))
++            self.assertNotIn("e", out, out.get("e"))
++            self.assertEqual(box["r"][0], 200, box["r"])
++            self.assertEqual(out["r"][0], 200, out["r"])
++        finally:
++            self.gate.set()
++            t.join(30)
++
++    def test_aux_waits_for_the_main_turn_openai(self):
++        self.aux_case("/v1/chat/completions", dict(self.AUX_OPENAI))
++
++    def test_aux_waits_for_the_main_turn_anthropic(self):
++        self.aux_case("/v1/messages", dict(self.AUX_ANTHROPIC))
++
++    def test_aux_waits_for_a_queued_main_request(self):
++        """An aux arriving while a main request is queued also waits for its turn."""
++        t1, box1 = self.start_main()
++        _, box2, main2_done = self.run_thread(lambda: self.post(
++            "/v1/chat/completions",
++            {"model": "m", "messages": [{"role": "user", "content": "another"}], "max_tokens": 5}))
++        time.sleep(0.5)                                     # let the second main reach status["queued"]
++        _, out, done = self.run_thread(lambda: self.post("/v1/chat/completions", dict(self.AUX_OPENAI)))
++        try:
++            self.assertFalse(done.wait(1.0))
++            self.gate.set()
++            t1.join(30)
++            self.assertTrue(main2_done.wait(30), box2)
++            self.assertTrue(done.wait(30), out)
++            self.assertEqual(box1["r"][0], 200, box1)
++            self.assertEqual(box2["r"][0], 200, box2)
++            self.assertEqual(out["r"][0], 200, out["r"])
++        finally:
++            self.gate.set()
++            t1.join(30)
++
++    def test_aux_alone_completes(self):
++        self.gate.set()
++        for path, aux, usage in (("/v1/chat/completions", dict(self.AUX_OPENAI), "usage"),
++                                 ("/v1/messages", dict(self.AUX_ANTHROPIC), "usage")):
++            with self.subTest(path=path):
++                code, b = self.post(path, aux)
++                self.assertEqual(code, 200, b)
++                self.assertIn(usage, b)
++
++    def test_aux_disables_thinking(self):
++        tok = ByteTokenizer()
++        eng = RecordingPrompt(tok, "</think>\n\nok", max_context=CTX)
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        try:
++            base = f"http://127.0.0.1:{httpd.server_address[1]}"
++
++            def post(path, body):
++                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
++                                             headers={"Content-Type": "application/json"})
++                with urllib.request.urlopen(req, timeout=30) as r:
++                    return json.loads(r.read())
++
++            for path, aux in (("/v1/chat/completions", dict(self.AUX_OPENAI)),
++                              ("/v1/messages", dict(self.AUX_ANTHROPIC))):
++                with self.subTest(path=path):
++                    post(path, aux)
++                    text = bytes(i for i in eng.last_ids if i < 256).decode("utf-8", "replace")
++                    self.assertIn("<think>\n\n</think>", text)       # enable_thinking=false renders no thinking block
++                    self.assertNotIn("Reasoning effort", text)
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    def test_aux_times_out_when_the_main_turn_never_ends(self):
++        import serve.server as srv
++
++        t, _ = self.start_main()
++        try:
++            self.assertFalse(self.svc._yield_to_main_turn(threading.Event(), wait=0.3, grace=0))
++        finally:
++            self.gate.set()
++            t.join(30)
++        self.assertEqual(srv.AUX_WAIT_S, 180.0)
++        self.assertEqual(srv.AUX_GRACE_S, 1.5)
++
++    def test_aux_wait_aborts_on_cancel(self):
++        t, _ = self.start_main()
++        try:
++            cancel = threading.Event()
++            _, out, done = self.run_thread(lambda: self.svc._yield_to_main_turn(cancel, wait=30, grace=0))
++            time.sleep(0.3)
++            cancel.set()
++            self.assertTrue(done.wait(10), out)
++            self.assertFalse(out["r"], out)
++        finally:
++            self.gate.set()
++            t.join(30)
++
++    def test_grace_lets_a_follow_up_main_turn_go_first(self):
++        """Inside the grace window a main turn taking the engine again resumes the wait (MCP next rounds)."""
++        import serve.server as srv
++
++        tok = ByteTokenizer()
++        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        _, out, done = self.run_thread(lambda: svc._yield_to_main_turn(threading.Event(), grace=1.0))
++        try:
++            time.sleep(0.2)                                 # the waiter is inside its grace window
++            with svc.status_lock:                           # a just-finished main turn takes the engine again
++                svc.status["queued"] = 1
++            time.sleep(0.3)
++            with svc.status_lock:
++                svc.status["queued"] = 0
++            self.assertTrue(done.wait(10), out)
++            self.assertTrue(out["r"], out)
++        finally:
++            with svc.status_lock:
++                svc.status["queued"] = 0
++            done.wait(10)
++        self.assertGreaterEqual(srv.AUX_GRACE_S, 1.0)
++
++    def test_no_tools_aux_never_enters_the_mcp_loop(self):
++        from serve.server import run_with_mcp
++
++        class Hub:
++            settings = {"max_rounds": 2}
++
++        tok = ByteTokenizer()
++        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        with self.assertRaises(ValueError):
++            list(run_with_mcp(svc, Hub(), [], None, {}, [], True, 5, 5, {}, threading.Event(), set()))
++        self.assertEqual(svc._mcp_turns, 0)
++
++
+ class TimingsDrafts(unittest.TestCase):
+     """`timings` carries the speculative draft counts (PR #83's fields) only when the engine reported them."""
+ 
+-- 
+2.54.0.windows.1
+
