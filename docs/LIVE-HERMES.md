@@ -48,3 +48,27 @@ budget / max turns still win; three idle continuations end the turn. 125 tests p
   `nemo_relay` subscriber flush that needed the parent's (blocked) event loop.
 - `ask_document` on a 26K-token directory: 1st question read the document (root captured, persisted), 2nd question
   `resume from root at 26411, suffix 53` -> 165 s vs 43 s for the whole Hermes turn; both answers correct.
+
+## 2026-10-01: a whole game from a spec (orchestration test)
+
+Claude and Muse discussed what makes a roguelike fun (3 rounds; the owner asked for a Shiren-the-Wanderer feel), Muse
+wrote a 325-line spec with 7 milestones, and Hermes + Qwen3.8-Flash-Next implemented it alone into one HTML file.
+
+- Run 1 (10:13-12:37, deadline 13:00): all 7 milestones claimed done (1281 lines), with its own node checks that all
+  pass. A real playtest found that walls and doors were never drawn: the spec said "visible = room tiles plus
+  neighbours that are not wall/closed door", meaning "you cannot see through walls", and the model implemented it
+  literally. Node checks could not see the screen.
+- Run 2 (review fed back to the same session; 13:05-15:09): fixed, added a text screen dump + render checks, and,
+  given the vision tool, took headless-browser screenshots of five scenes, looked at them, and found and fixed two
+  more bugs on its own (sleeping monsters looked awake, repeated log lines). Lesson: for a literal-minded model,
+  feeding back what the result looks like works better than refining the spec up front.
+- Run 3 (fresh session): procedural chiptune music and sound effects, verified by rendering to WAV offline
+  (no playback on the machine) and looking at spectrograms.
+- The same model also drew 8-direction SVG sprites (5 directions drawn, 3 mirrored) for 10 characters, one
+  conversation per character so earlier drawings stay in context.
+
+Engine observations from the 2.4 h run: one cold prefill (13.5K tokens, 36 s) for the whole run; decode ~25 tok/s
+at 140-160K context. Problems: a reasoning repetition loop (one planning paragraph 13 times, ~27 min); chain resume
+falling back to the last MTP-repairable checkpoint on every request (5-18K tokens re-read, ~20-30% of wall time;
+once 149K tokens / 380 s after a mid-history edit) -> the tail-resume fix above; a KeyError when two clients
+overlapped -> patch 0015.

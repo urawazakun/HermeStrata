@@ -1,0 +1,26 @@
+From ac7edd46d1c880d788ef24565abed096a867dfcf Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 16:32:01 +0900
+Subject: [PATCH] Server: a concurrent request's end may pop the status tail
+ (upstream #212); no KeyError when two requests overlap
+
+---
+ serve/server.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 4c5d5ac..4d7853a 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1638,7 +1638,7 @@ class Service:
+                     s["phase"], s["tool"] = f"writing a tool call: {ev.call.name}", ev.call.name
+                 elif ev.kind == "tool_call":
+                     s["phase"] = "tool call complete"
+-                s["tail"] = (s["tail"] + (ev.text or ""))[-600:]
++                s["tail"] = (s.get("tail", "") + (ev.text or ""))[-600:]   # a concurrent request may have popped it (#212)
+ 
+     def _progress(self, last_print, every=1.0):
+         """A progress line in the server window every `every` seconds while a request runs."""
+-- 
+2.54.0.windows.1
+
