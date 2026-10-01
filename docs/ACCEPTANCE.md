@@ -54,3 +54,12 @@ isolated child / fork (fork child recalls the planted fact; one of three ran out
 same pattern as the pre-refactor run), Japanese t=0 / t=0.7, a fact planted at 1/3 of 39K tokens found 3/3, bench x3:
 identical repeated 11.7K request 0.48-0.56 s prompt time (pre-refactor 1.31-1.36 s), 8K-doc decode 28.9-29.2 tok/s.
 Deployed to local production.
+
+## 2026-10-01 tail resume (patches/strata 0016-0017)
+
+GPU, same settings. New case `tail` (3 reps): turn 1 of an 18.5K-token conversation, then turns 2 and 3 resume from
+the chain at the previous request's end and read 26 tokens each (limit: suffix + 64); a changed middle message
+resumes from the newest checkpoint below the change (read 51) instead of the root. Regression set unchanged and
+passing: root/aux (root-disk after restart, then root 18-20 tokens read), parent/isolated/fork with planted-fact
+recall 3/3, Japanese, needle in 39K 3/3. Bench: identical repeated 11.7K request 0.09 s prompt time (was 0.48-0.56 s),
+8K-doc decode 28.5 tok/s. Deployed to local production.

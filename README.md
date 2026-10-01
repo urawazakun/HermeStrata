@@ -37,6 +37,7 @@ one line is the right trade-off. With 128 GB host RAM and an agent harness, seve
 | Strata | upstream 0.1.29/0.1.30 follow-ups: 0.1.30's `dead`/`block_pos` recurrent state carried through capture/restore/disk (disk schema v3), K8V4 KV explicitly unsupported for saved states, single MTP prefill, mutual exclusion with upstream's opt-in conversation cache | `0009` |
 | Strata + server | **readability refactor** (behaviour-preserving, from a ChatGPT review): cache-protocol client class (`serve/cache_protocol.py`), restore candidate selection as a typed list/result, two-phase disk restore (validate without GPU mutation, then mount), `saved_state` split into RAM store / disk codec / disk store, fix-history labels moved to `docs/CACHE-HISTORY.md`. GPU-accepted and in production | `0010`-`0014` |
 | Strata server | fix a `KeyError` when two requests overlap (upstream 0.1.30 #212 pops the status tail at a request's end while another request is still writing it); found by running an agent and a second client at the same time | `0015` |
+| Strata | **tail resume**: a 40 KiB MTP boundary row on every conversation checkpoint and at each request's end, so a conversation resumes at its end. Live agent runs re-read 5-18K tokens per request before (once 149K after a mid-history edit); GPU acceptance: follow-up turns read only their 26 new tokens, a mutated middle message resumes from the newest checkpoint below it, an identical repeated 11.7K request 0.09 s (was 0.5 s) | `0016`-`0017` |
 | Hermes | fixed prefix discipline: git workspace snapshot moved to the volatile tail (`HERMES_WORKSPACE_LATE=1`), title generated after the turn (`HERMES_TITLE_AFTER_TURN=1`) | `patches/hermes-agent/0001` |
 | Hermes | `delegate_task` **fork mode**: a child starts from the parent's exact prompt (+ its tool call + a tool result carrying the task), so the engine resumes it from the parent's saved state; blocked tools and depth limit are refused at call time instead of being removed from `tools[]` | `patches/hermes-agent/0002` |
 | Hermes | **work deadline** tools (`set_work_deadline` / `finish_work`): "work until 18:00" keeps the agent going until the deadline; run budget stays the ceiling | `patches/hermes-agent/0003` (experimental) |
@@ -75,12 +76,10 @@ Production now runs the 0.1.30-based series (GPU acceptance on V100, same settin
 Later the same day the readability refactor (`0010`-`0014`) passed the same GPU acceptance (root/aux, parent/child/fork with planted-fact recall, Japanese, a fact planted in 39K tokens 3/3) and replaced production. An identical repeated 11.7K request now resumes in 0.48-0.56 s (the 0.1.30 port had 1.3 s); 8K-doc decode 28.9-29.2 tok/s.
 
 
-> **In progress (not in production):** resume a conversation at its end. Today a chain checkpoint is usable only if an MTP boundary row exists at exactly that length, so long agent conversations re-read 5-18K tokens per request (and once 149K tokens after a mid-history edit). The fix keeps a 40 KiB boundary row on every conversation checkpoint and at the end of each request; CPU-validated, GPU acceptance running. See docs/LIVE-HERMES.md (2026-10-01).
-
 ## Layout
 
 ```
-patches/strata/         15 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
+patches/strata/         17 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
 patches/strata-0.1.21/  the earlier 17-patch series on 0.1.21 (history)
 patches/hermes-agent/   git format-patch against the Hermes Agent snapshot used by this project
 docs/                   design, fix history, acceptance ledger

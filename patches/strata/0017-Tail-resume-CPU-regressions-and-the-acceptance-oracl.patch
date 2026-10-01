@@ -1,0 +1,1195 @@
+From fff15c7dc2a7fcaeddd1073d5669ef317ab22539 Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 16:53:45 +0900
+Subject: [PATCH 17/17] Tail resume: CPU regressions and the acceptance oracle
+ (3-turn conversation reads only its suffix; a mutated middle message resumes
+ from the newest checkpoint below it)
+
+---
+ serve/tail_accept_cache.patch | 706 ++++++++++++++++++++++++++++++++++
+ serve/test_tail.py            | 460 ++++++++++++++++++++++
+ 2 files changed, 1166 insertions(+)
+ create mode 100644 serve/tail_accept_cache.patch
+ create mode 100644 serve/test_tail.py
+
+diff --git a/serve/tail_accept_cache.patch b/serve/tail_accept_cache.patch
+new file mode 100644
+index 0000000..4c812e4
+--- /dev/null
++++ b/serve/tail_accept_cache.patch
+@@ -0,0 +1,706 @@
++diff --git a/scripts/accept_cache.py b/scripts/accept_cache.py
++index e525678..e361964 100644
++--- a/scripts/accept_cache.py
+++++ b/scripts/accept_cache.py
++@@ -100,6 +100,8 @@ class Engine:
++             if m := re.search(r"prompt (\d+) tokens = (\d+) reused \+ (\d+) read in (\d+) ms.*?(\d+) generated in (\d+) ms \(([\d.]+) tok/s\)", l):
++                 rec.update(prompt=int(m[1]), reused=int(m[2]), read=int(m[3]), prefill_ms=int(m[4]), gen=int(m[5]), tok_s=float(m[7]))
++         rec["resume_lines"] = [l[:220] for l in lines if "resume" in l or "tip" in l.lower() or "root" in l.lower()][:6]
+++        rec["ckpt_lines"] = [l[:220] for l in lines  # tail: the exact mount marker, wherever it lands
+++                             if re.search(r"resume from chain at \d+ \(checkpoint row\)", l)]
++         msg = resp["choices"][0]["message"]
++         rec["answer"] = (msg.get("content") or "")[:120]
++         print(json.dumps({k: v for k, v in rec.items() if k != "resume_lines"}, ensure_ascii=False), flush=True)
++@@ -198,20 +200,689 @@ def case_needle(eng, rep):
++     return [r]
++ 
++ 
+++# --- tail-resume acceptance (Muse-2, step 2; ADDITIONS only, existing cases untouched) ---
+++# Server API inspection (serve/server.py @5174993): no /tokenize or /render endpoint.
+++# Exposed: GET /props returns the chat_template source; prompts are rendered server-side
+++# via Service.prepare (ChatTemplate.render + tok.encode, openai_to_messages). The oracle
+++# below is therefore faithful-local: same openai_to_messages + same pack template +
+++# same pack tokenizer (tools/strata_tokenizer), CPU-only, no GPU/server. This mirrors
+++# tools/probe_turn_prefix.py. Raw emitted prompt+generated is NEVER concatenated as
+++# history; only actually-sent bodies are rendered, and when the raw previous end is not
+++# a prefix the last stable turn boundary L is used and recorded (method="turn-boundary").
+++# Isolation for tail (chain-only, no tip masking, no disk): --tip-cache-gib 0 and
+++# --no-root-disk, plus --prompt-cache 16, --prompt-cache-root 1024, --prompt-cache-every 4096.
+++TAIL_LO, TAIL_HI, TAIL_TOL = 18000, 22000, 64
+++TAIL_EVERY = 4096
+++TAIL_PREFILL = 2048  # forced in TAIL_ISOLATION; the simulation below assumes exactly this
+++TAIL_SHORT = 64      # forced in TAIL_ISOLATION; segments this short read via windows (no periodic)
+++TAIL_ISOLATION = ["--tip-cache-gib", "0", "--no-root-disk", "--prompt-cache", "16",
+++                  "--prompt-cache-root", "1024", "--prompt-cache-every", "4096",
+++                  "--prefill", "2048", "--short-read", "64"]
+++TAIL_EVERY_TOL = TAIL_EVERY - TAIL_TOL
+++TAIL_ROOT_THRESH = 1024
+++TAIL_U2 = "その1行目をもう少し具体的に。"
+++TAIL_U3 = "了解。まとめて1行で。"
+++TAIL_MUT_PREFIX = "[訂正] "
+++TAIL_SYNTH_A = "了解。"
+++TAIL_SYNTH_U = "続けて。"
+++_TAIL_PREV_P1 = {}  # rep -> previous rep's p1 ids (cross-rep inheritance guard; CPU-only)
+++
+++
+++def tail_body_with(messages, max_tokens=48):
+++    """Tail-only body: consistent reasoning_effort='low' on every tail request so the
+++    pack template renders every turn the same way (existing cases use body_with)."""
+++    b = body_with(messages, max_tokens)
+++    b["reasoning_effort"] = "low"
+++    eb = b.get("extra_body")
+++    if isinstance(eb, dict):
+++        ctk = eb.get("chat_template_kwargs")
+++        if isinstance(ctk, dict):
+++            ctk["reasoning_effort"] = "low"
+++    return b
+++
+++
+++def tail_lcp(a, b):
+++    n, i = (len(a), len(b)), 0
+++    m = n[0] if n[0] < n[1] else n[1]
+++    while i < m and a[i] == b[i]:
+++        i += 1
+++    return i
+++
+++
+++def tail_last_turn(ids, turn_id):
+++    for i in range(len(ids) - 1, -1, -1):
+++        if ids[i] == turn_id:
+++            return i
+++    return None
+++
+++
+++def tail_genuine_root(ids, turn_id, thr=TAIL_ROOT_THRESH):
+++    """Mirror generate.cpp: FIRST turn-token at index>0 and strictly before the last
+++    boundary; accepted as root only if >= thr, else no genuine root (None)."""
+++    last = tail_last_turn(ids, turn_id)
+++    if last is None:
+++        return None
+++    for i in range(1, last):
+++        if ids[i] == turn_id:
+++            return i if i >= thr else None
+++    return None
+++
+++
+++def tail_parse_resume(line):
+++    m = re.search(r"resume from (\S+) at (\d+), suffix (\d+), restore ([\d.]+) ms", line)
+++    if not m:
+++        return None
+++    d = {"resume": m[1], "k": int(m[2]), "suffix": int(m[3]), "restore_ms": float(m[4])}
+++    if s := re.search(r"snapshot ([\d.]+) ms", line):
+++        d["snapshot_ms"] = float(s[1])
+++    return d
+++
+++
+++def tail_parse_prompt(line):
+++    m = re.search(r"prompt (\d+) tokens = (\d+) reused \+ (\d+) read in (\d+) ms.*?(\d+) generated in (\d+) ms \(([\d.]+) tok/s\)", line)
+++    if not m:
+++        return None
+++    return {"prompt": int(m[1]), "reused": int(m[2]), "read": int(m[3]), "prefill_ms": int(m[4]),
+++            "gen": int(m[5]), "tok_s": float(m[7])}
+++
+++
+++def tail_prefix_ok(n, lo=TAIL_LO, hi=TAIL_HI):
+++    return isinstance(n, int) and lo <= n <= hi
+++
+++
+++def tail_find_sections(measure, lo=TAIL_LO, hi=TAIL_HI, lo_n=50, hi_n=1200):
+++    """Adaptive/binary search on monotonic measure(n_sec)->size for size in [lo, hi].
+++    measure: callable(n_sec)->int (CPU-only renders). Bounded (~14 calls). Returns
+++    (n_sec, size, note) with note 'ok' or a setup-failure reason (never send GPU then)."""
+++    try:
+++        f_lo, f_hi = measure(lo_n), measure(hi_n)
+++    except Exception as e:
+++        return (lo_n, -1, f"measure failed: {e}")
+++    for v in (f_lo, f_hi):
+++        if not tail_is_int(v) or v < 0:
+++            return (lo_n, v, f"measure returned bad size {v!r}")
+++    if f_lo > hi:
+++        return (lo_n, f_lo, f"even minimum n={lo_n} gives {f_lo} above HI {hi}")
+++    if f_hi < lo:
+++        return (hi_n, f_hi, f"even maximum n={hi_n} gives {f_hi} below LO {lo}")
+++    if lo <= f_lo <= hi:
+++        return (lo_n, f_lo, "ok")
+++    if lo <= f_hi <= hi:
+++        return (hi_n, f_hi, "ok")
+++    a, fa, b = lo_n, f_lo, hi_n  # invariant: f(a) < lo, f(b) > hi
+++    for _ in range(12):
+++        m = (a + b) // 2
+++        if m <= a or m >= b:
+++            break
+++        try:
+++            fm = measure(m)
+++        except Exception as e:
+++            return (m, -1, f"measure failed at n={m}: {e}")
+++        if not tail_is_int(fm) or fm < 0:
+++            return (m, fm, f"measure returned bad size {fm!r} at n={m}")
+++        if lo <= fm <= hi:
+++            return (m, fm, "ok")
+++        if fm < lo:
+++            a, fa = m, fm
+++        else:
+++            b = m
+++    return (a, fa, f"no n in [{lo_n},{hi_n}] lands {fa} in [{lo},{hi}] after search")
+++
+++
+++def tail_expected_reuse(prev_ids, cur_ids, turn_id):
+++    """Independent expectation from faithful ids. Never uses rec['suffix'] (tautology).
+++    L is the LCP length (NOT the boundary itself); boundary is reported separately and
+++    must satisfy boundary <= LCP (checked via 'consistent')."""
+++    l = tail_lcp(prev_ids, cur_ids)
+++    b = tail_last_turn(prev_ids, turn_id)
+++    base = {"L": l, "suffix": len(cur_ids) - l, "boundary": b, "lcp": l,
+++            "prev_len": len(prev_ids), "cur_len": len(cur_ids)}
+++    if b is None:
+++        return {**base, "method": "lcp-no-boundary", "consistent": True}
+++    if prev_ids == cur_ids[:len(prev_ids)]:
+++        return {**base, "method": "raw-prefix", "consistent": bool(b <= l)}
+++    return {**base, "method": "turn-boundary", "consistent": bool(b <= l)}
+++
+++
+++def tail_is_int(x):
+++    return isinstance(x, int) and not isinstance(x, bool)
+++
+++
+++def tail_check_counts(rec, ids_len):
+++    """Engine metrics vs independent len(ids): prompt==len(ids), reused==k, read==prompt-reused.
+++    Rejects negative/non-int/inconsistent values (never silent pass)."""
+++    for k in ("prompt", "reused", "read", "k"):
+++        v = rec.get(k)
+++        if not tail_is_int(v) or v < 0:
+++            return False, f"bad metric {k}={v!r} (need non-negative int)"
+++    if rec["prompt"] != ids_len:
+++        return False, f"prompt={rec['prompt']} != independent len(ids)={ids_len} (wrong tokenizer/template?)"
+++    if rec["read"] != rec["prompt"] - rec["reused"]:
+++        return False, f"read={rec['read']} != prompt-reused={rec['prompt'] - rec['reused']}"
+++    if rec["reused"] != rec["k"]:
+++        return False, f"reused={rec['reused']} != k={rec['k']}"
+++    return True, "counts consistent"
+++
+++
+++def tail_row_text(rec):
+++    return (rec.get("ckpt_lines") or []) + (rec.get("resume_lines") or [])
+++
+++
+++def tail_exact_row(lines, k):
+++    """Exact successful-mount marker `resume from chain at K (checkpoint row)` with K == rec['k'].
+++    A generic 'checkpoint' substring is insufficient."""
+++    if not tail_is_int(k) or k < 0:
+++        return False
+++    pat = re.compile(r"resume from chain at (\d+) \(checkpoint row\)")
+++    for l in (lines or []):
+++        m = pat.search(l or "")
+++        if m and int(m[1]) == k:
+++            return True
+++    return False
+++
+++
+++def tail_check_turn(rec, exp_L, exp_suffix, ids_len, exp_boundary=None, tol=TAIL_TOL):
+++    """Strict tail-turn gate. Missing/bad metrics/logs fail (never silent pass)."""
+++    for k in ("prompt", "read", "resume", "k", "resume_lines"):
+++        if rec.get(k) is None:
+++            return False, f"missing metric/log: {k}"
+++    ok, why = tail_check_counts(rec, ids_len)
+++    if not ok:
+++        return False, why
+++    if exp_boundary is not None and not (tail_is_int(exp_boundary) and tail_is_int(exp_L) and exp_boundary <= exp_L):
+++        return False, f"inconsistent expectation: boundary={exp_boundary} > LCP L={exp_L}"
+++    if rec.get("resume") != "chain":
+++        return False, f"expected chain resume, got {rec.get('resume')!r} (tip would mask failure)"
+++    if not tail_exact_row(tail_row_text(rec), rec.get("k")):
+++        return False, "missing/mismatched exact marker `resume from chain at K (checkpoint row)` with K==k"
+++    k = rec["k"]
+++    if not (exp_L - tol <= k <= exp_L):
+++        return False, f"k={k} not near expected L={exp_L} (+-{tol})"
+++    if rec["read"] > exp_suffix + tol:
+++        return False, f"read={rec['read']} > independent suffix={exp_suffix}+{tol}"
+++    return True, "chain at L, read within suffix+tol"
+++
+++
+++def tail_check_mutated(rec, K_exp, root, change_pos, ids_len, tol=0):
+++    """Mutated middle-message gate: k must be the newest checkpoint below the change, above root."""
+++    for k in ("prompt", "read", "resume", "k", "resume_lines"):
+++        if rec.get(k) is None:
+++            return False, f"missing metric/log: {k}"
+++    ok, why = tail_check_counts(rec, ids_len)
+++    if not ok:
+++        return False, why
+++    if root is None or K_exp is None or change_pos is None:
+++        return False, "missing independent expectation (root/K_exp/change_pos)"
+++    if not all(tail_is_int(v) and v >= 0 for v in (K_exp, root, change_pos)):
+++        return False, f"bad expectation K_exp={K_exp!r} root={root!r} change={change_pos!r}"
+++    if not (K_exp > root):
+++        return False, f"K_exp={K_exp} not greater than root={root}"
+++    if not (K_exp < change_pos):
+++        return False, f"K_exp={K_exp} not below change={change_pos}"
+++    if rec.get("resume") != "chain":
+++        return False, f"expected chain resume, got {rec.get('resume')!r}"
+++    k = rec["k"]
+++    if not tail_exact_row(tail_row_text(rec), k):
+++        return False, "missing/mismatched exact marker `resume from chain at K (checkpoint row)` with K==k"
+++    if k == root:
+++        return False, f"k={k} is the old root, not the newest checkpoint below the change"
+++    if abs(k - K_exp) > tol:
+++        if k < K_exp:
+++            return False, f"k={k} older than newest K_exp={K_exp} below the change"
+++        return False, f"k={k} != K_exp={K_exp} (at/above the change)"
+++    if rec["read"] != rec["prompt"] - K_exp:
+++        return False, f"read={rec['read']} != prompt-K_exp={rec['prompt'] - K_exp}"
+++    return True, f"chain at newest checkpoint {K_exp} below the change, above root {root}"
+++
+++
+++def tail_mutate_early(text):
+++    """Distinct change at the very beginning of the assistant content (earliest divergence)."""
+++    return TAIL_MUT_PREFIX + (text or "")
+++
+++
+++def tail_simulate(n, resume, root_at, turn_at, every=TAIL_EVERY, chunk=TAIL_PREFILL, short=TAIL_SHORT):
+++    """CPU simulation of one request's chain checkpoints (single GPU, no images, no
+++    STRATA_CKPT_REREAD), matching generate.cpp: segments {root_at, turn_at, n-1} past
+++    `resume` (pp_next = resume+every); a segment of length<=short reads via windows (no
+++    periodic); otherwise on_chunk dones step chunk from the segment start and each first
+++    done>=pp_next records done with pp_next=done+every (drift accumulates, exactly as the
+++    engine does); root_at/turn_at record at their segment ends. Returns sorted positions."""
+++    pts, pp, at = set(), resume + every, resume
+++    for to in (root_at, turn_at, n - 1):
+++        if to is None or not tail_is_int(to) or to <= at:
+++            continue
+++        if to - at > short:
+++            d = at + chunk
+++            while True:
+++                done = d if d < to else to
+++                if done >= pp:
+++                    pts.add(done)
+++                    pp = done + every
+++                if done == to:
+++                    break
+++                d += chunk
+++        if to == root_at or to == turn_at:
+++            pts.add(to)
+++        at = to
+++    return sorted(pts)
+++
+++
+++def tail_matching(cands, ids_a, ids_b):
+++    """Candidate positions (prefixes of ids_a) that match ids_b: c <= LCP. Max is the
+++    engine's longest matching checkpoint."""
+++    l = tail_lcp(ids_a, ids_b)
+++    return sorted(c for c in cands if tail_is_int(c) and 0 < c <= l)
+++
+++
+++def tail_mutated_proof(p1, p2, p3, p4, turn_id, root, k1, k2, k3,
+++                       every=TAIL_EVERY, chunk=TAIL_PREFILL, short=TAIL_SHORT, cap=16):
+++    """Independently prove K_exp is the newest checkpoint below the change (Sol design:
+++    middle assistant mutated near content start). Derives every request's chain
+++    candidates with tail_simulate (no fixed due grid, no invented root), prunes past
+++    each actual resume exactly like generate.cpp, and takes the maximum actually
+++    matching length <= lcp. Returns dict(ok, reason, K_exp, ...); caller fails setup
+++    unless ok. No-eviction is shown with CONSERVATIVE upper bounds for all three
+++    requests (exact identity sets never gain invented positions): inherited
+++    below-root checkpoints when resuming root (at most floor(root/every)+1) plus 1/2/3
+++    reserved omitted request-end positions for C1/C2/C3; any bound reaching cap fails."""
+++    out = {"ok": False}
+++    n1, n2, n3 = len(p1), len(p2), len(p3)
+++    G1 = tail_last_turn(p1, turn_id)
+++    if G1 is None or not (0 < G1 < n1):
+++        return {**out, "reason": f"P1 has no interior last turn (G1={G1}, n1={n1})"}
+++    if root is None or not (tail_is_int(root) and 0 < root < G1):
+++        return {**out, "reason": f"no genuine root below G1 ({root!r})"}
+++    if k1 not in (0, root):
+++        return {**out, "reason": f"unexpected T1 resume k1={k1} (fresh marker admits only 0/root)"}
+++    if p3[G1] != turn_id or tail_lcp(p1, p3) <= G1:
+++        return {**out, "reason": f"G1={G1} is not a shared turn boundary of p1/p3"}
+++    l14 = tail_lcp(p1, p4)
+++    if not (l14 < n1):  # initial tail excluded: any request-end tail holds the FULL prompt
+++        return {**out, "reason": f"lcp(p1,p4)={l14} covers all of P1 (n1={n1}): tail unexcluded"}
+++    if not (G1 < l14):
+++        return {**out, "reason": f"change must start after the turn (G1={G1}, l14={l14})"}
+++    C1 = tail_simulate(n1, k1, root if k1 == 0 else -1, G1, every, chunk, short)
+++    if G1 not in C1:
+++        return {**out, "reason": f"L1 {G1} not in T1 candidates {C1}"}
+++    inh = (root // every + 1) if k1 == root else 0  # overcount is fine; never inserted
+++    b1 = len(C1) + inh + 1
+++    if not (b1 < cap):
+++        return {**out, "reason": f"T1 conservative count {b1} (exact {len(C1)}+inh {inh}+1) >= cap {cap}",
+++                "bounds": {"b1": b1, "inh": inh}}
+++    l12 = tail_lcp(p1, p2)
+++    m1 = tail_matching(C1, p1, p2)
+++    if not m1:
+++        return {**out, "reason": "nothing of T1 matches P2"}
+++    K2, L2 = max(m1), tail_last_turn(p2, turn_id)
+++    if L2 is None or not (0 < L2 < n2) or p3[L2] != turn_id or tail_lcp(p2, p3) < L2:
+++        return {**out, "reason": f"L2={L2} is not a shared turn boundary of p2/p3"}
+++    if not (n2 - k2 < every):
+++        return {**out, "reason": f"T2 suffix from actual k2 {n2 - k2} >= every {every}"}
+++    C2 = sorted({c for c in C1 if c <= k2 and c <= l12} | set(tail_simulate(n2, k2, -1, L2, every, chunk, short)))
+++    b2 = len(C2) + inh + 2
+++    if not (b2 < cap):
+++        return {**out, "reason": f"T2 conservative count {b2} (exact {len(C2)}+inh {inh}+2) >= cap {cap}",
+++                "bounds": {"b1": b1, "b2": b2, "inh": inh}}
+++    l23 = tail_lcp(p2, p3)
+++    m2 = tail_matching(C2, p2, p3)
+++    if not m2:
+++        return {**out, "reason": "nothing matches P3"}
+++    K3, L3 = max(m2), tail_last_turn(p3, turn_id)
+++    if L3 is None or not (L2 < L3 < len(p3)):
+++        return {**out, "reason": f"need later generation turn L3={L3} past L2={L2}"}
+++    if not (n3 - k3 < every):
+++        return {**out, "reason": f"T3 suffix from actual k3 {n3 - k3} >= every {every}"}
+++    C3 = sorted({c for c in C2 if c <= k3 and c <= l23} | set(tail_simulate(n3, k3, -1, L3, every, chunk, short)))
+++    b3 = len(C3) + inh + 3
+++    if not (b3 < cap):
+++        return {**out, "reason": f"T3 conservative count {b3} (exact {len(C3)}+inh {inh}+3) >= cap {cap}",
+++                "bounds": {"b1": b1, "b2": b2, "b3": b3, "inh": inh}}
+++    change = tail_lcp(p3, p4)
+++    if not (G1 < change < L2):
+++        return {**out, "reason": f"need G1={G1} < change={change} < L2={L2}"}
+++    m3 = tail_matching(C3, p3, p4)
+++    if not m3:
+++        return {**out, "reason": "nothing matches the mutated prompt"}
+++    K4 = max(m3)
+++    if not (K4 > root):
+++        return {**out, "reason": f"K_exp={K4} not greater than root={root}"}
+++    if K4 != G1:
+++        return {**out, "reason": f"newest matching {K4} != L1 {G1}: premise broken for this prefix"}
+++    return {**out, "ok": True, "reason": "candidate set proven: newest below change is L1",
+++            "L1": G1, "L2": L2, "L3": L3, "change": change, "K_exp": K4, "K2": K2, "K3": K3,
+++            "n1": n1, "every": every, "C1": C1,
+++            "bounds": {"b1": b1, "b2": b2, "b3": b3, "inh": inh}}
+++
+++
+++def tail_render_ids(body, template, tok):
+++    """Faithful ids for an actually-sent body (mirrors Service.prepare without vision)."""
+++    import sys as _sys
+++    saved = list(_sys.path)
+++    try:
+++        # Callers in tests inject template/tok and a pre-normalized body; here body is the
+++        # OpenAI dict, so normalize with the serving frontend available to this source tree.
+++        for cand in (str(SRC_ACCEPT), str(SRC_ACCEPT / "tools")):
+++            if cand not in _sys.path:
+++                _sys.path.insert(0, cand)
+++        from serve.frontend import openai_to_messages as _o2m
+++        messages, tools, kw = _o2m(body)
+++    finally:
+++        _sys.path[:] = saved
+++    prompt = template.render(messages, tools=tools, **kw)
+++    return tok.encode(prompt, parse_special=True), messages, tools, kw
+++
+++
+++def tail_load_faithful():
+++    """CPU-only load of the pack tokenizer + template the server uses. No GPU/server."""
+++    import sys as _sys
+++    detail = {}
+++    try:
+++        cfg = json.loads(PROD_CFG.read_text(encoding="utf-8-sig"))
+++        tdir = Path(cfg.get("tokenizer") or "")
+++    except Exception as e:
+++        return {"ok": False, "reason": f"prod cfg tokenizer unreadable: {e}"}
+++    if not tdir.is_dir():
+++        tdir = ROOT / "strata-work" / "pack-qwen-iq3_s" / "tokenizer"
+++    detail["tokenizer_dir"] = str(tdir)
+++    try:
+++        saved = list(_sys.path)
+++        for cand in (str(SRC_ACCEPT), str(SRC_ACCEPT / "tools")):
+++            if cand not in _sys.path:
+++                _sys.path.insert(0, cand)
+++        from serve.frontend import ChatTemplate as _CT
+++        import strata_tokenizer as _ST
+++        vocab = json.loads((tdir / "vocab.json").read_text(encoding="utf-8"))
+++        tokens = [None] * len(vocab)
+++        for t, i in vocab.items():
+++            tokens[i] = t
+++        merges = (tdir / "merges.txt").read_text(encoding="utf-8").split("\n")
+++        types = json.loads((tdir / "token_type.json").read_text(encoding="utf-8"))
+++        tok = _ST.Tokenizer(tokens, merges, types)
+++        tpath = tdir / "chat_template.jinja"
+++        if not tpath.exists():
+++            tpath = SRC_ACCEPT / "serve" / "chat_template.jinja"
+++        template = _CT(tpath)
+++        enc = tok.encode("<|im_start|>", parse_special=True)
+++        if len(enc) != 1:  # never guess: the oracle needs the exact single turn token
+++            return {"ok": False, "reason": f"<|im_start|> is not one token: {enc}", "detail": detail}
+++        detail.update(template=str(tpath), vocab=len(tokens), turn_id=enc[0])
+++        return {"ok": True, "tok": tok, "template": template, "turn_id": enc[0], "detail": detail}
+++    except Exception as e:
+++        return {"ok": False, "reason": f"faithful load failed: {e}", "detail": detail}
+++    finally:
+++        try:
+++            _sys.path[:] = saved
+++        except Exception:
+++            pass
+++
+++
+++def tail_build_long_user(rep, marker, n_sections=750):
+++    import random
+++    rnd = random.Random(1000 + rep)
+++    filler = [f"第{i}節。倉庫の在庫記録によると、区画{rnd.randint(1, 999)}の箱は{rnd.randint(1, 99)}個で、点検は{rnd.randint(1, 28)}日に行われた。"
+++              for i in range(n_sections)]
+++    head = f"（合言葉: TAILMARKER-{rep}-{marker}号。覚えておいて）ローグライクの食料システムについて、設計上の注意点を2行で。\n"
+++    return head + "\n".join(filler) + "\n\n上記文書を踏まえ、要点を2行で答えて。"
+++
+++
+++def case_tail(eng, rep):
+++    import time as _time
+++    out = []
+++    faithful = tail_load_faithful()
+++    if not faithful.get("ok"):
+++        r = {"tag": f"tail.r{rep}.faithful", "pass": False,
+++             "expect": "faithful pack tokenizer+template required for independent LCP",
+++             "reason": faithful.get("reason", "faithful unavailable")}
+++        print(json.dumps(r, ensure_ascii=False), flush=True)
+++        return [r]
+++    tok, template, turn_id = faithful["tok"], faithful["template"], faithful["turn_id"]
+++    tok_detail = dict(faithful.get("detail") or {})
+++    tok_detail["chunk"] = TAIL_PREFILL  # forced via TAIL_ISOLATION; simulation assumes it
+++    tok_detail["short"] = TAIL_SHORT
+++    marker = f"{rep}-{_time.time_ns() % 1000000:06d}"
+++
+++    def render(body):
+++        ids, _, _, _ = tail_render_ids(body, template, tok)
+++        return ids
+++
+++    def fail(rec):
+++        print(json.dumps({k: v for k, v in rec.items() if k not in ("resume_lines", "ckpt_lines")}, ensure_ascii=False), flush=True)
+++        return [rec]
+++
+++    def p1_at(n):
+++        u = tail_build_long_user(rep, marker, n)
+++        b = tail_body_with([{"role": "user", "content": u}], 48)
+++        return b, render(b)
+++
+++    def synth_proof(b, ids):
+++        """Full candidate-set proof on synthetic follow-ups (no engine answers needed:
+++        header geometry is content-independent). Assumes healthy resumes."""
+++        rt = tail_genuine_root(ids, turn_id, TAIL_ROOT_THRESH)
+++        L1t = tail_last_turn(ids, turn_id)
+++        if rt is None or L1t is None or not (rt < L1t):
+++            return None, f"bad boundaries root={rt} L1={L1t}"
+++        u = tail_build_long_user(rep, marker, n_sec)
+++        aS = {"role": "assistant", "content": TAIL_SYNTH_A}
+++        p2s = render(tail_body_with([{"role": "user", "content": u}, aS,
+++                                     {"role": "user", "content": TAIL_SYNTH_U}], 48))
+++        a2S = {"role": "assistant", "content": TAIL_SYNTH_A}
+++        p3s = render(tail_body_with([{"role": "user", "content": u}, aS,
+++                                     {"role": "user", "content": TAIL_SYNTH_U}, a2S,
+++                                     {"role": "user", "content": TAIL_U3}], 48))
+++        aSm = {"role": "assistant", "content": tail_mutate_early(TAIL_SYNTH_A)}
+++        p4s = render(tail_body_with([{"role": "user", "content": u}, aSm,
+++                                     {"role": "user", "content": TAIL_SYNTH_U}, a2S,
+++                                     {"role": "user", "content": TAIL_U3}], 48))
+++        k1a = 0 if (rep == 0 and not _TAIL_PREV_P1) else rt
+++        C1s = tail_simulate(len(ids), k1a, rt if k1a == 0 else -1, L1t)
+++        m1s = tail_matching(C1s, ids, p2s)
+++        if not m1s:
+++            return None, "synth: nothing of T1 matches P2"
+++        k2a = max(m1s)
+++        L2s = tail_last_turn(p2s, turn_id)
+++        if L2s is None:
+++            return None, "synth: P2 has no last turn"
+++        C2s = sorted({c for c in C1s if c <= k2a and c <= tail_lcp(ids, p2s)} |
+++                      set(tail_simulate(len(p2s), k2a, -1, L2s)))
+++        m2s = tail_matching(C2s, p2s, p3s)
+++        if not m2s:
+++            return None, "synth: nothing matches P3"
+++        k3a = max(m2s)
+++        return tail_mutated_proof(ids, p2s, p3s, p4s, turn_id, rt, k1a, k2a, k3a), None
+++
+++    # Size the long prefix via faithful ids (CPU-only; no server yet): adaptive/binary
+++    # search on the monotonic section count, then bounded synth-proof fine adjustment
+++    # (a stray sim periodic inside the ~dozens-wide match window is positional and rare;
+++    # stepping the section count moves the window far away).
+++    n_sec, p1_body, p1_ids = 750, None, None
+++    n_sec, size, note = tail_find_sections(lambda n: len(p1_at(n)[1]))
+++    setup_note = "" if note == "ok" else note
+++    if note == "ok":
+++        for _ in range(4):
+++            b, ids = p1_at(n_sec)
+++            if not (TAIL_LO <= len(ids) <= TAIL_HI):
+++                setup_note = f"re-measure {len(ids)} outside {TAIL_LO}..{TAIL_HI}"
+++                break
+++            pr, perr = synth_proof(b, ids)
+++            if perr is not None:
+++                setup_note = perr
+++                n_sec = max(50, n_sec - 40)
+++                continue
+++            if not pr.get("ok"):
+++                setup_note = "synth proof: " + str(pr.get("reason"))
+++                n_sec = max(50, n_sec - 40)
+++                continue
+++            p1_body, p1_ids = b, ids
+++            setup_note = ""
+++            break
+++    if p1_body is None or not (TAIL_LO <= len(render(p1_body)) <= TAIL_HI):
+++        # Fail BEFORE any GPU request: wrong tokenizer/template/sizing must not burn server time.
+++        p1_body = tail_body_with([{"role": "user", "content": tail_build_long_user(rep, marker, n_sec)}], 48)
+++        p1_ids = render(p1_body)
+++        return fail({"tag": f"tail.r{rep}.T1.setup", "pass": False, "marker": marker, "n_sections": n_sec,
+++                         "prompt_ids": len(p1_ids), "tok_detail": tok_detail, "isolation": TAIL_ISOLATION,
+++                         "expect": f"faithful prefix {TAIL_LO}..{TAIL_HI} tokens before any GPU request",
+++                         "reason": setup_note or f"faithful size {len(p1_ids)} outside {TAIL_LO}..{TAIL_HI}"})
+++    L1_boundary = tail_last_turn(p1_ids, turn_id)
+++    root_est = tail_genuine_root(p1_ids, turn_id, TAIL_ROOT_THRESH)
+++    if root_est is None:
+++        return fail({"tag": f"tail.r{rep}.T1.setup", "pass": False, "marker": marker, "prompt_ids": len(p1_ids),
+++                         "tok_detail": tok_detail, "reason": "no genuine root (first turn after 0, >=threshold, before last boundary)"})
+++    if L1_boundary is None or not (root_est < L1_boundary):
+++        return fail({"tag": f"tail.r{rep}.T1.setup", "pass": False, "marker": marker, "prompt_ids": len(p1_ids),
+++                         "tok_detail": tok_detail, "reason": f"bad boundaries root={root_est} L1={L1_boundary}"})
+++    # Cross-rep guard: the unique head marker must precede every near-tail checkpoint, so this
+++    # rep cannot inherit a previous rep's long-prefix cache. Earlier reps diverge at the head.
+++    cross = None
+++    for pr, pp in _TAIL_PREV_P1.items():
+++        xc = tail_lcp(pp, p1_ids)
+++        cross = xc if cross is None or xc > cross else cross
+++        if xc >= L1_boundary:
+++            return fail({"tag": f"tail.r{rep}.T1.setup", "pass": False, "marker": marker,
+++                             "reason": f"cross-rep LCP {xc} >= L1 {L1_boundary}: marker not unique/early"})
+++    _TAIL_PREV_P1[rep] = list(p1_ids)
+++
+++    r1, m1 = eng.req(p1_body, f"tail.r{rep}.T1")
+++    r1.update(tag=f"tail.r{rep}.T1", marker=marker, n_sections=n_sec, cross_rep_lcp=cross,
+++              prompt_ids=len(p1_ids), L1_boundary=L1_boundary, root_est=root_est,
+++              isolation=TAIL_ISOLATION, turn_id=turn_id, tok_detail=tok_detail,
+++              expect=f"prefix {TAIL_LO}..{TAIL_HI} tokens (engine prompt==len(ids))")
+++    r1["prefix_ok"] = tail_prefix_ok(r1.get("prompt"))
+++    okc, whyc = tail_check_counts(r1, len(p1_ids))
+++    k1ok = r1.get("k") in (0, root_est)
+++    r1["pass"] = bool(r1["prefix_ok"] and okc and k1ok)
+++    if not r1["pass"]:
+++        r1["reason"] = (f"prompt={r1.get('prompt')} outside {TAIL_LO}..{TAIL_HI}" if not r1["prefix_ok"]
+++                        else whyc if not okc else f"k1={r1.get('k')} not in (0, root {root_est})")
+++    print(json.dumps({k: v for k, v in r1.items() if k not in ("resume_lines", "ckpt_lines")}, ensure_ascii=False), flush=True)
+++    out.append(r1)
+++    if not r1["pass"]:
+++        return out
+++    a1 = assistant_of(m1)
+++
+++    # T2: same long prefix + assistant + small follow-up; must resume at L1 (turn-boundary).
+++    b2 = tail_body_with([{"role": "user", "content": tail_build_long_user(rep, marker, n_sec)}, a1,
+++                    {"role": "user", "content": TAIL_U2}], 48)
+++    p2_ids = render(b2)
+++    if not (len(p2_ids) - L1_boundary < TAIL_EVERY - TAIL_TOL):
+++        r2s = {"tag": f"tail.r{rep}.T2.setup", "pass": False, "prompt_ids": len(p2_ids),
+++               "reason": f"T2 suffix {len(p2_ids) - L1_boundary} >= every-tol: periodic in T2 unexcluded"}
+++        print(json.dumps(r2s, ensure_ascii=False), flush=True)
+++        out.append(r2s)
+++        return out
+++    exp2 = tail_expected_reuse(p1_ids, p2_ids, turn_id)
+++    if not exp2.get("consistent"):
+++        r2s = {"tag": f"tail.r{rep}.T2.setup", "pass": False, "prompt_ids": len(p2_ids),
+++               "reason": f"inconsistent expectation boundary={exp2['boundary']} > LCP L={exp2['L']}"}
+++        print(json.dumps(r2s, ensure_ascii=False), flush=True)
+++        out.append(r2s)
+++        return out
+++    r2, m2 = eng.req(b2, f"tail.r{rep}.T2")
+++    ok2, why2 = tail_check_turn(r2, exp2["L"], exp2["suffix"], len(p2_ids), exp2["boundary"])
+++    r2.update(tag=f"tail.r{rep}.T2", exp_L=exp2["L"], exp_suffix=exp2["suffix"], method=exp2["method"],
+++              boundary=exp2["boundary"], lcp=exp2["lcp"], prompt_ids=len(p2_ids),
+++              expect=f"resume chain near L={exp2['L']} ({exp2['method']}), read<=suffix+{TAIL_TOL}")
+++    r2["pass"], r2["reason"] = bool(ok2), why2
+++    print(json.dumps({k: v for k, v in r2.items() if k not in ("resume_lines", "ckpt_lines")}, ensure_ascii=False), flush=True)
+++    out.append(r2)
+++    if not r2["pass"]:
+++        return out
+++    a2 = assistant_of(m2)
+++
+++    # T3: append again; must resume at L2 (P2's last turn boundary).
+++    b3 = tail_body_with([{"role": "user", "content": tail_build_long_user(rep, marker, n_sec)}, a1,
+++                    {"role": "user", "content": TAIL_U2}, a2, {"role": "user", "content": TAIL_U3}], 48)
+++    p3_ids = render(b3)
+++    L2 = tail_last_turn(p2_ids, turn_id)
+++    if L2 is None or not (len(p3_ids) - L2 < TAIL_EVERY - TAIL_TOL):
+++        r3s = {"tag": f"tail.r{rep}.T3.setup", "pass": False, "prompt_ids": len(p3_ids),
+++               "reason": f"T3 suffix vs L2={L2} not shorter than every-tol: periodic in T3 unexcluded"}
+++        print(json.dumps(r3s, ensure_ascii=False), flush=True)
+++        out.append(r3s)
+++        return out
+++    exp3 = tail_expected_reuse(p2_ids, p3_ids, turn_id)
+++    if not exp3.get("consistent"):
+++        r3s = {"tag": f"tail.r{rep}.T3.setup", "pass": False, "prompt_ids": len(p3_ids),
+++               "reason": f"inconsistent expectation boundary={exp3['boundary']} > LCP L={exp3['L']}"}
+++        print(json.dumps(r3s, ensure_ascii=False), flush=True)
+++        out.append(r3s)
+++        return out
+++    r3, m3 = eng.req(b3, f"tail.r{rep}.T3")
+++    ok3, why3 = tail_check_turn(r3, exp3["L"], exp3["suffix"], len(p3_ids), exp3["boundary"])
+++    r3.update(tag=f"tail.r{rep}.T3", exp_L=exp3["L"], exp_suffix=exp3["suffix"], method=exp3["method"],
+++              boundary=exp3["boundary"], lcp=exp3["lcp"], L2=L2, prompt_ids=len(p3_ids),
+++              expect=f"resume chain near L={exp3['L']} ({exp3['method']}), read<=suffix+{TAIL_TOL}")
+++    r3["pass"], r3["reason"] = bool(ok3), why3
+++    print(json.dumps({k: v for k, v in r3.items() if k not in ("resume_lines", "ckpt_lines")}, ensure_ascii=False), flush=True)
+++    out.append(r3)
+++    if not r3["pass"]:
+++        return out
+++
+++    # M4 mutated (Sol design): mutate the middle ASSISTANT a1 near the start of its content.
+++    # L1 is the start of that assistant history turn; T2/T3 end/boundary checkpoints and the
+++    # initial request tail are all beyond the early change, so the newest match must be L1.
+++    a1m = dict(a1)
+++    a1m["content"] = tail_mutate_early(a1.get("content") or "")
+++    b4 = tail_body_with([{"role": "user", "content": tail_build_long_user(rep, marker, n_sec)}, a1m,
+++                    {"role": "user", "content": TAIL_U2}, a2, {"role": "user", "content": TAIL_U3}], 48)
+++    p4_ids = render(b4)
+++    proof = tail_mutated_proof(p1_ids, p2_ids, p3_ids, p4_ids, turn_id, root_est,
+++                               r1["k"], r2["k"], r3["k"])
+++    if not proof.get("ok"):
+++        r4s = {"tag": f"tail.r{rep}.M4mut.setup", "pass": False, "prompt_ids": len(p4_ids),
+++               "proof": {k: v for k, v in proof.items() if k != "ok"},
+++               "expect": "prove K_exp=L1 is the newest checkpoint below the change before any GPU request",
+++               "reason": f"setup unproven: {proof.get('reason')}"}
+++        print(json.dumps(r4s, ensure_ascii=False), flush=True)
+++        out.append(r4s)
+++        return out
+++    K_exp = proof["K_exp"]
+++    r4, _ = eng.req(b4, f"tail.r{rep}.M4mut")
+++    ok4, why4 = tail_check_mutated(r4, K_exp, root_est, proof["change"], len(p4_ids))
+++    r4.update(tag=f"tail.r{rep}.M4mut", K_exp=K_exp, root=root_est, change_pos=proof["change"],
+++              L1=proof["L1"], L2=proof["L2"], lcp_p1p4=tail_lcp(p1_ids, p4_ids), n1=proof["n1"],
+++              every=proof["every"], bounds=proof.get("bounds"), prompt_ids=len(p4_ids), mutation="assistant-a1-early",
+++              expect=f"resume chain at newest checkpoint below change: K_exp=L1={K_exp} above root={root_est}")
+++    r4["pass"], r4["reason"] = bool(ok4), why4
+++    print(json.dumps({k: v for k, v in r4.items() if k not in ("resume_lines", "ckpt_lines")}, ensure_ascii=False), flush=True)
+++    out.append(r4)
+++    return out
+++
+++
++ def main():
++     ap = argparse.ArgumentParser()
++-    ap.add_argument("what", choices=["c1", "c3", "ja", "needle", "serve", "stop"])
+++    ap.add_argument("what", choices=["c1", "c3", "ja", "needle", "tail", "serve", "stop"])
++     ap.add_argument("--variant", default="cached", choices=["cold", "cached", "prod"])
++     ap.add_argument("--extra", default="")
++     ap.add_argument("--reps", type=int, default=3)
++     a = ap.parse_args()
++     if a.what == "stop":
++         return stop()
++-    log = start(a.variant, a.extra.split())
+++    extra = a.extra.split()
+++    if a.what == "tail":
+++        if a.variant != "cached":  # prod runs the old binary, cold disables the chain: neither tests this branch
+++            sys.exit("tail requires --variant cached")
+++        if a.reps < 1:  # zero tests must not pass
+++            sys.exit("tail needs --reps >= 1")
+++        extra = extra + list(TAIL_ISOLATION)  # complete list last so its options win
+++    log = start(a.variant, extra)
++     if a.what == "serve":
++         return
++     eng = Engine(log)
++-    fn = {"c1": case1, "c3": case3, "ja": case_ja, "needle": case_needle}[a.what]
+++    fn = {"c1": case1, "c3": case3, "ja": case_ja, "needle": case_needle, "tail": case_tail}[a.what]
+++    if a.what == "tail":
+++        try:  # setup/render errors still stop the isolated server and exit nonzero
+++            res = []
+++            for rep in range(a.reps):
+++                res += fn(eng, rep)
+++        finally:
+++            stop()
+++        with open(OUT / f"{a.what}-{a.variant}.jsonl", "a", encoding="utf-8") as f:
+++            for r in res:
+++                f.write(json.dumps(dict(r, variant=a.variant, t=time.strftime("%H:%M:%S")), ensure_ascii=False) + "\n")
+++        if any(not r.get("pass") for r in res):
+++            sys.exit(1)
+++        return
++     res = []
++     for rep in range(a.reps):
++         res += fn(eng, rep)
+diff --git a/serve/test_tail.py b/serve/test_tail.py
+new file mode 100644
+index 0000000..cc953ac
+--- /dev/null
++++ b/serve/test_tail.py
+@@ -0,0 +1,460 @@
++"""serve/test_tail.py - CPU regression for the tail-resume acceptance oracle (Muse-2, step 2).
++
++The GPU case itself lives in H:\\qwen38-v100\\scripts\\accept_cache.py (outer repo,
++ADDITIONS only). This file exercises its pure helpers without any subprocess, server,
++or GPU: parser/prefix-size/suffix computation, engine-counts consistency
++(prompt==len(ids), reused==k, read==prompt-reused), exact checkpoint-row marker
++(`resume from chain at K (checkpoint row)` with K==k), tail-turn gating, mutated-case
++false positives (old root / older-than-newest fail), missing/bad metric/log failures,
++the no-tautology rule (read is compared to the INDEPENDENT suffix, never rec['suffix']),
++genuine-root rule, and the mutated candidate-set proof (Sol design: early assistant
++mutation, L1<=change, header mismatch before n-1, no unexcluded periodic).
++
++Outer import note: accept_cache.py reads its fixture BODY and mkdirs OUT on import
++(pre-existing setup, unchanged). Both paths exist on the dev machine and no server is
++started by import; tests never call start()/Engine()/tail_load_faithful() (the latter
++reads the prod pack). Faithful rendering in tests uses this tree's own ChatTemplate +
++ByteTokenizer, the same pair Service.prepare uses here, so LCP/boundary checks are
++exact in this context.
++
++    python -m unittest serve.test_tail -v
++"""
++from __future__ import annotations
++
++import importlib.util
++import sys
++import unittest
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++OUTER = ROOT.parent / "scripts" / "accept_cache.py"
++
++sys.path.insert(0, str(ROOT))
++from serve.frontend import ChatTemplate, openai_to_messages  # noqa: E402
++from serve.server import ByteTokenizer  # noqa: E402
++
++
++def load_outer():
++    spec = importlib.util.spec_from_file_location("accept_cache_tail", str(OUTER))
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++A = load_outer()
++EXACT = "resume from chain at {} (checkpoint row)"
++
++
++def chain_rec(prompt=20000, read=300, k=19700, marker_k=None, generic=False):
++    mk = k if marker_k is None else marker_k
++    ckpt = ["some checkpoint chatter without the marker"] if generic else [EXACT.format(mk)]
++    return {"prompt": prompt, "read": read, "reused": prompt - read, "resume": "chain", "k": k,
++            "suffix": 999999,  # poisoned: oracle must ignore rec['suffix'] (no tautology)
++            "resume_lines": [f"resume from chain at {k}, suffix 123, restore 1.0 ms"],
++            "ckpt_lines": ckpt}
++
++
++class Parsers(unittest.TestCase):
++    def test_resume_line(self):
++        d = A.tail_parse_resume("strata serve: resume from chain at 19700, suffix 300, restore 12.3 ms, snapshot 4.5 ms")
++        self.assertEqual((d["resume"], d["k"], d["suffix"]), ("chain", 19700, 300))
++        self.assertIsNone(A.tail_parse_resume("no resume here"))
++
++    def test_prompt_line(self):
++        d = A.tail_parse_prompt("strata serve: prompt 20000 tokens = 19700 reused + 300 read in 900 ms (1.0 tok/s), "
++                                "48 generated in 100 ms (1.0 tok/s), drafts accepted 0 of 0, 3 checkpoints")
++        self.assertEqual((d["prompt"], d["reused"], d["read"]), (20000, 19700, 300))
++        self.assertIsNone(A.tail_parse_prompt("prompt broken"))
++
++    def test_prefix_size(self):
++        self.assertTrue(A.tail_prefix_ok(18000) and A.tail_prefix_ok(20000) and A.tail_prefix_ok(22000))
++        for bad in (17999, 22001, None, "20000", -5, True):
++            self.assertFalse(A.tail_prefix_ok(bad), bad)
++
++    def test_exact_row_needs_exact_marker_and_K(self):
++        self.assertTrue(A.tail_exact_row([EXACT.format(7)], 7))
++        self.assertFalse(A.tail_exact_row([EXACT.format(8)], 7))  # mismatched K
++        self.assertFalse(A.tail_exact_row(["resume from chain at 7, suffix 1"], 7))  # generic substring
++        self.assertFalse(A.tail_exact_row(["checkpoint row"], 7))
++        self.assertFalse(A.tail_exact_row([], 7))
++        self.assertFalse(A.tail_exact_row(None, 7))
++        self.assertFalse(A.tail_exact_row([EXACT.format(7)], -1))
++        self.assertFalse(A.tail_exact_row([EXACT.format(7)], "7"))
++
++    def test_lcp_and_last_turn(self):
++        self.assertEqual(A.tail_lcp([1, 2, 3], [1, 2, 4]), 2)
++        self.assertEqual(A.tail_lcp([], [1]), 0)
++        ids = [5, 9, 9, 7, 9]
++        self.assertEqual(A.tail_last_turn(ids, 9), 4)
++        self.assertIsNone(A.tail_last_turn([1, 2], 9))
++
++    def test_genuine_root_mirrors_engine_rule(self):
++        # ids: turn at 0 (system start), first real turn at 3, last at 9.
++        ids = [9, 1, 1, 9, 1, 1, 1, 1, 1, 9]
++        self.assertEqual(A.tail_genuine_root(ids, 9, 2), 3)   # first after 0, >= thr, before last
++        self.assertIsNone(A.tail_genuine_root(ids, 9, 4))     # first (3) below threshold: no root invented
++        self.assertIsNone(A.tail_genuine_root([1, 2, 3], 9, 1))  # no turn at all
++        self.assertIsNone(A.tail_genuine_root([9, 9], 9, 1))  # only index0 + last: nothing strictly between
++
++
++class ExpectedReuse(unittest.TestCase):
++    def test_raw_prefix(self):
++        e = A.tail_expected_reuse([9, 1, 2, 3], [9, 1, 2, 3, 4], 9)
++        self.assertEqual((e["L"], e["suffix"], e["method"]), (4, 1, "raw-prefix"))
++        self.assertTrue(e["consistent"])
++
++    def test_turn_boundary(self):
++        # prev ends with a generation header [.., 9, 100]; cur re-renders history after 2.
++        e = A.tail_expected_reuse([1, 2, 9, 100], [1, 2, 7, 8], 9)
++        self.assertEqual(e["L"], 2)
++        self.assertEqual(e["suffix"], 2)
++        self.assertEqual(e["method"], "turn-boundary")
++        self.assertEqual(e["boundary"], 2)
++        self.assertTrue(e["consistent"])
++
++    def test_inconsistent_boundary_flagged(self):
++        # Genuine IDs: prev's last turn (index 3) lies strictly beyond the LCP (2),
++        # so no boundary-anchored reuse is possible; the helper must say inconsistent.
++        e = A.tail_expected_reuse([1, 9, 2, 9, 5], [1, 9, 7, 8], 9)
++        self.assertEqual(e["boundary"], 3)
++        self.assertEqual(e["L"], 2)
++        self.assertEqual(e["method"], "turn-boundary")
++        self.assertFalse(e["consistent"])
++
++    def test_no_boundary_token(self):
++        e = A.tail_expected_reuse([1, 2], [1, 3], 9)
++        self.assertEqual(e["method"], "lcp-no-boundary")
++
++
++class Counts(unittest.TestCase):
++    def test_pass(self):
++        ok, _ = A.tail_check_counts(chain_rec(), 20000)
++        self.assertTrue(ok)
++
++    def test_prompt_must_equal_len_ids(self):
++        ok, why = A.tail_check_counts(chain_rec(prompt=20001), 20000)
++        self.assertFalse(ok)
++        self.assertIn("len(ids)", why)
++
++    def test_reused_must_equal_k(self):
++        r = chain_rec()
++        r["reused"] = r["k"] - 1
++        r["read"] = r["prompt"] - r["reused"]
++        ok, why = A.tail_check_counts(r, 20000)
++        self.assertFalse(ok)
++        self.assertIn("reused", why)
++
++    def test_read_must_equal_prompt_minus_reused(self):
++        r = chain_rec()
++        r["read"] += 1
++        ok, why = A.tail_check_counts(r, 20000)
++        self.assertFalse(ok)
++        self.assertIn("read=", why)
++
++    def test_negative_and_nonint_rejected(self):
++        for bad in (-1, "300", 3.5, True, None):
++            r = chain_rec()
++            r["read"] = bad
++            self.assertFalse(A.tail_check_counts(r, 20000)[0], bad)
++        r = chain_rec()
++        r["k"] = -2
++        self.assertFalse(A.tail_check_counts(r, 20000)[0])
++
++
++class TailTurn(unittest.TestCase):
++    def test_pass_ignores_rec_suffix(self):
++        ok, _ = A.tail_check_turn(chain_rec(), 19700, 300, 20000, 19600)
++        self.assertTrue(ok)
++
++    def test_k_below_window_fails(self):
++        # read and k move together (counts hold): k below L-tol means read above suffix+tol.
++        r = chain_rec(prompt=20000, read=365, k=19635, marker_k=19635)
++        ok, why = A.tail_check_turn(r, 19700, 300, 20000, 19600)
++        self.assertFalse(ok)
++        self.assertIn("near expected", why)
++
++    def test_k_above_LCP_fails(self):
++        r = chain_rec(prompt=20000, read=299, k=19701, marker_k=19701)
++        ok, why = A.tail_check_turn(r, 19700, 300, 20000, 19600)
++        self.assertFalse(ok)
++        self.assertIn("near expected", why)
++
++    def test_k_far_from_L_fails(self):
++        r = chain_rec(k=19000, marker_k=19000)
++        r["reused"] = 19000
++        r["read"] = r["prompt"] - 19000
++        ok, why = A.tail_check_turn(r, 19700, 300, 20000, 19600)
++        self.assertFalse(ok)
++        self.assertIn("near expected", why)
++
++    def test_boundary_above_LCP_fails(self):
++        ok, why = A.tail_check_turn(chain_rec(), 19700, 300, 20000, 19800)
++        self.assertFalse(ok)
++        self.assertIn("boundary", why)
++
++    def test_tip_masks_failure(self):
++        r = chain_rec()
++        r["resume"] = "tip"
++        ok, why = A.tail_check_turn(r, 19700, 300, 20000, 19600)
++        self.assertFalse(ok)
++        self.assertIn("chain", why)
++
++    def test_missing_or_mismatched_marker_fails(self):
++        self.assertFalse(A.tail_check_turn(chain_rec(generic=True), 19700, 300, 20000, 19600)[0])
++        r = chain_rec(marker_k=19699)  # exact format, wrong K
++        self.assertFalse(A.tail_check_turn(r, 19700, 300, 20000, 19600)[0])
++
++    def test_counts_mismatch_fails(self):
++        ok, why = A.tail_check_turn(chain_rec(prompt=20001), 19700, 300, 20000, 19600)
++        self.assertFalse(ok)
++        self.assertIn("len(ids)", why)
++
++    def test_missing_metric_fails(self):
++        for drop in ("prompt", "read", "resume", "k", "resume_lines"):
++            r = chain_rec()
++            del r[drop]
++            ok, why = A.tail_check_turn(r, 19700, 300, 20000, 19600)
++            self.assertFalse(ok, drop)
++            self.assertIn("missing", why)
++
++
++class MutatedTurn(unittest.TestCase):
++    def test_pass_at_newest_below_change(self):
++        ok, _ = A.tail_check_mutated(chain_rec(prompt=20000, read=5000, k=15000), 15000, 2000, 15200, 20000)
++        self.assertTrue(ok)
++
++    def test_old_root_fails(self):
++        # False positive guard: resuming at the old root instead of the newest checkpoint fails.
++        r = chain_rec(prompt=20000, read=18000, k=2000, marker_k=2000)
++        ok, why = A.tail_check_mutated(r, 15000, 2000, 15200, 20000)
++        self.assertFalse(ok)
++        self.assertIn("old root", why)
++
++    def test_older_than_newest_fails(self):
++        r = chain_rec(prompt=20000, read=8000, k=12000, marker_k=12000)
++        ok, why = A.tail_check_mutated(r, 15000, 2000, 15200, 20000)
++        self.assertFalse(ok)
++        self.assertIn("older than newest", why)
++
++    def test_at_or_above_change_fails(self):
++        for k in (15200, 16000):
++            r = chain_rec(prompt=20000, read=20000 - k, k=k, marker_k=k)
++            self.assertFalse(A.tail_check_mutated(r, 15000, 2000, 15200, 20000)[0], k)
++
++    def test_inconsistent_counts_fail_first(self):
++        # read/k move together under counts: an off-by-one read breaks reused==k first.
++        r = chain_rec(prompt=20000, read=5001, k=15000)
++        ok, why = A.tail_check_mutated(r, 15000, 2000, 15200, 20000)
++        self.assertFalse(ok)
++        self.assertIn("reused", why)
++
++    def test_missing_and_bad_expectation_fail(self):
++        r = chain_rec(prompt=20000, read=5000, k=15000)
++        del r["k"]
++        self.assertFalse(A.tail_check_mutated(r, 15000, 2000, 15200, 20000)[0])
++        self.assertFalse(A.tail_check_mutated(chain_rec(), None, 2000, 15200, 20000)[0])
++        self.assertFalse(A.tail_check_mutated(chain_rec(), 1500, 2000, 15200, 20000)[0])  # K_exp <= root
++        self.assertFalse(A.tail_check_mutated(chain_rec(), 15300, 2000, 15200, 20000)[0])  # K_exp >= change
++
++
++class Simulate(unittest.TestCase):
++    def test_windows_only_segments(self):
++        # every=8 but every segment is short: only the explicit root/turn points.
++        self.assertEqual(A.tail_simulate(12, 0, 3, 6, every=8, chunk=4, short=64), [3, 6])
++
++    def test_drift_accumulates(self):
++        # pp_next = done+every after each capture (not a fixed grid): 11 -> 19, not 16.
++        self.assertEqual(A.tail_simulate(30, 0, 3, 27, every=8, chunk=4, short=2),
++                         [3, 11, 19, 27])
++
++    def test_resume_skips_root(self):
++        self.assertEqual(A.tail_simulate(30, 3, -1, 27, every=8, chunk=4, short=2),
++                         [11, 19, 27])
++
++    def test_matching(self):
++        self.assertEqual(A.tail_matching([1, 2, 3], [1, 2, 3, 9], [1, 2, 4, 9]), [1, 2])
++        self.assertEqual(A.tail_matching([1, 2], [1, 2], [1, 2, 9]), [1, 2])
++        self.assertEqual(A.tail_matching([], [1], [1]), [])
++
++
++class MutatedProof(unittest.TestCase):
++    """Synthetic prompts for the simulation-based proof (pack-like: the assistant
++    history turn starts where the generation header started, then diverges)."""
++
++    T = 9
++
++    def prompts(self):
++        p1 = [1, 2, 3, 9, 4, 5, 9, 50, 51, 52, 53]
++        p2 = [1, 2, 3, 9, 4, 5, 9, 50, 51, 52, 9, 60]
++        p3 = [1, 2, 3, 9, 4, 5, 9, 50, 51, 52, 9, 60, 62, 9, 61]
++        p4 = [1, 2, 3, 9, 4, 5, 9, 50, 51, 77, 60, 62, 9, 61]
++        return p1, p2, p3, p4
++
++    def test_proof_ok_cold(self):
++        p1, p2, p3, p4 = self.prompts()
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 0, 6, 10,
++                                  every=8, chunk=4, short=64)
++        self.assertTrue(pr["ok"], pr)
++        self.assertEqual((pr["K_exp"], pr["L1"], pr["K2"], pr["K3"]), (6, 6, 6, 10))
++        self.assertLess(pr["L1"], pr["change"])
++        self.assertLess(pr["change"], pr["L2"])
++
++    def test_proof_ok_root_resume(self):
++        p1, p2, p3, p4 = self.prompts()
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 3, 6, 10,
++                                  every=8, chunk=4, short=64)
++        self.assertTrue(pr["ok"], pr)
++        self.assertEqual(pr["K_exp"], 6)
++
++    def test_lcp_eq_n1_minus_1_accepted_when_uncaptured(self):
++        # The pack may retokenize a final newline so lcp reaches n1-1; valid because the
++        # simulated schedule (short segments) captured no checkpoint at n-1.
++        T = self.T
++        p1 = [1, 2, 3, 9, 4, 5, 9, 50]
++        p2 = [1, 2, 3, 9, 4, 5, 9, 50, 51, 9, 60]
++        p3 = [1, 2, 3, 9, 4, 5, 9, 50, 51, 9, 60, 62, 9, 61]
++        p4 = [1, 2, 3, 9, 4, 5, 9, 77, 9, 60, 62, 9, 61]
++        self.assertEqual(A.tail_lcp(p1, p4), len(p1) - 1)
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, T, 3, 0, 6, 9,
++                                  every=8, chunk=4, short=64)
++        self.assertTrue(pr["ok"], pr)
++        self.assertEqual(pr["K_exp"], 6)
++
++    def test_full_prefix_tail_unproven(self):
++        p1, p2, p3, _ = self.prompts()
++        p4 = p1 + [99]  # raw prompt is a complete prefix: tail unexcluded
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 0, 6, 10,
++                                  every=8, chunk=4, short=64)
++        self.assertFalse(pr["ok"])
++
++    def test_unexpected_k1_unproven(self):
++        p1, p2, p3, p4 = self.prompts()
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 5, 6, 10,
++                                  every=8, chunk=4, short=64)
++        self.assertFalse(pr["ok"])
++
++    def test_late_change_unproven(self):
++        p1, p2, p3, _ = self.prompts()
++        p4 = p3[:]  # no change at all -> change beyond L2
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 0, 6, 10,
++                                  every=8, chunk=4, short=64)
++        self.assertFalse(pr["ok"])
++
++    def test_cap_rejects_c1(self):
++        # Standard vectors: C1 has 2 exact points -> b1 = 2+0+1 = 3 reaches cap 3.
++        p1, p2, p3, p4 = self.prompts()
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 0, 6, 10,
++                                  every=8, chunk=4, short=64, cap=3)
++        self.assertFalse(pr["ok"])
++        self.assertIn("T1 conservative count", pr["reason"])
++        self.assertEqual(pr["bounds"]["b1"], 3)
++
++    def test_cap_rejects_c2_endpoints(self):
++        # b1 = 3 < 4 passes, but C2 has 3 exact points -> b2 = 3+0+2 = 5 reaches cap 4.
++        p1, p2, p3, p4 = self.prompts()
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 0, 6, 10,
++                                  every=8, chunk=4, short=64, cap=4)
++        self.assertFalse(pr["ok"])
++        self.assertIn("T2 conservative count", pr["reason"])
++        self.assertEqual(pr["bounds"]["b2"], 5)
++
++    def test_cap_rejects_c3_endpoints(self):
++        # b1 = 3, b2 = 5 pass cap 6, but C3 has 4 exact points -> b3 = 4+0+3 = 7.
++        p1, p2, p3, p4 = self.prompts()
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 0, 6, 10,
++                                  every=8, chunk=4, short=64, cap=6)
++        self.assertFalse(pr["ok"])
++        self.assertIn("T3 conservative count", pr["reason"])
++        self.assertEqual(pr["bounds"]["b3"], 7)
++
++    def test_inherited_root_counts_when_k1_root(self):
++        # k1 == root: below-root inheritance counts floor(3/8)+1 = 1 extra point.
++        p1, p2, p3, p4 = self.prompts()
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 3, 6, 10,
++                                  every=8, chunk=4, short=64, cap=8)
++        self.assertTrue(pr["ok"], pr)
++        self.assertEqual(pr["bounds"]["inh"], 1)
++        pr = A.tail_mutated_proof(p1, p2, p3, p4, self.T, 3, 3, 6, 10,
++                                  every=8, chunk=4, short=64, cap=7)
++        self.assertFalse(pr["ok"])
++        self.assertIn("T3 conservative count", pr["reason"])
++
++
++class FindSections(unittest.TestCase):
++    def test_binary_search_finds_range(self):
++        def f(n):
++            return 5000 + 100 * n  # fake monotonic renderer; target [18000,22000] -> n in [130,170]
++        n, size, note = A.tail_find_sections(f)
++        self.assertEqual(note, "ok")
++        self.assertTrue(18000 <= size <= 22000)
++        self.assertTrue(50 <= n <= 1200)
++
++    def test_unreachable_fails_cleanly(self):
++        n, size, note = A.tail_find_sections(lambda n: 100)
++        self.assertNotEqual(note, "ok")
++        n, size, note = A.tail_find_sections(lambda n: 10 ** 9)
++        self.assertNotEqual(note, "ok")
++
++    def test_measure_errors_fail_cleanly(self):
++        def boom(n):
++            raise RuntimeError("tokenizer down")
++        n, size, note = A.tail_find_sections(boom)
++        self.assertNotEqual(note, "ok")
++        self.assertIn("tokenizer", note)
++
++
++class FaithfulRendering(unittest.TestCase):
++    def test_raw_prefix_honest_here(self):
++        # THIS tree's template reuses the generation header as the history prefix, so the
++        # raw previous end IS a prefix here. The GPU pack template re-renders instead
++        # (probe_turn_prefix.py). The oracle handles both; assert this context honestly.
++        tok = ByteTokenizer()
++        tpl = ChatTemplate(ROOT / "serve" / "chat_template.jinja")
++        turn = tok.encode("<|im_start|>", parse_special=True)[0]
++
++        def ids(body):
++            m, t, kw = openai_to_messages(body)
++            return tok.encode(tpl.render(m, tools=t, **kw), parse_special=True)
++
++        b1 = {"messages": [{"role": "user", "content": "needle one two three"}]}
++        p1 = ids(b1)
++        b2 = {"messages": [{"role": "user", "content": "needle one two three"},
++                            {"role": "assistant", "content": "ok got it"},
++                            {"role": "user", "content": "and then?"}]}
++        p2 = ids(b2)
++        self.assertEqual(p1, p2[:len(p1)])
++        e = A.tail_expected_reuse(p1, p2, turn)
++        self.assertEqual(e["method"], "raw-prefix")
++        self.assertTrue(e["consistent"])
++
++    def test_isolation_flags_complete(self):
++        iso = A.TAIL_ISOLATION
++        self.assertEqual(iso.count("--tip-cache-gib"), 1)
++        self.assertIn("0", iso)
++        self.assertIn("--no-root-disk", iso)
++        for f in ("--prompt-cache", "--prompt-cache-root", "--prompt-cache-every",
++                  "--prefill", "--short-read"):
++            self.assertIn(f, iso)
++        self.assertEqual(iso[iso.index("--prefill") + 1], "2048")
++        self.assertEqual(iso[iso.index("--short-read") + 1], "64")
++
++    def test_tail_bodies_lock_reasoning_low(self):
++        import copy
++        msgs = [{"role": "user", "content": "hi"}]
++        b = A.tail_body_with(msgs)
++        self.assertEqual(b["reasoning_effort"], "low")
++        self.assertEqual(b["extra_body"]["chat_template_kwargs"]["reasoning_effort"], "low")
++        plain = A.body_with(msgs)  # existing cases unchanged (fixture medium survives)
++        self.assertNotEqual(plain.get("reasoning_effort"), "low")
++
++    def test_long_user_marker_unique_and_early_edit(self):
++        a = A.tail_build_long_user(0, "AAA", 5)
++        b = A.tail_build_long_user(0, "BBB", 5)
++        self.assertNotEqual(a, b)
++        self.assertEqual(a, A.tail_build_long_user(0, "AAA", 5))
++        self.assertTrue(A.tail_mutate_early("hello world").startswith(A.TAIL_MUT_PREFIX))
++        self.assertNotEqual(A.tail_mutate_early("hello"), "hello")
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.54.0.windows.1
+

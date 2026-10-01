@@ -1,0 +1,1097 @@
+From e7397df8c3146f1777522a53c902e12813dadfb6 Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 16:53:41 +0900
+Subject: [PATCH 16/17] Tail resume: keep a 40 KiB MTP boundary row on every
+ conversation checkpoint and at the end of each request, so the next request
+ resumes at the longest matching point instead of the last repairable
+ checkpoint
+
+---
+ include/strata/core/conversation_cache.hpp |  57 +++-
+ include/strata/program/restore.hpp         |  48 ++-
+ src/core/conversation_state.cpp            |   9 +-
+ src/program/generate.cpp                   | 222 +++++++++++++-
+ src/program/restore.cpp                    | 172 ++++++++++-
+ src/program/restore_test.cpp               | 330 +++++++++++++++++++++
+ src/program/saved_state_layout_test.cpp    |  45 +++
+ 7 files changed, 861 insertions(+), 22 deletions(-)
+
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 40490a5..fe7ff83 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -20,6 +20,59 @@ struct ConversationImageKey {
+     bool operator==(const ConversationImageKey&) const = default;
+ };
+ 
++// Per-row byte cap for the attached MTP boundary row (TAIL-RESUME). It bounds the TOTAL
++// extra row-vector allocation: 4*hc*n_embd payload bytes plus the copied image-key bytes.
++// The real model row is far smaller (tens of KB). The cap gates the transient stash and
++// every attached row (the retained live row keeps its existing checks); the division-first
++// check runs before any product or allocation, so no wrap-to-small shape can pass.
++// No duplicate recurrent state.
++// Per-row dynamic cost: 4*hc*n_embd + imgs.size()*sizeof(ConversationImageKey); the fixed
++// struct overhead is sizeof(ConversationCheckpointRow) (counted once per checkpoint by
++// the enclosing vectors, not in bytes() below).
++inline constexpr size_t kCheckpointRowCapBytes = 1u << 20;
++// Maximum row cells (floats) under the cap: the division-first bound behind every check.
++inline constexpr uint64_t kCheckpointRowCapCells = (uint64_t)(1u << 20) / sizeof(float);
++
++/// CPU-only MTP boundary row attached to a ConversationCheckpoint (TAIL-RESUME).
++///
++/// A checkpoint carries recurrent state only; the top-level checkpoint additionally holds
++/// the final-stage residual row R_(L-1) that pairs MTP cell L-1 on resume. The row is
++/// borrowed scratch at capture (device residual rows) copied once to this host vector;
++/// stage_parts hold recurrent state only, never a second row copy. Validity is decided
++/// by restore::checkpoint_row_valid_for, never by mere existence: L must equal the
++/// checkpoint length, the ids hash/image identity/cvec/shape must match the request,
++/// and the saved valid_from must be reachable from the new request's window.
++/// No disk schema change: this row is RAM-only (root v3 unchanged); parked accounting
++/// covers it via bytes() below (capacity, so eviction/pruning stays truthful).
++struct ConversationCheckpointRow {
++    int64_t L = -1;                             ///< checkpoint length this row was captured for
++    uint64_t ids_hash = 0;                      ///< FNV-1a of the checkpoint ids at capture
++    std::vector<ConversationImageKey> imgs;     ///< image identity at capture (copy of checkpoint imgs)
++    bool cvec = true;                           ///< control-vector enablement at capture
++    int64_t hc = 0;                             ///< model hc at capture (row shape)
++    int64_t n_embd = 0;                         ///< model n_embd at capture (row shape)
++    int64_t valid_from = 0;                     ///< drafter valid_from at capture (reachability floor)
++    std::vector<float> row;                     ///< R_(L-1): hc*n_embd host floats
++
++    bool has() const { return L >= 0 && !row.empty(); }
++    void clear() {
++        L = -1;
++        ids_hash = 0;
++        imgs.clear();
++        cvec = true;
++        hc = 0;
++        n_embd = 0;
++        valid_from = 0;
++        row.clear();
++    }
++    // Dynamic allocation only (capacities, independent of validity): clear() keeps capacity,
++    // so a cleared-but-retained row still counts. Fixed struct overhead rides with the
++    // enclosing vectors' sizeof(ConversationCheckpoint) and is not counted here.
++    size_t bytes() const {
++        return row.capacity() * sizeof(float) + imgs.capacity() * sizeof(ConversationImageKey);
++    }
++};
++
+ struct ConversationCheckpoint {
+     std::vector<int32_t> ids;
+     std::vector<ConversationImageKey> imgs;
+@@ -28,11 +81,13 @@ struct ConversationCheckpoint {
+     // Ordinary layer-split checkpoints retain each device's running state.
+     // Whole-session parking is currently single-GPU and rejects these parts.
+     std::vector<ConversationCheckpoint> stage_parts;
++    // TAIL-RESUME: the final-stage residual row R_(L-1) for MTP repair (RAM-only).
++    ConversationCheckpointRow boundary_row;
+ 
+     size_t bytes() const {
+         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
+                gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
+-               stage_parts.capacity() * sizeof(ConversationCheckpoint);
++               stage_parts.capacity() * sizeof(ConversationCheckpoint) + boundary_row.bytes();
+         for (const auto& part : stage_parts) n += part.bytes();
+         return n;
+     }
+diff --git a/include/strata/program/restore.hpp b/include/strata/program/restore.hpp
+index 225137c..02e8ecf 100644
+--- a/include/strata/program/restore.hpp
++++ b/include/strata/program/restore.hpp
+@@ -134,11 +134,55 @@ struct RepairCtx {
+     bool cvec = true;
+     int64_t boundary_hc = 0;                                 ///< live g.hc (boundary shape check)
+     int64_t boundary_n_embd = 0;                             ///< live g.n_embd
++    // TAIL-RESUME: the actual chain checkpoint under test (non-live candidates only) plus the
++    // request-side key for its attached-row validator. Null = pre-tail behaviour (SavedState
++    // fallback only). Borrowed for the call only, same lifetime as the other references.
++    const strata::core::ConversationCheckpoint* ckpt = nullptr;
++    const std::vector<int64_t>* req_ids = nullptr;           ///< request ids (attached-row prefix key)
++    const std::vector<strata::core::ConversationImageKey>* req_imgs = nullptr;
+ };
+ 
++/// TAIL-RESUME: overflow-safe boundary-row shape gate. True iff hc/n_embd are positive,
++/// their product is exactly row_cells, and the payload fits the per-row byte cap.
++/// Division FIRST (bounding before multiplying) closes the wrap-to-small hole: a product
++/// computed first could wrap to a small value and pass. No allocation, never throws.
++inline bool checkpoint_row_shape_ok(int64_t hc, int64_t n_embd, size_t row_cells) {
++    if (hc <= 0 || n_embd <= 0 || row_cells == 0) return false;
++    if ((uint64_t) hc > strata::core::kCheckpointRowCapCells / (uint64_t) n_embd) return false;
++    return (uint64_t) hc * (uint64_t) n_embd == (uint64_t) row_cells;
++}
++
++/// TAIL-RESUME: attach a captured host boundary row to a checkpoint (CPU-only, no device copy).
++/// The device copy (D2H) is the caller's: `row` must already hold exactly the scratch row for
++/// `stash_L` (R_(stash_L-1)). Requires stash_L == checkpoint length, positive model shape,
++/// the division-first cap bound, exact vector length, 0<=valid_from<=L-1, and the total extra
++/// allocation (payload + copied image keys) under the cap. The ids hash and image identity are
++/// derived from the checkpoint itself (never caller-supplied), so a stale row cannot be
++/// legitimized with fresh metadata. Attach builds a fresh row and moves it in, so no prior
++/// oversized capacity survives success; on any failure the checkpoint is left with NO usable
++/// attached row (fail closed). `why` names the reason. Never throws.
++bool attach_checkpoint_row(strata::core::ConversationCheckpoint& cc, const std::vector<float>& row,
++                           int64_t stash_L, bool cvec, int64_t hc, int64_t n_embd,
++                           int64_t valid_from, std::string* why = nullptr);
++
++/// TAIL-RESUME: validate a checkpoint's attached boundary row for a request (CPU-only).
++/// Every reject is independent: req_ids.size()==n, 1<=k<n with request[k] present for the
++/// pairing, nonzero shape, recorded L == checkpoint length == k, exact shape AND vector
++/// length, ids hash, full checkpoint-ids equality to the request prefix with direct int64
++/// comparison (no out-of-int32 truncation forge), below-L image identity to the request AND
++/// to the retained row, exact cvec equality, 0<=saved valid_from<=k-1 and
++/// new_valid_from>=saved valid_from. A missing row is a plain reject (false). Never throws.
++bool checkpoint_row_valid_for(const strata::core::ConversationCheckpoint& cc, int64_t n, size_t hcn,
++                              int64_t boundary_hc, int64_t boundary_n_embd, int64_t new_valid_from,
++                              bool cvec, const std::vector<int64_t>& req_ids,
++                              const std::vector<strata::core::ConversationImageKey>& req_imgs,
++                              std::string* why = nullptr);
++
+ /// The MTP boundary repairability gate for one chain/live candidate at k (moved verbatim
+-/// semantics from generate.cpp): K8V4 needs no repair source; live needs the retained row
+-/// (length/hash/window); chain needs a same-length saved boundary with a reachable window.
++/// semantics from generate.cpp, plus the TAIL-RESUME attached-row preference): K8V4 needs no
++/// repair source; live needs the retained row (length/hash/window); chain prefers the
++/// checkpoint-attached row (same identity checks) with the same-length saved boundary as
++/// fallback, both gated on a reachable window.
+ /// Never throws: a throwing lookup reports false (caller logs "trying shorter").
+ bool chain_repairable(int64_t k, bool is_live, const RepairCtx& ctx);
+ 
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index 3e97827..36821f9 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -94,10 +94,13 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
+ }
+ 
+ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
+-    size_t ids = 0, images = 0;
++    size_t ids = 0, images = 0, row = 0, row_images = 0;
+     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
+-        !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
+-    for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
++        !product(images, {c.imgs.size(), sizeof(ConversationImageKey)}) ||
++        !product(row, {c.boundary_row.row.size(), sizeof(float)}) ||
++        !product(row_images, {c.boundary_row.imgs.size(), sizeof(ConversationImageKey)})) return false;
++    for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size(),
++                     row, row_images})
+         if (!add(total, n)) return false;
+     return true;
+ }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 5a54691..d356f5d 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -2039,6 +2039,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                         // The repairability pre-check above ran on untouched state, so a failure here is
+                         // transient: reset and fall through, same as a failed mount. K8V4 skips repair
+                         // entirely: upstream mounts on checkpoint_restore + kv_restore alone.
++                        bool from_ckpt_row = false;   // TAIL-RESUME: this mount repaired from the attached row
+                         if (saved::kv_chain_mount_needs_repair(strata::core::qsa_kv_hybrid())) {
+                             const int32_t btok = (int32_t) ids[(size_t) k];
+                             const float* bdry_src = nullptr;
+@@ -2047,14 +2048,25 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                                 f1_new_vf >= live_bdry_vf) {
+                                 bdry_src = live_bdry.data();
+                             } else if (!is_live) {
++                                // TAIL-RESUME: call the SAME attached-row validator the collection
++                                // gate ran (never a weaker hand-written check); prefer the valid
++                                // attached row, then the SAME existing exact SavedState fallback.
+                                 // K8V4: the store holds nothing (walks skipped) - defensive null.
+-                                const saved::SavedItem* exact = saved_state_kv_ok() ?
+-                                    saved_states.find_exact(ids32, req_simgs, cvec_cached, k) : nullptr;
+-                                if (exact != nullptr && exact->boundary.complete() &&
+-                                    exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
+-                                    exact->boundary.row.size() == f1_hcn && f1_hcn > 0 &&
+-                                    f1_new_vf >= exact->mtp.valid_from)
+-                                    bdry_src = exact->boundary.row.data();
++                                if (c != nullptr &&
++                                    restore::checkpoint_row_valid_for(
++                                        *c, n, f1_hcn, g.hc, g.n_embd, f1_new_vf, cvec_cached,
++                                        ids, req_imgs)) {
++                                    bdry_src = c->boundary_row.row.data();
++                                    from_ckpt_row = true;
++                                } else {
++                                    const saved::SavedItem* exact = saved_state_kv_ok() ?
++                                        saved_states.find_exact(ids32, req_simgs, cvec_cached, k) : nullptr;
++                                    if (exact != nullptr && exact->boundary.complete() &&
++                                        exact->boundary.hc == g.hc && exact->boundary.n_embd == g.n_embd &&
++                                        exact->boundary.row.size() == f1_hcn && f1_hcn > 0 &&
++                                        f1_new_vf >= exact->mtp.valid_from)
++                                        bdry_src = exact->boundary.row.data();
++                                }
+                             }
+                             const int32_t btok_use = bdry_src == nullptr ? 0 : btok;
+                             std::string be;
+@@ -2095,6 +2107,10 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                         from_live = is_live;
+                         from_saved = false;
+                         f1_outcome = restore::RestoreResult::restored_at(k, saved::ResumeSource::Chain);
++                        // TAIL-RESUME: one line only for successful actual attached-row mounts.
++                        if (!is_live && from_ckpt_row)
++                            std::fprintf(stderr, "strata serve: resume from chain at %lld (checkpoint row)\n",
++                                         (long long) k);
+                         break;
+                         } catch (const std::exception& ex) {
+                             // A throwing mount/repair/ring-refill is a failed candidate, not a cold request:
+@@ -5279,6 +5295,15 @@ int main(int argc, char** argv) {
+         int64_t f2_bdry_at = -1;
+         std::vector<float> f2_bdry_row;
+         int64_t f2_bdry_row_L = -1;
++        // TAIL-RESUME: bounded single transient last-prompt-row stash. Boundary R is borrowed
++        // scratch (a chunk's R_rows or a window's final_R), overwritten by the next chunk/window,
++        // so on_chunk/read_windows save the exact last row for done/b here while valid; the
++        // checkpoint_at(to) at the segment end then receives that exact row (never a later row
++        // sliced to an earlier checkpoint). One row only (per-row byte cap); reset at every
++        // request/read-segment boundary so a stale same-length row cannot survive. K8V4 never
++        // stashes (no captures there). Split reads the final stage's row under OnDevice.
++        std::vector<float> tail_row;
++        int64_t tail_row_L = -1;
+         // Stash one exact residual row R_(want-1) from prompt-path scratch (a chunk's R_rows or a
+         // window's final_R) before the next chunk/window overwrites it. Split-device handling matches
+         // the root row path (the drafter's rows live on the last stage). Never fatal: a failed copy
+@@ -5468,7 +5493,24 @@ int main(int argc, char** argv) {
+         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr) -> bool {
+             if (o.prompt_cache <= 0 || L < 1) return true;
+             for (ConvCheckpoint& c : checks)
+-                if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
++                if ((int64_t) c.ids.size() == L) {
++                    // TAIL-RESUME: a duplicate checkpoint_at(L) may refresh/attach a row only when
++                    // the checkpoint is exactly the current prefix (ids + below-L images); the
++                    // scratch row must be proven exact L. Metadata is never overwritten to
++                    // legitimize a stale row; a failed attach leaves no usable row (fail closed).
++                    bool prefix_ok = (int64_t) cur.size() >= L;
++                    for (int64_t i = 0; prefix_ok && i < L; ++i)
++                        if (cur[(size_t) i] != (int64_t) c.ids[(size_t) i]) prefix_ok = false;
++                    if (prefix_ok && !(imgs_below(req_imgs, L) == c.imgs)) prefix_ok = false;
++                    if (prefix_ok && tail_row_L == L && !tail_row.empty()) {
++                        restore::attach_checkpoint_row(c, tail_row, tail_row_L, cvec_cached, g.hc,
++                                                       g.n_embd,
++                                                       std::min(mtp.prefill_valid_from(), L - 1),
++                                                       nullptr);
++                    }
++                    c.used = ++check_clock;
++                    return true;
++                }
+             ConvCheckpoint c;
+             c.ids.assign(cur.begin(), cur.begin() + L);
+             c.imgs = imgs_below(req_imgs, L);
+@@ -5490,6 +5532,14 @@ int main(int argc, char** argv) {
+                     c.stage_parts.push_back(std::move(part));
+                 }
+             }
++            // TAIL-RESUME: attach the transient exact-L row (the chunk/window that just reached L
++            // stashed it above). Parts were already captured at exactly done; the row is the final
++            // stage's. A missing/mismatched row only leaves the checkpoint row-less (restore then
++            // falls back to the exact SavedState source); it never fails the request.
++            if (tail_row_L == L && !tail_row.empty()) {
++                restore::attach_checkpoint_row(c, tail_row, tail_row_L, cvec_cached, g.hc, g.n_embd,
++                                               std::min(mtp.prefill_valid_from(), L - 1), nullptr);
++            }
+             c.used = ++check_clock;
+             checks.push_back(std::move(c));
+             while ((int) checks.size() > o.prompt_cache) {
+@@ -5512,6 +5562,28 @@ int main(int argc, char** argv) {
+             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+             // (no second prefill: prefill writes absolute cells, so a repeat only redoubles the drafter work -
+             // on a batched chunk it would clobber E-9's values with the slow path's. R_rows below is only read.)
++            // TAIL-RESUME: stash this chunk's exact last row R_(done-1) for done=p0+T while R_rows is
++            // valid. Chunks are few (bounded copies); the segment-end checkpoint_at(to) below receives
++            // the exact to row. Never fatal: a failed copy only leaves the row unavailable.
++            if (o.prompt_cache > 0 && R_rows != nullptr && T > 0) {
++                try {
++                    if (saved_state_kv_ok() && g.hc > 0 && g.n_embd > 0 &&
++                        (uint64_t) g.hc <= strata::core::kCheckpointRowCapCells / (uint64_t) g.n_embd) {
++                        const size_t hcn = (size_t) ((uint64_t) g.hc * (uint64_t) g.n_embd);
++                        const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
++                        std::vector<float> one(hcn);
++                        if (cudaMemcpy(one.data(), R_rows + (size_t) (T - 1) * hcn,
++                                       hcn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
++                            tail_row = std::move(one);
++                            tail_row_L = p0 + T;
++                        }
++                    }
++                } catch (const std::exception& ex) {
++                    std::fprintf(stderr, "strata serve: tail row stash threw (%s): skipped\n", ex.what());
++                } catch (...) {
++                    std::fprintf(stderr, "strata serve: tail row stash threw: skipped\n");
++                }
++            }
+             // Stash the turn-boundary residual R_(f2_bdry_at-1) - this chunk's row
+             // (f2_bdry_at-1-p0). Same borrowed-scratch lifetime as the root row above.
+             stash_bdry_row(f2_bdry_row, f2_bdry_row_L, f2_bdry_at, R_rows, p0, T, "boundary");
+@@ -6439,6 +6511,30 @@ int main(int argc, char** argv) {
+                         return false;
+                     }
+                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
++                    // TAIL-RESUME: stash only this segment's final row R_(b-1) while final_R_all()
++                    // is valid (final window only: no D2H on every verify window). The segment-end
++                    // checkpoint_at(to) then receives the exact to row. Never fatal.
++                    if (o.prompt_cache > 0 && q + T == b && ver.final_R_all() != nullptr) {
++                        try {
++                            if (saved_state_kv_ok() && g.hc > 0 && g.n_embd > 0 &&
++                                (uint64_t) g.hc <= strata::core::kCheckpointRowCapCells / (uint64_t) g.n_embd) {
++                                const size_t hcn = (size_t) ((uint64_t) g.hc * (uint64_t) g.n_embd);
++                                const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
++                                std::vector<float> one(hcn);
++                                if (cudaMemcpy(one.data(),
++                                               ver.final_R_all() + (size_t) (T - 1) * hcn,
++                                               hcn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
++                                    tail_row = std::move(one);
++                                    tail_row_L = b;
++                                }
++                            }
++                        } catch (const std::exception& ex) {
++                            std::fprintf(stderr, "strata serve: tail row stash threw (%s): skipped\n",
++                                         ex.what());
++                        } catch (...) {
++                            std::fprintf(stderr, "strata serve: tail row stash threw: skipped\n");
++                        }
++                    }
+                     // Stash the turn-boundary residual R_(f2_bdry_at-1) - this window's row
+                     // (f2_bdry_at-1-q) of final_R. Same verify-scratch lifetime as the root row below.
+                     stash_bdry_row(f2_bdry_row, f2_bdry_row_L, f2_bdry_at, ver.final_R_all(), q, T,
+@@ -6622,10 +6718,18 @@ int main(int argc, char** argv) {
+                              -1;
+             f2_bdry_row.clear();
+             f2_bdry_row_L = -1;
++            // TAIL-RESUME: reset the transient tail stash at the request boundary so a stale
++            // same-length row from a previous transcript cannot survive into this request.
++            tail_row.clear();
++            tail_row_L = -1;
+             int64_t at = read_from;
+             for (const int64_t to : {reread_to, root_at, turn_at, f2_bdry_at, n - 1}) {
+                 if (to <= at) continue;
+                 err.clear();
++                // TAIL-RESUME: reset the transient stash at each read-segment boundary; the
++                // chunk/window callbacks below re-stash exactly this segment's rows.
++                tail_row.clear();
++                tail_row_L = -1;
+                 const bool win = windows_ok(at, to);
+                 if (win && !refill(err)) {
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+@@ -7235,12 +7339,13 @@ int main(int argc, char** argv) {
+             const auto e4_post_t0 = Clock::now();
+             try {
+                 if (stop_req.load()) { live_ok = false; boundary_ok = false; live_bdry_L = -1; }
+-                // (a) runs only when a tip or live-boundary retention can come of it (same aux/budget gate
+-                // as the flush below): drafter-only work, so skipping it for aux/budget-off lines leaves live
+-                // and the chain exactly as the catch-up-failure path does (tip suppressed, live/chain kept).
++                // (a) runs only when a tip, live-boundary retention or chain tail can come of it
++                // (main non-aux lines with tip budget OR prompt-cache chain, so chain operation is
++                // independent of full SavedState tips): drafter-only work, so skipping it for aux
++                // lines leaves live and the chain exactly as the catch-up-failure path does.
+                 // K8V4: skipped as well (imported SavedState preparation, not an upstream chain operation).
+                 if (boundary_ok && mtp_ok && produced_n > 0 && emit_win_e > 0 && !req_aux &&
+-                    o.tip_cache_gib > 0.0 && saved_state_kv_ok()) {
++                    (o.tip_cache_gib > 0.0 || o.prompt_cache > 0) && saved_state_kv_ok()) {
+                     std::vector<int32_t> fnxt((size_t) emit_win_e);
+                     for (int t = 0; t < emit_win_e; ++t)
+                         fnxt[(size_t) t] = t + 1 < emit_win_e ? window[(size_t) (t + 1)] : emit_last;
+@@ -7250,12 +7355,15 @@ int main(int argc, char** argv) {
+                         mtp_ok = false;
+                     }
+                 }
+-                // (b) final-token flush. Skipped (leaving the coherent pre-flush boundary) when no tip can come
+-                // of it anyway (aux lines, budget off): aux must not advance the shared session either.
++                // (b) final-token flush. Skipped (leaving the coherent pre-flush boundary) when no tip
++                // or chain tail can come of it anyway (aux lines, both budgets off): aux must not advance
++                // the shared session either. TAIL-RESUME: prompt_cache>0 on main non-aux requests flushes
++                // even with tip budget zero, so the chain tail is independent of full SavedState tips.
+                 // K8V4: no post-DONE flush (it exists for the tip boundary) - live stays as decode left it,
+                 // exactly as upstream; the chain reuses it via checkpoint_restore + kv_restore.
+                 if (boundary_ok && !stop_req.load() && produced_n > 0 && emit_pos >= 0 &&
+-                    emit_pos + 1 <= o.max_context && o.tip_cache_gib > 0.0 && !req_aux && saved_state_kv_ok()) {
++                    emit_pos + 1 <= o.max_context && (o.tip_cache_gib > 0.0 || o.prompt_cache > 0) &&
++                    !req_aux && saved_state_kv_ok()) {
+                     struct FlushNoHead {
+                         strata::core::Verifier& v;
+                         explicit FlushNoHead(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+@@ -7358,6 +7466,90 @@ int main(int argc, char** argv) {
+                                      (long long) live.size());
+                     }
+                 }
++                // (e) TAIL-RESUME end-of-request chain checkpoint at live.size() (prompt + actually
++                // emitted tokens): live ids/images (NOT cur, which is prompt only), recurrent/stage
++                // state and the attached row/hash/cvec/vf from the flush residual. Same count/LRU
++                // eviction as checkpoint_at; no full main/MTP KV snapshot. Optional/best-effort in
++                // this post-DONE block: never fatal, never loses the served answer, never invents a
++                // row (flush_R empty, e.g. produced_n==0, captures nothing). The tail MTP state must
++                // be coherent: a failed catch-up (mtp_ok false) claims nothing repairable. A STOP
++                // arriving during post-DONE work publishes no new tail checkpoint either.
++                if (boundary_ok && mtp_ok && !flush_R.empty() && !req_aux && o.prompt_cache > 0 &&
++                    !live.empty() && !stop_req.load() && saved_state_kv_ok()) {
++                    try {
++                        const int64_t tail_L = (int64_t) live.size();
++                        // Division FIRST: bound before multiplying (same wrap-to-small rule as the
++                        // attach helper); the product below is then exact.
++                        const uint64_t tail_cells_ok =
++                            (tail_L >= 1 && g.hc > 0 && g.n_embd > 0 &&
++                             (uint64_t) g.hc <= strata::core::kCheckpointRowCapCells / (uint64_t) g.n_embd)
++                                ? (uint64_t) g.hc * (uint64_t) g.n_embd
++                                : 0;
++                        const int64_t tail_vf = std::min(mtp.prefill_valid_from(), tail_L - 1);
++                        if (tail_cells_ok > 0 && flush_R.size() == (size_t) tail_cells_ok) {
++                            bool tail_dup = false;
++                            for (ConvCheckpoint& cc : checks)
++                                if ((int64_t) cc.ids.size() == tail_L) {
++                                    tail_dup = true;
++                                    if (cc.ids == live && cc.imgs == live_imgs) {
++                                        restore::attach_checkpoint_row(cc, flush_R, tail_L, cvec_cached,
++                                                                       g.hc, g.n_embd, tail_vf,
++                                                                       nullptr);
++                                    }
++                                    cc.used = ++check_clock;
++                                    break;
++                                }
++                            if (!tail_dup) {
++                                ConvCheckpoint tc;
++                                tc.ids = live;
++                                tc.imgs = live_imgs;
++                                bool tc_ok = cudaDeviceSynchronize() == cudaSuccess &&
++                                             checkpoint_save(tc, ss, g);
++                                for (auto& st : stages) {
++                                    if (!tc_ok) break;
++                                    const strata::core::OnDevice on(st->dev);
++                                    ConvCheckpoint part;
++                                    part.ids = tc.ids;
++                                    if (cudaDeviceSynchronize() != cudaSuccess ||
++                                        !checkpoint_save(part, st->ss, g))
++                                        tc_ok = false;
++                                    else
++                                        tc.stage_parts.push_back(std::move(part));
++                                }
++                                if (tc_ok) {
++                                    tc.used = ++check_clock;
++                                    restore::attach_checkpoint_row(tc, flush_R, tail_L, cvec_cached,
++                                                                   g.hc, g.n_embd, tail_vf,
++                                                                   nullptr);
++                                    // Pre-push eviction under the exact root-pinned/LRU victim rule:
++                                    // the victim is chosen BEFORE checks mutates, so a stamps throw
++                                    // skips the capture with checks untouched. The push may throw
++                                    // (checks unchanged); the erase only moves (noexcept). The count
++                                    // bound holds on every path, row or row-less alike.
++                                    bool evict = (int) checks.size() + 1 > o.prompt_cache;
++                                    size_t victim = checks.size();
++                                    if (evict) {
++                                        std::vector<uint64_t> stamps;
++                                        stamps.reserve(checks.size() + 1);
++                                        for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
++                                        stamps.push_back(tc.used);
++                                        victim = strata::program::conv_cache::eviction_victim(
++                                            stamps.data(), stamps.size(), o.prompt_cache);
++                                    }
++                                    checks.push_back(std::move(tc));
++                                    if (evict)
++                                        checks.erase(checks.begin() + (std::ptrdiff_t) victim);
++                                }
++                            }
++                        }
++                    } catch (const std::exception& ex) {
++                        std::fprintf(stderr, "strata serve: tail checkpoint at %lld tokens skipped "
++                                             "(%s)\n", (long long) live.size(), ex.what());
++                    } catch (...) {
++                        std::fprintf(stderr, "strata serve: tail checkpoint at %lld tokens skipped\n",
++                                     (long long) live.size());
++                    }
++                }
+             } catch (const std::exception& ex) {
+                 std::fprintf(stderr, "strata serve: SavedState post-DONE work threw (%s): live invalidated\n",
+                              ex.what());
+diff --git a/src/program/restore.cpp b/src/program/restore.cpp
+index c090e07..dea5641 100644
+--- a/src/program/restore.cpp
++++ b/src/program/restore.cpp
+@@ -31,6 +31,157 @@ namespace strata::program::restore {
+ using strata::core::ConversationCheckpoint;
+ using strata::core::ConversationImageKey;
+ 
++bool attach_checkpoint_row(ConversationCheckpoint& cc, const std::vector<float>& row, int64_t stash_L,
++                           bool cvec, int64_t hc, int64_t n_embd, int64_t valid_from,
++                           std::string* why) {
++    auto fail = [&](const char* w) -> bool {
++        try {
++            cc.boundary_row.clear();
++        } catch (...) {
++        }
++        if (why != nullptr) {
++            try {
++                *why = w;
++            } catch (...) {
++            }
++        }
++        return false;
++    };
++    try {
++        const int64_t L = (int64_t) cc.ids.size();
++        if (L < 1) return fail("checkpoint empty");
++        if (stash_L != L) return fail("scratch row length mismatch");
++        if (hc <= 0 || n_embd <= 0) return fail("nonzero shape");
++        // Division FIRST: bound before multiplying (wrap-to-small can never pass), so every
++        // product below is exact and every allocation is pre-bounded.
++        if ((uint64_t) hc > strata::core::kCheckpointRowCapCells / (uint64_t) n_embd)
++            return fail("row over byte cap");
++        const uint64_t prod = (uint64_t) hc * (uint64_t) n_embd;
++        if ((uint64_t) row.size() != prod) return fail("row length");
++        if (valid_from < 0 || valid_from > L - 1) return fail("valid_from");
++        // The total extra allocation (payload + copied image keys) stays under the cap.
++        // Image count is bounded BEFORE multiplying, so the product below is exact.
++        if (cc.imgs.size() > strata::core::kCheckpointRowCapBytes / sizeof(ConversationImageKey))
++            return fail("row over byte cap");
++        const uint64_t img_bytes = (uint64_t) cc.imgs.size() * sizeof(ConversationImageKey);
++        if (img_bytes > strata::core::kCheckpointRowCapBytes ||
++            prod * sizeof(float) > strata::core::kCheckpointRowCapBytes - img_bytes)
++            return fail("row over byte cap");
++        // Fresh temporary, then move: a prior oversized retained capacity cannot persist
++        // through a successful attach. Capacities are re-checked before publication (below),
++        // and any throw below fails closed: the catch invalidates the old row too.
++        strata::core::ConversationCheckpointRow tmp;
++        tmp.row = row;
++        tmp.imgs = cc.imgs;
++        // Actual dynamic capacities fit the combined cap (safe divisions/subtraction only):
++        // account exactly what std::vector retained, even with extra capacity.
++        if (tmp.row.capacity() > strata::core::kCheckpointRowCapBytes / sizeof(float))
++            return fail("row over byte cap");
++        const uint64_t row_cap_bytes = (uint64_t) tmp.row.capacity() * sizeof(float);
++        if (tmp.imgs.capacity() >
++            (strata::core::kCheckpointRowCapBytes - row_cap_bytes) / sizeof(ConversationImageKey))
++            return fail("row over byte cap");
++        tmp.L = L;
++        tmp.ids_hash =
++            saved_state::root_fnv1a(cc.ids.data(), cc.ids.size() * sizeof(int32_t));
++        tmp.cvec = cvec;
++        tmp.hc = hc;
++        tmp.n_embd = n_embd;
++        tmp.valid_from = valid_from;
++        cc.boundary_row = std::move(tmp);
++        return true;
++    } catch (const std::exception& ex) {
++        if (why != nullptr) {
++            try {
++                *why = ex.what();
++            } catch (...) {
++            }
++        }
++        try {
++            cc.boundary_row.clear();
++        } catch (...) {
++        }
++        return false;
++    } catch (...) {
++        return fail("attach threw");
++    }
++}
++
++bool checkpoint_row_valid_for(const ConversationCheckpoint& cc, int64_t n, size_t hcn,
++                              int64_t boundary_hc, int64_t boundary_n_embd,
++                              int64_t new_valid_from, bool cvec, const std::vector<int64_t>& req_ids,
++                              const std::vector<ConversationImageKey>& req_imgs, std::string* why) {
++    auto fail = [&](const char* w) -> bool {
++        if (why != nullptr) {
++            try {
++                *why = w;
++            } catch (...) {
++            }
++        }
++        return false;
++    };
++    try {
++        if (n < 1 || req_ids.size() != (size_t) n) return fail("bounds/request end");
++        const int64_t k = (int64_t) cc.ids.size();
++        if (k < 1 || k >= n) return fail("bounds/request end");
++        if ((int64_t) req_ids.size() <= k) return fail("bounds/request end");   // request[k] pairs cell k-1
++        if (hcn == 0 || boundary_hc <= 0 || boundary_n_embd <= 0) return fail("nonzero shape");
++        if ((uint64_t) boundary_hc > strata::core::kCheckpointRowCapCells / (uint64_t) boundary_n_embd)
++            return fail("geometry/product");
++        if ((uint64_t) boundary_hc * (uint64_t) boundary_n_embd != (uint64_t) hcn)
++            return fail("geometry/product");
++        const auto& r = cc.boundary_row;
++        if (!r.has()) return fail("missing row");
++        if (r.L != k) return fail("wrong L");
++        if (r.hc != boundary_hc || r.n_embd != boundary_n_embd) return fail("geometry");
++        if (!checkpoint_row_shape_ok(r.hc, r.n_embd, r.row.size())) return fail("geometry/product");
++        if (r.row.size() != hcn) return fail("geometry/product");
++        // Retained dynamic capacities fit the combined cap (divisions/subtraction only, never
++        // a huge product first): a row that grew past the cap since attach cannot repair.
++        if (r.row.capacity() > strata::core::kCheckpointRowCapBytes / sizeof(float))
++            return fail("geometry/product");
++        {
++            const uint64_t row_cap_bytes = (uint64_t) r.row.capacity() * sizeof(float);
++            if (r.imgs.capacity() >
++                (strata::core::kCheckpointRowCapBytes - row_cap_bytes) / sizeof(ConversationImageKey))
++                return fail("geometry/product");
++        }
++        uint64_t h = 0;
++        try {
++            h = saved_state::root_fnv1a(cc.ids.data(), cc.ids.size() * sizeof(int32_t));
++        } catch (...) {
++            return fail("ids hash");
++        }
++        if (h != r.ids_hash) return fail("ids hash");
++        // Direct int64 comparison: truncating an out-of-int32 request token could forge equality.
++        for (int64_t i = 0; i < k; ++i)
++            if (req_ids[(size_t) i] != (int64_t) cc.ids[(size_t) i]) return fail("ids");
++        std::vector<ConversationImageKey> below;
++        try {
++            for (const auto& img : req_imgs)
++                if (img.start < k) below.push_back(img);
++        } catch (...) {
++            return fail("image identity");
++        }
++        if (!(below == cc.imgs)) return fail("image identity");
++        if (!(r.imgs == cc.imgs)) return fail("image identity");
++        if (r.cvec != cvec) return fail("cvec");
++        if (r.valid_from < 0 || r.valid_from > k - 1) return fail("valid_from");
++        if (new_valid_from < r.valid_from) return fail("reachable window");
++        return true;
++    } catch (const std::exception& ex) {
++        if (why != nullptr) {
++            try {
++                *why = ex.what();
++            } catch (...) {
++            }
++        }
++        return false;
++    } catch (...) {
++        return fail("validator threw");
++    }
++}
++
+ bool chain_repairable(int64_t k, bool is_live, const RepairCtx& ctx) {
+     try {
+         if (k < 1 || k >= ctx.n || ctx.hcn == 0) return false;
+@@ -46,6 +197,20 @@ bool chain_repairable(int64_t k, bool is_live, const RepairCtx& ctx) {
+                                                 ctx.live_ids->size() * sizeof(int32_t)) &&
+                    ctx.new_valid_from >= ctx.live_row_vf;
+         }
++        // TAIL-RESUME: a checkpoint-attached row repairs k-1 with the same identity checks.
++        // Validated FIRST, so a valid attached row is never rejected by a throwing fallback
++        // lookup; the exact SavedState fallback below stands unchanged when the row is
++        // absent or invalid. K8V4 keeps the need_repair=false bypass above (no captures).
++        if (!is_live && ctx.ckpt != nullptr && ctx.req_ids != nullptr && ctx.req_imgs != nullptr &&
++            (int64_t) ctx.ckpt->ids.size() == k) {
++            try {
++                if (checkpoint_row_valid_for(*ctx.ckpt, ctx.n, ctx.hcn, ctx.boundary_hc,
++                                             ctx.boundary_n_embd, ctx.new_valid_from, ctx.cvec,
++                                             *ctx.req_ids, *ctx.req_imgs, nullptr))
++                    return true;
++            } catch (...) {
++            }
++        }
+         const saved_state::SavedItem* exact =
+             ctx.store_ok && ctx.store != nullptr && ctx.ids != nullptr && ctx.imgs != nullptr ?
+                 ctx.store->find_exact(*ctx.ids, *ctx.imgs, ctx.cvec, k) :
+@@ -85,7 +250,12 @@ std::vector<ChainCand> collect_chain_candidates(
+         for (const ConversationCheckpoint& cc : checks) {
+             const int64_t ck = (int64_t) cc.ids.size();
+             if (!chain_prefix_ok(cc.ids, cc.imgs, ids, req_imgs, n)) continue;
+-            if (chain_repairable(ck, false, repair))
++            // TAIL-RESUME: the gate sees the actual checkpoint, so its attached row can repair.
++            RepairCtx per = repair;
++            per.ckpt = &cc;
++            per.req_ids = &ids;
++            per.req_imgs = &req_imgs;
++            if (chain_repairable(ck, false, per))
+                 chain.push_back({ck, false});
+             else
+                 std::fprintf(stderr, "strata serve: chain candidate at %lld tokens has no MTP "
+diff --git a/src/program/restore_test.cpp b/src/program/restore_test.cpp
+index eaf1dc8..0dd8a12 100644
+--- a/src/program/restore_test.cpp
++++ b/src/program/restore_test.cpp
+@@ -684,6 +684,336 @@ int main() {
+                   m.fail == restore::RestoreFail::Transient,
+               "throw + reset false is FatalMount");
+     }
++    {   // TAIL-RESUME accept: a checkpoint-attached row repairs with NO SavedState source.
++        // The store is empty, so only the attached row can admit the candidate.
++        saved::SavedStateStore st;
++        const std::vector<int64_t> ids = req64(250);
++        const std::vector<int32_t> ids32 = req32(250);
++        strata::core::ConversationCheckpoint cc = chain_item(150, 0);
++        std::vector<float> row(8, 0.25f);
++        check(restore::attach_checkpoint_row(cc, row, 150, true, 2, 4, 0, nullptr),
++              "tail attach succeeds");
++        std::vector<strata::core::ConversationCheckpoint> checks;
++        checks.push_back(cc);
++        const std::vector<int32_t> live = req32(200);   // live kept out (live_ok false below)
++        restore::RepairCtx ctx = repair_ctx(250, &st, &ids32, &no_simgs, true);
++        std::vector<restore::ChainCand> got = restore::collect_chain_candidates(
++            true, false, live, no_cimgs, checks, ids, no_cimgs, 250, ctx);
++        check(got.size() == 1 && got[0].k == 150 && !got[0].live,
++              "attached row accepted with no store");
++        // The execution half calls the SAME validator: it agrees here.
++        check(restore::checkpoint_row_valid_for(checks[0], 250, 8, 2, 4, 0, true, ids, no_cimgs),
++              "direct validator accepts the same row");
++    }
++    {   // TAIL-RESUME rejects: each reason independently turns a valid row invalid.
++        const std::vector<int64_t> ids = req64(250);
++        const std::vector<strata::core::ConversationImageKey> one_img = {{10, 77}};
++        auto valid = [&]() {
++            strata::core::ConversationCheckpoint c = chain_item(150, 0);
++            std::vector<float> row(8, 0.5f);
++            const bool ok = restore::attach_checkpoint_row(c, row, 150, true, 2, 4, 0, nullptr);
++            check(ok, "reject fixture attaches");
++            return c;
++        };
++        {   // missing row (never attached)
++            const strata::core::ConversationCheckpoint c = chain_item(150, 0);
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "missing row rejects");
++        }
++        {   // empty row
++            auto c = valid();
++            c.boundary_row.row.clear();
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "empty row rejects");
++        }
++        {   // truncated row
++            auto c = valid();
++            c.boundary_row.row.pop_back();
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "truncated row rejects");
++            check(c.boundary_row.bytes() >= 8 * sizeof(float),
++                  "invalid row capacity still counted");
++        }
++        {   // recorded L != checkpoint length
++            auto c = valid();
++            c.ids.push_back(150);
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "wrong L rejects");
++        }
++        {   // ids hash
++            auto c = valid();
++            c.boundary_row.ids_hash ^= 1;
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "ids hash rejects");
++        }
++        {   // full ids equality, isolated from the hash (hash recomputed over the mutant)
++            auto c = valid();
++            c.ids[60] = 9999;
++            c.boundary_row.ids_hash =
++                saved::root_fnv1a(c.ids.data(), c.ids.size() * sizeof(int32_t));
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "divergent ids reject despite matching hash");
++        }
++        {   // below-L image identity vs the request (checkpoint claims a picture it lacks)
++            auto c = chain_item(150, 0);
++            c.imgs = one_img;
++            std::vector<float> row(8, 0.5f);
++            check(restore::attach_checkpoint_row(c, row, 150, true, 2, 4, 0, nullptr),
++                  "imaged fixture attaches");
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "image below-L vs request rejects");
++            check(restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, one_img),
++                  "matching image accepts");
++            c.boundary_row.imgs.clear();   // retained-row identity vs the checkpoint
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, one_img),
++                  "retained-row image identity rejects");
++        }
++        {   // cvec
++            auto c = valid();
++            c.boundary_row.cvec = false;
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "cvec mismatch rejects");
++        }
++        {   // geometry / product
++            auto c = valid();
++            c.boundary_row.hc = 3;
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "wrong hc rejects");
++            c = valid();
++            check(!restore::checkpoint_row_valid_for(c, 250, 16, 2, 4, 0, true, ids, no_cimgs),
++                  "hcn mismatch rejects");
++            c = valid();
++            check(!restore::checkpoint_row_valid_for(c, 250, 0, 2, 4, 0, true, ids, no_cimgs),
++                  "zero hcn rejects");
++            c = valid();
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 0, 4, 0, true, ids, no_cimgs),
++                  "zero boundary shape rejects");
++        }
++        {   // valid_from: negative, past k-1, and the reachable-window regression
++            auto c = valid();
++            c.boundary_row.valid_from = -1;
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "negative valid_from rejects");
++            c = valid();
++            c.boundary_row.valid_from = 150;
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "valid_from past k-1 rejects");
++            c = valid();
++            c.boundary_row.valid_from = 10;
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 9, true, ids, no_cimgs),
++                  "new window below saved valid_from rejects");
++            check(restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 10, true, ids, no_cimgs),
++                  "new window at saved valid_from accepts");
++        }
++        {   // bounds / request end (the request vector IS the request: size == n, and
++            // request[k] must exist for the k-1 pairing)
++            auto c = valid();
++            check(!restore::checkpoint_row_valid_for(c, 150, 8, 2, 4, 0, true, req64(150), no_cimgs),
++                  "k == n never mounts");
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, req64(150), no_cimgs),
++                  "longer n than the actual request rejects");
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, req64(149), no_cimgs),
++                  "short request (no request[k]) rejects");
++            check(!restore::checkpoint_row_valid_for(c, 0, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "empty request rejects");
++            const strata::core::ConversationCheckpoint empty;
++            check(!restore::checkpoint_row_valid_for(empty, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "empty checkpoint rejects");
++        }
++        {   // out-of-int32 request tokens never compare equal (no truncation forge)
++            auto c = valid();
++            std::vector<int64_t> wide = req64(250);
++            wide[60] += (int64_t) 1 << 32;   // low 32 bits still read 60
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, wide, no_cimgs),
++                  "wide token rejects despite low-bit match");
++        }
++        {   // shape gate units: exact, short, zero, overflow, and wrap-to-small (no
++            // allocation on any path). hc=(1LL<<62)+1 with n_embd=4 wraps to 4.
++            check(restore::checkpoint_row_shape_ok(2, 4, 8), "shape gate accepts exact");
++            check(!restore::checkpoint_row_shape_ok(2, 4, 7), "shape gate rejects short");
++            check(!restore::checkpoint_row_shape_ok(0, 4, 0), "shape gate rejects zero");
++            check(!restore::checkpoint_row_shape_ok((int64_t) 1 << 40, (int64_t) 1 << 40, 8),
++                  "shape gate rejects overflow");
++            check(!restore::checkpoint_row_shape_ok(((int64_t) 1 << 62) + 1, 4, 4),
++                  "shape gate rejects wrap-to-small");
++        }
++    }
++    {   // TAIL-RESUME attach side: failures leave NO usable row (fail closed, never legitimized).
++        const std::vector<int64_t> ids = req64(250);
++        std::vector<float> row(8, 0.5f);
++        {   // scratch length mismatch (a later row must never dress an earlier checkpoint)
++            auto c = chain_item(150, 0);
++            check(!restore::attach_checkpoint_row(c, row, 149, true, 2, 4, 0, nullptr) &&
++                      !c.boundary_row.has(),
++                  "stale-length attach fails closed");
++        }
++        {   // short row
++            auto c = chain_item(150, 0);
++            std::vector<float> short_row(7, 0.5f);
++            check(!restore::attach_checkpoint_row(c, short_row, 150, true, 2, 4, 0, nullptr) &&
++                      !c.boundary_row.has(),
++                  "short-row attach fails closed");
++        }
++        {   // over the per-row byte cap (512x513 floats = just over 1 MiB)
++            auto c = chain_item(150, 0);
++            std::vector<float> big((size_t) 512 * 513, 0.5f);
++            check(!restore::attach_checkpoint_row(c, big, 150, true, 512, 513, 0, nullptr) &&
++                      !c.boundary_row.has(),
++                  "over-cap attach fails closed");
++        }
++        {   // overflow shape without a matching allocation
++            auto c = chain_item(150, 0);
++            check(!restore::attach_checkpoint_row(c, row, 150, true, (int64_t) 1 << 32, 4, 0,
++                                                  nullptr) &&
++                      !c.boundary_row.has(),
++                  "overflow attach fails closed");
++        }
++        {   // wrap-to-small shape ((1LL<<62)+1 * 4 wraps to 4): bounded before multiplying
++            auto c = chain_item(150, 0);
++            std::vector<float> four(4, 0.5f);
++            check(!restore::attach_checkpoint_row(c, four, 150, true, ((int64_t) 1 << 62) + 1, 4,
++                                                  0, nullptr) &&
++                      !c.boundary_row.has(),
++                  "wrap-to-small attach fails closed");
++        }
++        {   // too many image keys: the count is bounded before multiplying
++            auto c = chain_item(150, 0);
++            c.imgs.assign(70000, strata::core::ConversationImageKey{0, 0});
++            check(!restore::attach_checkpoint_row(c, row, 150, true, 2, 4, 0, nullptr) &&
++                      !c.boundary_row.has(),
++                  "too-many-image attach fails closed");
++        }
++        {   // retained over-cap capacity rejects at validation (size still exact)
++            auto c = chain_item(150, 0);
++            std::vector<float> cap_row(8, 0.5f);
++            check(restore::attach_checkpoint_row(c, cap_row, 150, true, 2, 4, 0, nullptr),
++                  "retained-capacity fixture attaches");
++            c.boundary_row.row.reserve(300000);   // ~1.2 MiB retained, 8 floats live
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "over-cap retained capacity rejects");
++        }
++        {   // invalid valid_from is rejected before publication (capture passes min(vf, L-1))
++            auto c = chain_item(150, 0);
++            check(!restore::attach_checkpoint_row(c, row, 150, true, 2, 4, -1, nullptr) &&
++                      !c.boundary_row.has(),
++                  "negative valid_from attach fails closed");
++            auto d = chain_item(150, 0);
++            check(!restore::attach_checkpoint_row(d, row, 150, true, 2, 4, 150, nullptr) &&
++                      !d.boundary_row.has(),
++                  "valid_from past L-1 attach fails closed");
++            auto e = chain_item(150, 0);
++            check(restore::attach_checkpoint_row(e, row, 150, true, 2, 4, 149, nullptr) &&
++                      e.boundary_row.has(),
++                  "valid_from at L-1 attaches");
++        }
++        {   // a failed re-attach erases the previously valid row (never a stale success)
++            auto c = chain_item(150, 0);
++            check(restore::attach_checkpoint_row(c, row, 150, true, 2, 4, 0, nullptr),
++                  "re-attach fixture valid");
++            std::vector<float> short_row(7, 0.5f);
++            check(!restore::attach_checkpoint_row(c, short_row, 150, true, 2, 4, 0, nullptr) &&
++                      !c.boundary_row.has(),
++                  "failed re-attach invalidates");
++            check(!restore::checkpoint_row_valid_for(c, 250, 8, 2, 4, 0, true, ids, no_cimgs),
++                  "invalidated row rejects");
++        }
++    }
++    {   // TAIL-RESUME fallback + ordering: the old exact SavedState source still admits a
++        // row-less checkpoint; the longest matching attached checkpoint wins; a mutated middle
++        // selects the newest checkpoint below the change (never the root).
++        const std::vector<int64_t> ids = req64(250);
++        const std::vector<int32_t> ids32 = req32(250);
++        saved::SavedStateStore st;
++        check(st.insert_tip(make_item(150, 0), false), "fallback boundary source tip(150) stores");
++        restore::RepairCtx ctx = repair_ctx(250, &st, &ids32, &no_simgs, true);
++        const std::vector<int32_t> live = req32(200);
++        {   // invalid attached row + exact SavedState at the same k: the fallback admits it
++            auto bad = chain_item(150, 0);
++            std::vector<float> row(8, 0.5f);
++            check(restore::attach_checkpoint_row(bad, row, 150, true, 2, 4, 0, nullptr),
++                  "fallback fixture attaches");
++            bad.boundary_row.ids_hash ^= 1;   // invalid row, legitimate store entry remains
++            std::vector<strata::core::ConversationCheckpoint> checks;
++            checks.push_back(bad);
++            std::vector<restore::ChainCand> got = restore::collect_chain_candidates(
++                true, false, live, no_cimgs, checks, ids, no_cimgs, 250, ctx);
++            check(got.size() == 1 && got[0].k == 150, "invalid row falls back to SavedState");
++        }
++        {   // longest matching attached checkpoint beats the older root-length one
++            saved::SavedStateStore empty;
++            restore::RepairCtx c2 = repair_ctx(250, &empty, &ids32, &no_simgs, true);
++            std::vector<strata::core::ConversationCheckpoint> checks;
++            auto root = chain_item(100, 0);
++            auto tip = chain_item(150, 0);
++            std::vector<float> row(8, 0.5f);
++            check(restore::attach_checkpoint_row(root, row, 100, true, 2, 4, 0, nullptr) &&
++                      restore::attach_checkpoint_row(tip, row, 150, true, 2, 4, 0, nullptr),
++                  "ordering fixtures attach");
++            checks.push_back(root);
++            checks.push_back(tip);
++            std::vector<restore::ChainCand> got = restore::collect_chain_candidates(
++                true, false, live, no_cimgs, checks, ids, no_cimgs, 250, c2);
++            check(got.size() == 2 && got[0].k == 150 && got[1].k == 100,
++                  "longest attached checkpoint first");
++        }
++        {   // mutated middle: the client changed token 160; 180 no longer prefixes, 150 does
++            saved::SavedStateStore empty;
++            restore::RepairCtx c2 = repair_ctx(250, &empty, &ids32, &no_simgs, true);
++            std::vector<int64_t> mut = req64(250);
++            mut[160] = 9999;
++            std::vector<strata::core::ConversationCheckpoint> checks;
++            auto above = chain_item(180, 0);
++            auto below = chain_item(150, 0);
++            std::vector<float> row(8, 0.5f);
++            check(restore::attach_checkpoint_row(above, row, 180, true, 2, 4, 0, nullptr) &&
++                      restore::attach_checkpoint_row(below, row, 150, true, 2, 4, 0, nullptr),
++                  "mutation fixtures attach");
++            checks.push_back(above);
++            checks.push_back(below);
++            std::vector<restore::ChainCand> got = restore::collect_chain_candidates(
++                true, false, live, no_cimgs, checks, mut, no_cimgs, 250, c2);
++            check(got.size() == 1 && got[0].k == 150,
++                  "mutated middle selects newest below the change");
++        }
++        {   // live + K8V4 no-repair behaviour unchanged: row-less checkpoints still offered
++            saved::SavedStateStore empty;
++            restore::RepairCtx c2 = repair_ctx(250, &empty, &ids32, &no_simgs, false);
++            std::vector<strata::core::ConversationCheckpoint> checks;
++            checks.push_back(chain_item(150, 0));
++            std::vector<restore::ChainCand> got = restore::collect_chain_candidates(
++                true, false, live, no_cimgs, checks, ids, no_cimgs, 250, c2);
++            check(got.size() == 1 && got[0].k == 150, "no-repair needs no row");
++        }
++    }
++    {   // TAIL-RESUME accounting: the row is counted (capacities, validity-independent)
++        // while attached; clear() keeps capacity, so a cleared-but-retained row still counts
++        // (truthful until the checkpoint is evicted/pruned, which destroys the vectors).
++        // The bound is prompt_cache rows of at most the per-row cap each.
++        auto c = chain_item(150, 0);
++        const size_t bare = c.bytes();
++        std::vector<float> row(8, 0.5f);
++        check(restore::attach_checkpoint_row(c, row, 150, true, 2, 4, 0, nullptr),
++              "accounting fixture attaches");
++        const size_t full = c.bytes();
++        check(full > bare && full - bare >= 8 * sizeof(float),
++              "attached row counted in bytes()");
++        c.boundary_row.clear();
++        check(!c.boundary_row.has() && c.bytes() == full,
++              "cleared retained capacity still counted");
++        // eviction destroys the row with its checkpoint: summed bytes drop by the full row cost.
++        std::vector<strata::core::ConversationCheckpoint> chain;
++        chain.push_back(chain_item(100, 0));
++        chain.push_back(chain_item(150, 0));
++        check(restore::attach_checkpoint_row(chain[0], row, 100, true, 2, 4, 0, nullptr) &&
++                  restore::attach_checkpoint_row(chain[1], row, 150, true, 2, 4, 0, nullptr),
++              "eviction fixtures attach");
++        size_t before = 0;
++        for (const auto& k : chain) before += k.bytes();
++        chain.erase(chain.begin());
++        size_t after = 0;
++        for (const auto& k : chain) after += k.bytes();
++        check(after < before, "evicted checkpoint takes its row bytes");
++    }
+     if (g_fail == 0)
+         std::printf("restore_test: all ok\n");
+     else
+diff --git a/src/program/saved_state_layout_test.cpp b/src/program/saved_state_layout_test.cpp
+index 2ff0edc..b2a3ceb 100644
+--- a/src/program/saved_state_layout_test.cpp
++++ b/src/program/saved_state_layout_test.cpp
+@@ -393,6 +393,51 @@ int main() {
+         fs::remove_all(dir, ec);
+         check(!ec && !fs::exists(dir), "layout scan tmp cleaned");
+     }
++    {   // TAIL-RESUME parked estimate: conversation_snapshot_bytes covers an attached
++        // boundary row (payload + copied image keys), so the parked reservation always
++        // holds the checkpoint list it copies. Row metadata is filled by hand (the attach
++        // helper lives in restore.cpp, which this test does not link); the estimate only
++        // reads the vectors.
++        Fixture f;
++        check(make_fixture(0, 12, 0, 36, true, f, err), "tail estimate fixture builds");
++        for (int64_t j = 0; j < 12; ++j) {   // KV extent for the estimate leg (no transfer runs)
++            core::QsaState& st = f.qs[(size_t) j];
++            st.n_pages = 4096;
++            st.n_slots = 4096;
++            st.kv_mode = 0;
++        }
++        core::QsaState draft{};
++        draft.max_cells = f.ss.max_cells;
++        draft.n_pages = 4096;
++        draft.n_slots = 4096;
++        draft.kv_mode = 0;
++        draft.idx_pooled_rows = 65536;
++        std::vector<int32_t> ids((size_t) L);
++        for (int64_t i = 0; i < L; ++i) ids[(size_t) i] = (int32_t)(1000 + i);
++        const std::vector<core::ConversationImageKey> images = {{100, 0xabc}};
++        core::ConversationCheckpoint ck;
++        ck.ids.assign(ids.begin(), ids.begin() + 8000);
++        ck.imgs = images;
++        check(core::conversation_checkpoint_save(ck, f.ss, f.g, err), "tail estimate checkpoint saves");
++        std::vector<core::ConversationCheckpoint> bare_ck{ck};
++        const core::ConversationView bare_view{ids, images, bare_ck, true};
++        size_t bare = 0;
++        check(core::conversation_snapshot_bytes(bare_view, f.ss, f.g, draft, bare, err),
++              "tail estimate baseline");
++        core::ConversationCheckpoint with_row = ck;
++        with_row.boundary_row.row.assign(64, 0.5f);
++        with_row.boundary_row.imgs = with_row.imgs;
++        with_row.boundary_row.L = 8000;
++        with_row.boundary_row.hc = 8;
++        with_row.boundary_row.n_embd = 8;
++        std::vector<core::ConversationCheckpoint> full_ck{with_row};
++        const core::ConversationView full_view{ids, images, full_ck, true};
++        size_t full = 0;
++        check(core::conversation_snapshot_bytes(full_view, f.ss, f.g, draft, full, err),
++              "tail estimate with row");
++        check(full > bare && full - bare == 64 * sizeof(float) + sizeof(core::ConversationImageKey),
++              "tail estimate covers row payload + image keys");
++    }
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }
+-- 
+2.54.0.windows.1
+
