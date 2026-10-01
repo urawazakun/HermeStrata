@@ -1,8 +1,9 @@
-From d1af3d68c4c69e26c70eaacb33ec6140a8489155 Mon Sep 17 00:00:00 2001
-From: Muse <muse@local>
-Date: Thu, 1 Oct 2026 07:39:14 +0900
-Subject: [PATCH 2/4] refactor(cache): STEP 1 (CELL-C) extract restore
- candidate selection and walk
+From 377e1dffb33e0a97890f0b2ad8d70a1bf170ba4e Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:20:32 +0900
+Subject: [PATCH 11/14] Restore candidate selection extracted from main():
+ RestoreCandidate list (chain/tip/root/root-disk, longest first) and a typed
+ RestoreResult
 
 ---
  CMakeLists.txt                     |    7 +-

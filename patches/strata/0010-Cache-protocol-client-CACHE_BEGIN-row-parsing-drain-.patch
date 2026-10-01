@@ -1,10 +1,10 @@
-From cef6954024dc10dbdb29bc0ff89a285cadc46624 Mon Sep 17 00:00:00 2001
-From: Muse <muse@local>
-Date: Thu, 1 Oct 2026 07:09:31 +0900
-Subject: [PATCH 1/4] refactor(cache): STEP 5 (CELL-C) extract
- CacheProtocolClient from StrataEngine
+From b33976535fe9a04d1528956bd2cb683b0f4112cc Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:20:32 +0900
+Subject: [PATCH 10/14] Cache protocol client: CACHE_BEGIN/row
+ parsing/drain/timeout/desync/503 mapping moved out of StrataEngine into
+ serve/cache_protocol.py, with unit tests
 
-Behaviour-preserving: CACHE_BEGIN/row parsing, drain, timeout/deadline, desync kill and HTTP 503/501 mapping move to serve/cache_protocol.py with focused tests in serve/test_cache_protocol.py. StrataEngine keeps process management and delegates; serve/server.py re-exports keep existing imports working.
 ---
  serve/cache_protocol.py      | 294 +++++++++++++++++++++++
  serve/server.py              | 273 ++++-----------------

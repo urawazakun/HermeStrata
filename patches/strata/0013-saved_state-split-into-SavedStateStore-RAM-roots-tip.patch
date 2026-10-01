@@ -1,8 +1,9 @@
-From ef7a1ea4c2b7778799ddc29c6cc58257d0a29a4e Mon Sep 17 00:00:00 2001
-From: Muse <muse@local>
-Date: Thu, 1 Oct 2026 08:28:39 +0900
-Subject: [PATCH 4/4] refactor(cache): STEP 3 (CELL-C) split saved_state into
- codec and store units
+From 7e84156907668b44f95c3aaabaae73fd03d4689a Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:20:33 +0900
+Subject: [PATCH 13/14] saved_state split into SavedStateStore (RAM
+ roots/tips), RootDiskCodec (format, identity, checksum) and RootDiskStore
+ (index, writer, trim); codec tests
 
 ---
  CMakeLists.txt                             |   11 +-

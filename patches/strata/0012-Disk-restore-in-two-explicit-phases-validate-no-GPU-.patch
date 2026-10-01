@@ -1,8 +1,9 @@
-From db0cbfff6fb109134d1196483cb79c5ff9fbf591 Mon Sep 17 00:00:00 2001
-From: Muse <muse@local>
-Date: Thu, 1 Oct 2026 07:59:12 +0900
-Subject: [PATCH 3/4] refactor(cache): STEP 2 (CELL-C) split disk restore into
- validate and mount phases
+From b6c2938d42faa0a8f9ec15095dd9212398c8518a Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:20:33 +0900
+Subject: [PATCH 12/14] Disk restore in two explicit phases: validate (no GPU
+ mutation; corruption drops the index entry, transient keeps it) and mount
+ (failure resets cold)
 
 ---
  include/strata/program/restore.hpp |  64 +++++++

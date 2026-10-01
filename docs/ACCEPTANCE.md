@@ -45,3 +45,12 @@ Japanese answers 25.3 (t=0) / 25.6 (t=0.7) tok/s vs 22.6 / 22.3 on the 0.1.21 bu
 - re-run 06:35 PASS: c1 0.53-0.72 s; c3 tip 0.69-0.73 s, fork 1.6-1.7 s, recall 2/2 shown, root-disk after restart
   2.0-2.4 s; needle 3/3; Japanese 24-29 tok/s; 8K-doc decode 25.1 vs 23.2 tok/s (0.1.29, 3 reps each).
   Regression noted: identical repeated request resumes in ~1.3 s (0.1.29: 0.1-0.5 s).
+
+## 2026-10-01 readability refactor (patches/strata 0010-0014)
+
+Same driver and settings as the 0.1.30 acceptance. CPU: 15 C++ tests (cache/layout/restore/codec) and 180 Python
+tests pass after every step. GPU: root + aux (3/3 correct answers, root resume 0.5-0.7 s of prefill), parent /
+isolated child / fork (fork child recalls the planted fact; one of three ran out of its token budget while thinking,
+same pattern as the pre-refactor run), Japanese t=0 / t=0.7, a fact planted at 1/3 of 39K tokens found 3/3, bench x3:
+identical repeated 11.7K request 0.48-0.56 s prompt time (pre-refactor 1.31-1.36 s), 8K-doc decode 28.9-29.2 tok/s.
+Deployed to local production.

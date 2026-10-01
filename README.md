@@ -35,6 +35,7 @@ one line is the right trade-off. With 128 GB host RAM and an agent harness, seve
 | Strata | fixes from GPU acceptance: fall back to the next valid restore point instead of cold (F1); tips restorable at the last turn boundary of the prompt (F2/F2b) | `0007` |
 | Strata server | **prefix keeper** (`--prefix-keeper`): keeps Hermes requests append-only for the cache — volatile system lines become a trailing `[context update]`, pruned history is restored; idea by the owner | `0008` |
 | Strata | upstream 0.1.29/0.1.30 follow-ups: 0.1.30's `dead`/`block_pos` recurrent state carried through capture/restore/disk (disk schema v3), K8V4 KV explicitly unsupported for saved states, single MTP prefill, mutual exclusion with upstream's opt-in conversation cache | `0009` |
+| Strata + server | **readability refactor** (behaviour-preserving, from a ChatGPT review): cache-protocol client class (`serve/cache_protocol.py`), restore candidate selection as a typed list/result, two-phase disk restore (validate without GPU mutation, then mount), `saved_state` split into RAM store / disk codec / disk store, fix-history labels moved to `docs/CACHE-HISTORY.md`. GPU-accepted and in production | `0010`-`0014` |
 | Hermes | fixed prefix discipline: git workspace snapshot moved to the volatile tail (`HERMES_WORKSPACE_LATE=1`), title generated after the turn (`HERMES_TITLE_AFTER_TURN=1`) | `patches/hermes-agent/0001` |
 | Hermes | `delegate_task` **fork mode**: a child starts from the parent's exact prompt (+ its tool call + a tool result carrying the task), so the engine resumes it from the parent's saved state; blocked tools and depth limit are refused at call time instead of being removed from `tools[]` | `patches/hermes-agent/0002` |
 | Hermes | **work deadline** tools (`set_work_deadline` / `finish_work`): "work until 18:00" keeps the agent going until the deadline; run budget stays the ceiling | `patches/hermes-agent/0003` (experimental) |
@@ -68,14 +69,15 @@ showed no measurable gain here and stays off.
 Not yet measured on GPU: tip-budget eviction under pressure (item 6 of the ledger).
 ## 2026-10-01: rebased onto upstream Strata 0.1.30
 
-Production now runs the 0.1.30-based series (GPU acceptance on V100, same settings as above): saved states, root-disk, parent/child/fork and planted-fact recall all pass; Japanese answers +12-15% vs the 0.1.21 build (0.1.27 CJK draft head); a 39K-token prompt reads 12% faster; 8K-doc decode 25.1 vs 23.2 tok/s (0.1.29). Known gap: an identical repeated request resumes in ~1.3 s (was 0.1-0.5 s). The 0.1.21 series and its history stay in `patches/strata-0.1.21/`.
+Production now runs the 0.1.30-based series (GPU acceptance on V100, same settings as above): saved states, root-disk, parent/child/fork and planted-fact recall all pass; Japanese answers +12-15% vs the 0.1.21 build (0.1.27 CJK draft head); a 39K-token prompt reads 12% faster; 8K-doc decode 25.1 vs 23.2 tok/s (0.1.29).  The 0.1.21 series and its history stay in `patches/strata-0.1.21/`.
 
-> **WIP refactor (not in production):** `patches/wip-refactor/` applies on top of `patches/strata/` (behaviour-preserving readability refactor from the ChatGPT review: restore candidate selection, two-phase disk restore, saved_state split, cache-protocol client). Brief and progress: `docs/wip/`. Updated every ~2 h while it runs.
+Later the same day the readability refactor (`0010`-`0014`) passed the same GPU acceptance (root/aux, parent/child/fork with planted-fact recall, Japanese, a fact planted in 39K tokens 3/3) and replaced production. An identical repeated 11.7K request now resumes in 0.48-0.56 s (the 0.1.30 port had 1.3 s); 8K-doc decode 28.9-29.2 tok/s.
+
 
 ## Layout
 
 ```
-patches/strata/         9 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
+patches/strata/         14 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
 patches/strata-0.1.21/  the earlier 17-patch series on 0.1.21 (history)
 patches/hermes-agent/   git format-patch against the Hermes Agent snapshot used by this project
 docs/                   design, fix history, acceptance ledger

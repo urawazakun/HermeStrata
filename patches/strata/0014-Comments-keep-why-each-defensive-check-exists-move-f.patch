@@ -1,0 +1,1977 @@
+From 14b5717e7a97623d3cb700453e419ff44d985f50 Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:20:34 +0900
+Subject: [PATCH 14/14] Comments: keep why each defensive check exists; move
+ fix-history labels to docs/CACHE-HISTORY.md
+
+---
+ CMakeLists.txt                             |  12 +-
+ docs/CACHE-HISTORY.md                      |  78 ++++++++
+ include/strata/program/restore.hpp         |  19 +-
+ include/strata/program/root_disk_codec.hpp |   6 +-
+ include/strata/program/saved_state.hpp     | 122 ++++++------
+ src/program/generate.cpp                   | 214 ++++++++++-----------
+ src/program/restore.cpp                    |   4 +-
+ src/program/restore_test.cpp               |   2 +-
+ src/program/root_disk_codec.cpp            |   2 +-
+ src/program/saved_state.cpp                |  22 +--
+ src/program/saved_state_test.cpp           | 132 +++++++------
+ 11 files changed, 344 insertions(+), 269 deletions(-)
+ create mode 100644 docs/CACHE-HISTORY.md
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b352a6f..a8289f7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -640,9 +640,9 @@ endif()
+ #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
+ #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
+ # Plan v0.3 P6: speculation components that need no GPU.
+-# E1 (DESIGN-HERMES-CACHE.md): the SavedState store policy - CPU-only, no CUDA (see saved_state.hpp).
+-# CELL-C step 1: restore candidate selection (see restore.hpp) - CPU-only, no CUDA.
+-# Step 3: the on-disk codec (see root_disk_codec.hpp) and root-disk store (see root_disk_store.hpp).
++# The SavedState store policy - CPU-only, no CUDA (see saved_state.hpp).
++# Restore candidate selection (see restore.hpp) - CPU-only, no CUDA.
++# The on-disk codec (see root_disk_codec.hpp) and root-disk store (see root_disk_store.hpp).
+ add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
+             src/program/saved_state.cpp src/program/restore.cpp src/program/root_disk_codec.cpp
+             src/program/root_disk_store.cpp)
+@@ -671,15 +671,15 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
+   target_include_directories(bf16_bits_test PRIVATE include)
+   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+-  # E2 (DESIGN-HERMES-CACHE.md): SavedState eligibility walk + exact-length lookup (CPU-only)
++  # SavedState eligibility walk + exact-length lookup (CPU-only)
+   add_executable(saved_state_test src/program/saved_state_test.cpp)
+   target_link_libraries(saved_state_test PRIVATE strata_spec)
+   add_test(NAME saved_state_test COMMAND saved_state_test)
+-  # CELL-C step 1: restore candidate selection + walk (CPU-only, links strata_spec)
++  # Restore candidate selection + walk (CPU-only, links strata_spec)
+   add_executable(restore_test src/program/restore_test.cpp)
+   target_link_libraries(restore_test PRIVATE strata_spec)
+   add_test(NAME restore_test COMMAND restore_test)
+-  # Step 3: on-disk root codec format/rejection contract (CPU-only, links strata_spec)
++  # On-disk root codec format/rejection contract (CPU-only, links strata_spec)
+   add_executable(root_disk_codec_test src/program/root_disk_codec_test.cpp)
+   target_link_libraries(root_disk_codec_test PRIVATE strata_spec)
+   add_test(NAME root_disk_codec_test COMMAND root_disk_codec_test)
+diff --git a/docs/CACHE-HISTORY.md b/docs/CACHE-HISTORY.md
+new file mode 100644
+index 0000000..7eda13d
+--- /dev/null
++++ b/docs/CACHE-HISTORY.md
+@@ -0,0 +1,78 @@
++# Cache history (Hermes strata-030)
++
++Where the SavedState / conversation-cache behaviour came from, and why the code is shaped
++this way. Invariant explanations live next to the code; this file holds only the history.
++
++## Origin of this refactor
++
++A readability review of the cache code arrived via the user from ChatGPT (2026-10-01).
++Claude scoped it, and the work split as BRIEF CELL-C: Muse-1 (engine + cache units),
++Muse-2 (serve cache protocol), reviewed by Sol. Rule throughout: no behaviour change —
++same restore decisions, logs, disk schema (v3) and CLI flags, with the CPU suites
++(`saved_state`, layout, `restore`, `root_disk_codec`, server/keeper) green after every step.
++
++## Earlier cache work (DESIGN-HERMES-CACHE.md)
++
++- **Store policy (E1).** Pinned roots (fixed-prefix ends, never evicted by traffic), byte-budget
++  LRU tips (one recent line tip in host RAM for alternation and forks), and the untouched
++  upstream live chain. Aux (title/side) requests never insert, evict, or advance the clock.
++  A stage-layout change clears the store rather than risk a cross-layout restore. Snapshot
++  capture pins roots and flushes tips with exact emitted boundaries.
++- **Restore (E2).** Longest prefix wins over exact full ids + image/cvec identity; geometry,
++  payload sizes, pointers, capacities and the drafter window are validated before any GPU
++  mutation. Boundary cell k-1 is re-paired from the resume suffix before the suffix prefill
++  (E2b boundary repair).
++- **Disk (E3, schema v3).** Versioned bounded binary codec with trailing checksum, streaming
++  metadata-only startup scan, lazy payload loads, background writer with atomic temp->rename
++  publishing, mtime-LRU trim over recognized files only, and index repair on load failure.
++- **Stats (E4), tests (E5), serve surface.** Per-request source/k/suffix/timings; a dedicated
++  CPU policy suite; aux gating (S1) and the cache inventory API (S2).
++
++## Old review labels and what they required
++
++Sol review / finding / blocker labels marked the rationale behind the strictest checks:
++
++- **Validation before mutation.** Every geometry scalar, KV/indexer size, pointer, capacity
++  and drafter-window bound is proven before any GPU write, so a truncated or corrupt
++  payload fails closed instead of landing half-uploaded.
++- **Window/boundary discipline.** A candidate whose drafter window reaches below the
++  snapshot's first real pair is rejected outright; the boundary cell is always re-paired
++  from the resume suffix, never trusted from speculative rows.
++- **Optional-allocation containment.** Captures, stashes and queue insertions that can
++  allocate must never fail the request they serve: a failed stash only drops that
++  snapshot, and a failed enqueue never suppresses the RAM insert.
++- **Coherence reset.** After a failed mount, repair, or throw during mount, all stages
++  reset and live/chain candidacy dies; a failed reset has no coherent fallback and fails the
++  request outright. Phase-1 load/validation/index-drop exceptions instead keep the index
++  and the chain with no GPU reset (nothing was written yet).
++
++## Fixes that shaped the invariants
++
++- **Fall-through restore (F1).** A failed restore tries the next shorter candidate, never
++  cold; ties prefer live/chain (no upload); a FAILED attempted mount resets all stages for
++  coherence and kills live/chain candidacy while shorter saved candidates stay tryable.
++  Successful mounts never reset. Cold only after candidates are exhausted.
++- **Paired tips (F2).** One tip line holds two restorable points: the last-turn-boundary prompt
++  point (F2b: for re-rendered next turns and forked children) and the generation end (for verbatim
++  echoes), sharing one KV/MTP backing with boundary-only recurrent/indexer/boundary state.
++  The raw prompt end is never a prefix: it carries the generation header the next turn
++  re-renders as a history turn.
++- **030 checkpoint contract.** GDN/tails ride with per-layer spare keys and block cursors;
++  029-shaped payloads fail validation before any GPU mutation.
++- **K8V4 exclusion.** Hybrid KV takes no SavedState part (no capture, restore, or disk
++  offers); chain mounts there stand on checkpoint restore alone with no boundary repair.
++- **Rope identity.** Disk roots are shared across processes only under byte-identical
++  resolved rope configs, folded into the header's numeric identity.
++
++## This refactor (CELL-C)
++
++1. Restore candidate selection and the longest-first walk out of `main()` (`restore.*`,
++   `RestoreCandidate`/`RestoreResult`).
++2. Disk restore in two explicit phases: CPU-side validate (typed index disposition) and
++   GPU-side mount (typed reset disposition).
++3. `saved_state` split into the RAM store, `RootDiskCodec` (format/header/checksum) and
++   `RootDiskStore` (index/writer/trim), with `saved_state.hpp` kept as the compatibility
++   umbrella.
++4. Comment hygiene: invariant rationale stays in code; history lives here.
++5. Serve side: `CacheProtocolClient` extracted from `StrataEngine` (Muse-2; same wire
++   protocol and HTTP behaviour).
+diff --git a/include/strata/program/restore.hpp b/include/strata/program/restore.hpp
+index 9810095..225137c 100644
+--- a/include/strata/program/restore.hpp
++++ b/include/strata/program/restore.hpp
+@@ -1,7 +1,7 @@
+ // include/strata/program/restore.hpp - restore candidate selection (readability refactor).
+ //
+-// Behaviour-preserving extraction from src/program/generate.cpp's F1 unified restore walk
+-// (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum; F1: BRIEF-CACHE-FIX-1).
++// Behaviour-preserving extraction from src/program/generate.cpp's unified restore walk
++// (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum).
+ //
+ // This header + src/program/restore.cpp are CPU-ONLY on purpose: no CUDA includes, no device
+ // code. They own the SELECTION half of the restore walk - who is eligible, in what order -
+@@ -223,12 +223,15 @@ class RestoreWalk {
+ 
+ // ---- Disk restore phases: validate (no GPU mutation) then mount (GPU mutation). -------------
+ //
+-// Phase 1 loads the lazy payload and runs full validation without touching the GPU; phase 2
+-// uploads, refills the ring and pairs the boundary cell, resetting for coherence on any
+-// failure. Both catch internally and return typed outcomes; the walk consumes them with a
+-// switch (no phase-level try/catch/continue). The drivers never touch the index themselves:
+-// index disposition is encoded in the outcome for the caller (drop = drop_path only, never
+-// file deletion). Attempt logs print inside the drivers in original order (reason strings
++// Phase 1 loads the lazy payload and runs full validation without touching the GPU; it may drop
++// the entry from the index - and only the index, never the file - through the borrowed drop
++// callback inside the original try, so a throwing drop stays transient exactly as before.
++// Without the drop, a corrupt file would pin its key (enqueue dedups against the index) and a
++// recaptured root could never replace it. Phase 2 uploads, refills the ring and pairs the
++// boundary cell, resetting for coherence on any failure, and never drops the index: an
++// upload/repair failure is transient, not corruption. Both phases catch internally and return
++// typed outcomes describing what happened; the walk consumes them with a switch (no phase-level
++// try/catch/continue). Attempt logs print inside the drivers in original order (reason strings
+ // borrowed from the caller, never copied for metadata); only the fatal ERR line stays with
+ // the caller, selected by the FatalMount/FatalRepair disposition.
+ 
+diff --git a/include/strata/program/root_disk_codec.hpp b/include/strata/program/root_disk_codec.hpp
+index 68c2524..a74ed4b 100644
+--- a/include/strata/program/root_disk_codec.hpp
++++ b/include/strata/program/root_disk_codec.hpp
+@@ -1,7 +1,7 @@
+ // include/strata/program/root_disk_codec.hpp - RootDiskCodec: the on-disk root format.
+ //
+ // CPU-ONLY: the versioned bounded binary serialization of RootDiskHeader + the full SavedItem
+-// (every E1 payload: ids, image/cvec identity, geometry, all stages' recurrent/indexer/KV,
++// (every payload: ids, image/cvec identity, geometry, all stages' recurrent/indexer/KV,
+ // the MTP rows with valid_from, the boundary row), the header identity comparison, the FNV-1a
+ // checksum, the filename ownership gates and the bulk-stripping helper. No CUDA, no device
+ // code. Split out of saved_state.{hpp,cpp} (readability refactor, behaviour-preserving);
+@@ -15,7 +15,7 @@
+ //   u32 magic, u32 version, 6 x (u32 len + bytes: engine_version, pack_path, kv_type, mtp_dir,
+ //   model_fingerprint, numeric_flags), u64 ids_len, u64 ids_hash (FNV-1a over the ids, verified on
+ //   decode), ids_len x i32 ids, u64 img count + (i64 start, u64 hash) pairs, u8 cvec, i64 n_stages,
+-//   6 x i64 geometry, then per stage (rec gdn/ple/tails blobs + ple_prev, per-layer indexer + KV blobs),
++//   6 x i64 geometry, then per stage (rec gdn/ple/tails/dead/block_pos blobs + ple_prev, per-layer indexer + KV blobs),
+ //   the MTP (cells, valid_from, 0/1 KV payloads), the boundary row (hc, n_embd, floats), and a
+ //   trailing u64 FNV-1a checksum over every preceding payload byte (v2): same-length corruption
+ //   anywhere in the recurrent/KV bulk that the ids hash cannot see fails the decode before any
+@@ -41,7 +41,7 @@ namespace strata::program::saved_state {
+ 
+ struct SavedItem;   // payload definitions live in strata/program/saved_state.hpp
+ 
+-/// E3's on-disk header: every field that changes numerics must match, else the file is
++/// On-disk header: every field that changes numerics must match, else the file is
+ /// ignored. The engine fills it per process (see generate.cpp's root_*_identity helpers); compatible_with()
+ /// gates the load. Pure and CPU-testable. ids_len/ids_hash never gate compatibility: the full-ids prefix
+ /// rule applies after load (never hash-only).
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index 4a0e500..bbb3a6b 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -1,20 +1,18 @@
+-// include/strata/program/saved_state.hpp - E1: the SavedState store (DESIGN-HERMES-CACHE.md sections 1, 2, 7).
+-//
+-// Implemented: Muse / review: Sol.
++// include/strata/program/saved_state.hpp - the SavedState store (DESIGN-HERMES-CACHE.md sections 1, 2, 7).
+ //
+ // Three kinds of saved state: pinned ROOTS (the end of a fixed prefix, keyed by token ids, never evicted by
+-// traffic, E3 persists them to disk), byte-budget LRU TIPS (one recent tip per conversation line in host RAM,
++// traffic, the root-disk cache persists them), byte-budget LRU TIPS (one recent tip per conversation line in host RAM,
+ // what makes parent<->child alternation and forked children cheap), and upstream's live ConvCheckpoint CHAIN
+ // (unchanged, lives in generate.cpp).
+ //
+ // This header is CPU-ONLY on purpose: no CUDA includes, no device code. The store owns the policy (prefix match
+ // by exact full ids, cvec/image identity, pin, LRU budget, per-line replacement, split-stage generation) while
+-// generate.cpp fills the opaque payload blobs from the device. That keeps the policy unit-testable on CPU for E5
+-// and leaves E2 (restore), E3 (disk), E4 (stats) and S2 (inventory) as consumers of this interface:
++// generate.cpp fills the opaque payload blobs from the device. That keeps the policy unit-testable on CPU
++// and leaves restore, disk, stats and inventory (S2) as consumers of this interface:
+ //
+-//   E2 restores via find_best() + the payload blobs (upload KV [0,k) + recurrent state, re-point page table).
+-//   E3 serialises SavedItem + RootDiskHeader (header.compatible_with() gates loads).
+-//   E4 fills ResumeStats per request (source/k/suffix/restore_ms/snapshot_ms).
++//   Restore via find_best() + the payload blobs (upload KV [0,k) + recurrent state, re-point page table).
++//   Disk persistence serialises SavedItem + RootDiskHeader (header.compatible_with() gates loads).
++//   Per-request stats fill ResumeStats per request (source/k/suffix/restore_ms/snapshot_ms).
+ //   S2 serves inventory() and drop_non_pinned().
+ //
+ // Payload completeness (section 1: "A saved item contains"): ids, recurrent state snapshot (GDN recurrence +
+@@ -27,17 +25,17 @@
+ // so a forked child (parent prompt + parent's generated tool-call + a short tool result) resumes with a tiny
+ // suffix. Tips are snapshotted after DONE is sent/flushed, never blocking the reply.
+ //
+-// F2 (BRIEF-CACHE-FIX-1): the tip's generation-end ids are prompt + generated ids (reasoning/<think> included)
++// The tip's generation-end ids are prompt + generated ids (reasoning/<think> included)
+ // but the next turn re-renders the assistant WITHOUT the reasoning, so the generation point is never a prefix
+ // of the next prompt. One tip therefore retains TWO coherent restorable points of its line:
+-//   (a) the LAST TURN BOUNDARY inside the prompt (F2b: the start of the trailing assistant generation
++//   (a) the LAST TURN BOUNDARY inside the prompt (the start of the trailing assistant generation
+ //       header, i.e. the preceding <|im_end|> + newline end - NOT the raw prompt end n, whose trailing
+ //       generation header is re-rendered as a history assistant turn) - a prefix of the next turn of the
+ //       same line and of a forked child's prompt (parent prompt + re-rendered assistant + tool result);
+ //   (b) the generation end (previous behaviour) - used when the client echoes the generated ids verbatim.
+ // Resume picks the longest valid point across both. The prompt point lives in the store (tips_), so it survives
+ // an unrelated (child) request independently of the chain, which the chain does not. Roots stay single-point
+-// (E3 persists roots only; paired tips are RAM-only).
++// (the disk holds roots only; paired tips are RAM-only).
+ #pragma once
+ 
+ #include "strata/kernels/kv_q4.hpp"   // authoritative q4 row formula (CPU-clean: <cstdint> + qsa.hpp only)
+@@ -54,19 +52,19 @@ namespace strata::program::saved_state {
+ /// Default tip budget: --tip-cache-gib. 8 GiB holds >= depth+1 lines: a 12K prefix tip is ~150 MiB KV +
+ /// ~113 MiB recurrent state, a 40K tip ~550 MiB + state (DESIGN section 0 numbers).
+ inline constexpr double kDefaultTipCacheGib = 8.0;
+-/// E3's --root-dir default. E1 parses the flag but does not write (interface ready).
++/// Default --root-dir path (the on-disk root cache).
+ inline const char* kDefaultRootDir = "H:\\qwen38-v100\\strata-cache\\roots";
+-/// E3's --root-cap-gib default: the root directory is trimmed (oldest mtime first) past this.
++/// --root-cap-gib default: the root directory is trimmed (oldest mtime first) past this.
+ inline constexpr double kDefaultRootCapGib = 20.0;
+-/// E3's per-file bound: a root file bigger than this is ignored at scan and never decoded.
++/// per-file bound: a root file bigger than this is ignored at scan and never decoded.
+ inline constexpr uint64_t kMaxRootFileBytes = 4ull * 1024 * 1024 * 1024;
+-/// E3's decode bound for the ids array (4M tokens = 16 MiB): checked BEFORE any allocation.
++/// decode bound for the ids array (4M tokens = 16 MiB): checked BEFORE any allocation.
+ inline constexpr uint64_t kMaxRootIds = 4000000;
+-/// E3's decode bound for one header string (engine version, paths, flags): checked BEFORE allocation.
++/// decode bound for one header string (engine version, paths, flags): checked BEFORE allocation.
+ inline constexpr uint32_t kMaxRootString = 1u << 20;
+-/// E3's decode bound for the image list (images are one entry per picture in the prefix).
++/// decode bound for the image list (images are one entry per picture in the prefix).
+ inline constexpr uint64_t kMaxRootImages = 1u << 16;
+-/// E3's decode caps for the geometry/layout scalars. Real values are tiny (12 layers, head_dim <= 512,
++/// decode caps for the geometry/layout scalars. Real values are tiny (12 layers, head_dim <= 512,
+ /// single-digit page/block sizes); anything above these is corrupt. Validating the geometry FIRST (before
+ /// any loop or allocation) keeps every downstream size computation in u64 range and every allocation
+ /// geometry-derived and exact.
+@@ -75,13 +73,13 @@ inline constexpr int64_t kMaxRootStages = 8;
+ inline constexpr int64_t kMaxRootHeads = 4096;
+ inline constexpr int64_t kMaxRootDim = 4096;
+ inline constexpr int64_t kMaxRootBlock = 65536;
+-/// E3's per-blob cap for the recurrent state (GDN + PLE + tails, ~113 MiB real). Unlike KV/indexer/MTP
++/// per-blob cap for the recurrent state (GDN + PLE + tails, ~113 MiB real). Unlike KV/indexer/MTP
+ /// blobs its exact size is not derivable from SnapshotGeom at decode time (it needs the full model
+-/// geometry, which E2's saved_validate_for_restore checks instead), so it carries an absolute cap.
++/// geometry, which the restore-time saved_validate_for_restore checks instead), so it carries an absolute cap.
+ inline constexpr uint64_t kMaxRootRecBytes = 1ull << 30;
+-/// E3's writer-queue bound: roots are a handful per process; past this new captures are dropped (nonfatal).
++/// writer-queue bound: roots are a handful per process; past this new captures are dropped (nonfatal).
+ inline constexpr size_t kMaxRootQueue = 64;
+-/// E3's writer-queue byte bound: queued captures are full bulk copies in RAM. 64 x 4 GiB of queued
++/// writer-queue byte bound: queued captures are full bulk copies in RAM. 64 x 4 GiB of queued
+ /// roots would be far too much transient RAM (the pinned RAM root + the in-flight capture copy + the
+ /// worker's codec buffer already hold ~3x one root); 8 GiB caps the queue at a fraction of host RAM
+ /// while still holding a burst of real roots (~30 x 12K roots). Count and bytes both gate enqueue.
+@@ -98,7 +96,7 @@ struct ImgKey {
+ 
+ enum class Kind : uint8_t { Root, Tip };
+ 
+-/// E4's resume source. E1 only defines it; the restore path (E2) and the per-request stats line (E4) fill it.
++/// Resume source. Defined here; the restore path and the per-request stats line fill it.
+ enum class ResumeSource : uint8_t { None, Chain, Tip, Root, RootDisk };
+ 
+ /// Exact full-ids prefix comparison (section 1: "valid only if its full ids are a prefix of P, not just the
+@@ -127,7 +125,7 @@ enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3 };
+ /// the exact predicate). K8V4 (kv_hybrid): no capture, restore, or offers - RAM or disk.
+ inline bool kv_saved_supported(bool kv_hybrid) { return !kv_hybrid; }
+ 
+-/// Whether a chain/live mount requires a saved boundary repair source and runs the E2b repair block.
++/// Whether a chain/live mount requires a saved boundary repair source and runs the boundary repair block.
+ /// K8V4 mounts stand on checkpoint_restore + kv_restore exactly as upstream (no repair); other modes
+ /// keep the repair requirement.
+ inline bool kv_chain_mount_needs_repair(bool kv_hybrid) { return !kv_hybrid; }
+@@ -210,27 +208,27 @@ struct StagePayload {
+     }
+ };
+ 
+-/// The MTP repair row (Sol final review): R_(L-1), the main model's final residual after the last layer
++/// The MTP repair row: R_(L-1), the main model's final residual after the last layer
+ /// for the last consumed token, as a host float blob with its layout. The residual R is per-token scratch
+-/// (rebuilt from each token's embedding), so WITHOUT this row E2 could not repair MTP pair L-1: pairing cell
++/// (rebuilt from each token's embedding), so WITHOUT this row the restore could not repair MTP pair L-1: pairing cell
+ /// L-1 needs (R_(L-1), tok_L), and tok_L is the new request's first suffix token (request.ids[L]).
+ ///
+-/// REQUIRED E2 REPAIR (documented here, implemented in E2): on resume at k=L with suffix starting at tok_L,
++/// REQUIRED REPAIR (documented here, implemented in the restore path): on resume at k=L with suffix starting at tok_L,
+ /// pair cell L-1 via mtp.prefill(&boundary.row, &tok_L, 1, L-1) BEFORE the suffix prefill, then prefill the
+-/// suffix normally. E2 MUST reject a candidate outright when the new request's drafter window reaches below
++/// suffix normally. The restore MUST reject a candidate outright when the new request's drafter window reaches below
+ /// valid_from (rows there are unwritten zeros, not pairs - resuming under them would attend garbage).
+ /// Roots and tips both carry the row (roots: stashed from the authoritative prompt source inside on_chunk /
+ /// read_windows before scratch is overwritten; tips: the final flush verifier residual, last stage on split).
+ /// A snapshot without its boundary row is rejected (complete()).
+ struct BoundaryRow {
+-    int64_t hc = 0;                       ///< ModelGeometry::hc at capture (E2/E3 layout validation)
++    int64_t hc = 0;                       ///< ModelGeometry::hc at capture (restore/disk layout validation)
+     int64_t n_embd = 0;                   ///< ModelGeometry::n_embd at capture
+     std::vector<float> row;               ///< R_(L-1): hc*n_embd host floats
+     uint64_t bytes() const { return (uint64_t)row.size() * 4 + 16; }
+     bool complete() const { return hc > 0 && n_embd > 0 && (int64_t)row.size() == hc * n_embd; }
+ };
+ 
+-/// The MTP drafter's K/V rows: the valid-pair invariant (Sol review finding 3).
++/// The MTP drafter's K/V rows: the valid-pair invariant.
+ ///
+ /// AUTHORITATIVE SEMANTICS (see MtpDrafter::prefill/draft): drafter cell i pairs the main model's final
+ /// residual R_i with the token at position i+1. Prompt cells are exact (on_chunk/read_windows prefill with
+@@ -241,7 +239,7 @@ struct BoundaryRow {
+ ///
+ /// WINDOWING: prompt prefill skips cells the attention window can never reach again, so rows below
+ /// valid_from may be unwritten zeros (deterministic - the drafter starts zeroed). Rows [valid_from, cells)
+-/// are real-paired. E2 MUST repair the boundary on restore by re-pairing from the resume suffix (prefill /
++/// are real-paired. The restore MUST repair the boundary on restore by re-pairing from the resume suffix (prefill /
+ /// draft over the suffix, as prompt reads do) rather than trusting speculative rows past it.
+ struct MtpPayload {
+     std::vector<KvLayerPayload> kv;       ///< exactly one entry (the drafter's layer) when captured
+@@ -254,8 +252,8 @@ struct MtpPayload {
+     }
+ };
+ 
+-/// Geometry/layout key captured with every snapshot (E1) and validated before any restore (E2) or disk
+-/// load (E3): a stage layout, KV format geometry or indexer shape change must never restore stale bytes.
++/// Geometry/layout key captured with every snapshot and validated before any restore or disk
++/// load: a stage layout, KV format geometry or indexer shape change must never restore stale bytes.
+ /// Per-layer KV formats ride in each KvLayerPayload::fmt; this covers the shared geometry.
+ struct SnapshotGeom {
+     int64_t n_qsa_layers = 0;
+@@ -271,7 +269,7 @@ struct SnapshotGeom {
+     bool operator!=(const SnapshotGeom& o) const { return !(*this == o); }
+ };
+ 
+-/// Exact pool bytes for `cells` cells (Sol final-review fix): pages = ceil(cells/page_size), each page
++/// Exact pool bytes for `cells` cells: pages = ceil(cells/page_size), each page
+ /// n_head_kv*page_size rows of `row` bytes. Row widths mirror the capturer bit-for-bit: fp16 halves, int8
+ /// codes + scales per KV_Q8_GROUP values, q4 via the authoritative kv_q4_bytes_per_head. `scales` selects the
+ /// scale pools (int8 only).
+@@ -302,8 +300,8 @@ inline bool kv_blob_ok(const KvLayerPayload& k, int64_t cells, const SnapshotGeo
+     return (uint64_t)k.ks.size() == sc && (uint64_t)k.vs.size() == sc;
+ }
+ 
+-/// F2: prefix coverage - `src` holds at least the [0, cells) page range. Pages are written in order, so the
+-/// range is a byte-prefix of the stored vectors. Lets a prompt point validate against (and E2 restore from)
++/// Prefix coverage - `src` holds at least the [0, cells) page range. Pages are written in order, so the
++/// range is a byte-prefix of the stored vectors. Lets a prompt point validate against (and restore from)
+ /// its generation owner's KV without any copy.
+ inline bool kv_prefix_ok(const KvLayerPayload& src, int64_t cells, const SnapshotGeom& gm) {
+     if (cells < 1 || src.cells < cells) return false;
+@@ -324,17 +322,17 @@ struct SavedItem {
+     int n_stages = 1;                     ///< stages.size(); must match the store's stage count
+     uint64_t bytes = 0;                   ///< set by the store on insert (payload + ids/imgs overhead)
+     uint64_t last_use = 0;                ///< set by the store (LRU clock)
+-    SnapshotGeom geom;                    ///< geometry/layout the payloads were captured under (E2 validates)
++    SnapshotGeom geom;                    ///< geometry/layout the payloads were captured under (validated on restore)
+     std::vector<StagePayload> stages;
+     MtpPayload mtp;
+-    BoundaryRow boundary;                 ///< R_(L-1): the MTP repair row (Sol final review; E2 pairs it)
++    BoundaryRow boundary;                 ///< R_(L-1): the MTP repair row, paired on restore
+     uint64_t payload_bytes() const {
+         uint64_t b = (uint64_t)ids.size() * 4 + (uint64_t)imgs.size() * 16 + 16 + 48;   // +48: geom + scalars
+         for (const StagePayload& s : stages) b += s.bytes();
+         b += mtp.bytes() + boundary.bytes();
+         return b;
+     }
+-    /// Strict structural gate (findings 5 + final review): the store rejects anything inconsistent or
++    /// Strict structural gate: the store rejects anything inconsistent or
+     /// incomplete - a truncated copy must never become a restorable item. ple may be empty (no-PLE builds);
+     /// gdn/tails never are. Byte sizes are checked against the geometry, not just non-emptiness.
+     bool complete() const {
+@@ -376,14 +374,14 @@ struct SavedItem {
+     }
+ };
+ 
+-/// F2: one tip line's TWO coherent restorable points (see the file-top note).
++/// One tip line's TWO coherent restorable points (see the file-top note).
+ ///
+-/// The prompt point is the state at exactly the LAST TURN BOUNDARY k inside the prompt (F2b: the start of
++/// The prompt point is the state at exactly the LAST TURN BOUNDARY k inside the prompt (the start of
+ /// the trailing assistant generation header - the raw prompt end n is NOT a prefix of the next request,
+ /// which re-renders that header as a history assistant turn without reasoning). The generation point
+ /// is the previous tip behaviour (prompt + generated ids at DONE, length G).
+ ///
+-/// Capture contract (E1/E2, implemented in generate.cpp; the store only gates coherence):
++/// Capture contract (implemented in generate.cpp; the store only gates coherence):
+ /// - The prompt's recurrent payload (GDN/PLE/tails + ple_prev over the BOUNDARY ids), indexer payloads,
+ ///   MTP metadata (cells = k-1) and boundary R_(k-1) are captured at the prefill segment ending at k,
+ ///   when the session holds exactly the boundary-k state and BEFORE any generated input is committed.
+@@ -395,11 +393,11 @@ struct SavedItem {
+ ///   NO main-KV copy (its StagePayload::kv vectors are empty) and logically covers the shorter page range
+ ///   [0, k). The drafter rows [0, k-1) are likewise immutable during decode, so the prompt shares those
+ ///   too: its MtpPayload keeps its own cells/valid_from metadata (cells = k-1) with an EMPTY kv (no second
+-///   draft-KV copy); E2 restores rows [0, k-1) from the generation backing. (An owned prompt MTP copy also
++///   draft-KV copy); the restore reads rows [0, k-1) from the generation backing. (An owned prompt MTP copy also
+ ///   validates, for tests.)
+ /// - The prompt's indexer/recurrent/boundary payloads are its own (boundary-only, never generation state).
+ ///
+-/// E2 mount recipe for a prompt point p of entry e (gen g of length G, boundary length k, request ids P
++/// Mount recipe for a prompt point p of entry e (gen g of length G, boundary length k, request ids P
+ /// with P[k] first suffix token): upload the KV prefix - the first kv_pool_bytes(fmt, k, gm...) bytes of
+ /// each of g's layer vectors (pages are contiguous, so the prefix is a byte-prefix) - restore
+ /// recurrent/indexer from p, MTP metadata from p with rows [0, k-1) from g (or p's own copy when present),
+@@ -420,7 +418,7 @@ struct TipEntry {
+     bool complete() const;
+ };
+ 
+-/// F2 coherence gate: p is a valid shared-KV prompt point for generation item g. g must be complete on its
++/// Coherence gate: p is a valid shared-KV prompt point for generation item g. g must be complete on its
+ /// own; p must be a strict prefix line of g (ids, cvec, images below the boundary length k), share its
+ /// geometry/stages, carry a complete boundary of the same shape (a DIFFERENT row: R_(k-1), not R_(G-1)),
+ /// own exact MTP pairs [0, k-1), boundary-only recurrent/indexer state of the right sizes, and NO main-KV
+@@ -488,7 +486,7 @@ inline bool TipEntry::complete() const {
+     return prompt_for_shared_ok(prompt, gen);
+ }
+ 
+-/// E4's per-request stats (interface only in E1): `resume from {chain|tip|root|root-disk} at k, suffix n,
++/// Per-request stats (defined here; filled per request): `resume from {chain|tip|root|root-disk} at k, suffix n,
+ /// restore ms, snapshot ms`.
+ struct ResumeStats {
+     ResumeSource source = ResumeSource::None;
+@@ -506,7 +504,7 @@ struct DiskInventoryEntry {
+     uint64_t bytes = 0;
+ };
+ 
+-    /// S2's inventory row (interface only in E1): GET /v1/cache lists these; DELETE drops all non-pinned.
++    /// S2's inventory row (interface only): GET /v1/cache lists these; DELETE drops all non-pinned.
+ struct InventoryEntry {
+     Kind kind = Kind::Tip;
+     size_t ids_len = 0;
+@@ -542,53 +540,53 @@ class SavedStateStore {
+     /// advance - aux traffic must never cost the main path anything. Exact-duplicate ids refresh in place
+     /// (one recent tip per line for re-runs); otherwise LRU-evict tips past the byte budget.
+     ///
+-    /// F2: this single-point form stays for compatibility (CPU tests, tools). The engine records paired tips
++    /// This single-point form stays for compatibility (CPU tests, tools). The engine records paired tips
+     /// via insert_tip_pair; a single insert whose gen key matches a paired entry replaces the whole entry.
+     /// Deliberately NOT collapsing prefix-related tips of the same line: a forked child (section 7) extends
+     /// its parent's ids, and dropping the parent's tip on the child's insert would destroy the alternation
+-    /// benefit. The byte budget bounds the duplication; E2 may add line collapsing once restore lands.
++    /// benefit. The byte budget bounds the duplication.
+     bool insert_tip(SavedItem item, bool is_aux);
+-    /// F2: insert one tip LINE with both restorable points (prompt end n + generation end L). Entry bytes =
++    /// Insert one tip LINE with both restorable points (last turn boundary k + generation end L). Entry bytes =
+     /// gen + prompt with the shared KV counted once; the pair evicts coherently. Rejects incoherent pairs
+     /// (prompt_for_shared_ok), aux lines (strict no-op like insert_tip), and stage-count mismatches. An
+     /// exact-duplicate gen key replaces the entry in place (one recent tip per line for re-runs).
+     bool insert_tip_pair(SavedItem prompt, SavedItem gen, bool is_aux);
+-    /// E2's resume lookup: longest POINT whose full ids are a prefix of `ids` with exact image and cvec
+-    /// identity and a matching stage count. F2: every paired tip offers both its prompt and generation points;
++    /// Resume lookup: longest POINT whose full ids are a prefix of `ids` with exact image and cvec
++    /// identity and a matching stage count. Every paired tip offers both its prompt and generation points;
+     /// resume picks the longest valid one across both (prompt for re-rendered turns, generation for verbatim
+     /// echoes). Ties are impossible (lengths differ); live-chain ties prefer the
+     /// chain (no upload) at the call site. Null when nothing matches. A successful restore MUST call
+     /// note_use() on the returned item so the LRU clock counts mounts, not just inserts.
+     const SavedItem* find_best(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                                bool cvec) const;
+-    /// E2 eligibility filter (Sol review): longest match excluding every previously rejected candidate, so
++    /// Eligibility filter: longest match excluding every previously rejected candidate, so
+     /// the call site can walk longest-first with an accumulating skip set. Skipping one pointer loops forever
+     /// with two invalid candidates (A skipped -> B invalid -> A returned again); the vector cannot. No store
+     /// mutation between calls: pointers stay valid. CPU-testable (see saved_state_test.cpp).
+     const SavedItem* find_best_except(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                                       bool cvec, const std::vector<const SavedItem*>& skip) const;
+-    /// E2b exact-length prefix lookup: the POINT with ids.size()==k whose ids/cvec/images match, even when a
+-    /// longer tip also matches (find_best would hide it). F2: searches prompt and generation points alike.
++    /// Exact-length prefix lookup: the POINT with ids.size()==k whose ids/cvec/images match, even when a
++    /// longer tip also matches (find_best would hide it). Searches prompt and generation points alike.
+     /// Null when none. No-upload MTP boundary repair needs
+     /// exactly this length. CPU-testable.
+     const SavedItem* find_exact(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
+                                 int64_t k) const;
+-    /// E2 mounts through the point find_best() returned: advances its LINE's last_use to now (F2: a mount of
++    /// Mounts go through the point find_best() returned: advances its LINE's last_use to now (a mount of
+     /// either point of a pair refreshes the entry AND both points' own last_use, so the pair evicts coherently
+     /// and S2 rows stay fresh). False for null or foreign pointers (never fabricates freshness).
+     bool note_use(const SavedItem* it);
+-    /// F2: the generation item backing a prompt point (null unless `p` is a paired entry's prompt). E2 uses
++    /// The generation item backing a prompt point (null unless `p` is a paired entry's prompt). The restore uses
+     /// it to validate and mount the prompt point against the shared KV/MTP backing without any copy.
+     const SavedItem* tip_gen_for(const SavedItem* p) const;
+     /// S2 DELETE: drop all non-pinned items. Returns how many tip inventory ROWS (restorable
+     /// points, as inventory() lists them: two for a paired tip) were dropped. tips() keeps line semantics.
+     size_t drop_non_pinned();
+-    /// S2 GET: roots then tips. F2: a paired tip lists TWO rows (prompt point, then generation point) sharing
++    /// S2 GET: roots then tips. A paired tip lists TWO rows (prompt point, then generation point) sharing
+     /// the entry's last_use; their bytes sum to the entry bytes (shared KV counted once, in the gen row).
+     std::vector<InventoryEntry> inventory() const;
+     void clear();
+ 
+-    /// Tip LINES (F2: one entry holds up to two restorable points). tip_points() counts the restorable
++    /// Tip LINES (one entry holds up to two restorable points). tip_points() counts the restorable
+     /// points (gen + prompt points).
+     size_t tips() const { return tips_.size(); }
+     size_t tip_points() const;
+@@ -607,8 +605,8 @@ class SavedStateStore {
+     int n_stages_ = 1;
+ };
+ 
+-/// Strict GiB flag parser (E3 review: --root-cap-gib must be finite with a bounded conversion,
+-/// and a malformed string must error - never a silent atof invalid=>0 accidental purge).
++/// Strict GiB flag parser: --root-cap-gib must be finite with a bounded conversion,
++/// and a malformed string must error - never a silent atof invalid=>0 accidental purge.
+ /// Full-string strtod: empty, trailing garbage, NaN/inf, negatives and values at/above the exact
+ /// uint64-byte-conversion boundary (2^34 GiB: (double)UINT64_MAX rounds up to 2^64, so >= rejects
+ /// the boundary itself) all fail. 0 is valid (keep nothing). Shared CPU helper (generate.cpp uses
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 55e8cc8..5a54691 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -367,19 +367,17 @@ struct Options {
+     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
+     /// the batched path)
+     int64_t short_read = 64;
+-    /// E1 (DESIGN-HERMES-CACHE.md): SavedState tips live in host RAM under this LRU byte budget (GiB, default 8).
++    /// SavedState tips live in host RAM under this LRU byte budget (GiB, default 8).
+     /// 0 = tips off (roots still pin at the upstream system-prefix boundary).
+-    /// Implemented: Muse / review: Sol.
+     double tip_cache_gib = strata::program::saved_state::kDefaultTipCacheGib;
+-    /// E3 (DESIGN-HERMES-CACHE.md): pinned roots persist under this directory (default
++    /// Pinned roots persist under this directory (default
+     /// H:\qwen38-v100\strata-cache\roots): written by a background thread on root capture, indexed
+     /// (metadata only) at startup, payloads lazy-loaded on the longest exact-prefix match.
+-    /// Implemented: Muse / review: Sol.
+     std::string root_dir = strata::program::saved_state::kDefaultRootDir;
+-    /// E3: the root directory is trimmed (oldest mtime first, recognized cache files only) past this
++    /// The root directory is trimmed (oldest mtime first, recognized cache files only) past this
+     /// cap in GiB (default 20). 0 = keep nothing (writes still land, then trim).
+     double root_cap_gib = strata::program::saved_state::kDefaultRootCapGib;
+-    /// E3: false (--no-root-disk) disables root-disk loading AND storing: the true-cold configuration
++    /// False (--no-root-disk) disables root-disk loading AND storing: the true-cold configuration
+     /// for acceptance runs. Default true.
+     bool root_disk = true;
+     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
+@@ -837,8 +835,8 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull)
+ // Strict --root-cap-gib/--tip-cache-gib parsing lives in saved_state.{hpp,cpp} (shared CPU helper,
+ // unit-tested in saved_state_test.cpp): strata::program::saved_state::parse_gib_flag.
+ 
+-// ---- E3: root-disk identity (DESIGN-HERMES-CACHE.md section 2, E3 bullet). ----------------------
+-// Implemented: Muse / review: Sol. The RootDiskHeader this process writes and accepts: the engine
++// ---- Root-disk identity (DESIGN-HERMES-CACHE.md section 2). ----------------------
++// The RootDiskHeader this process writes and accepts: the engine
+ // version (STRATA_VERSION), the normalized absolute pack path, the --kv type, the MTP dir path plus
+ // its contents fingerprint, the model fingerprint (pack listing + PLE/native shards as
+ // name=size:mtime, FNV-hashed), and the numeric flags (kv-resident value, every --native-* bit,
+@@ -1047,7 +1045,7 @@ std::string root_numeric_flags(const Options& o, bool& ok) {
+     for (const bool* b : bits) s += *b ? '1' : '0';
+     s += std::string(";cpuq8=") + (o.cpu_oracle_q8_0 ? '1' : '0');
+     s += std::string(";nople=") + (o.no_ple ? '1' : '0');
+-    // Ablations / execution-shape flags that alter the payload or its reductions (E3 review).
++    // Ablations / execution-shape flags that alter the payload or its reductions.
+     // keep_canonical loads canonical copies of natively served tensors (different bytes).
+     // no_prefill_borrow is deliberately excluded: buffer lending only changes scratch sourcing,
+     // never the captured reductions.
+@@ -1108,10 +1106,10 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
+     return false;
+ }
+ 
+-// ---- E1: SavedState snapshot capture (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum).
+-// Implemented: Muse / review: Sol. CAPTURE ONLY: roots pin at the upstream system-prefix boundary and tips
+-// snapshot after DONE is flushed (prompt + generated tokens at exactly that boundary). Restore (E2), disk
+-// persistence (E3) and the per-request stats line (E4) consume saved_state.hpp's interface; they are not here.
++// ---- SavedState snapshot capture (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum).
++// CAPTURE ONLY: roots pin at the upstream system-prefix boundary and tips
++// snapshot after DONE is flushed (prompt + generated tokens at exactly that boundary). Restore, disk
++// persistence and the per-request stats line consume saved_state.hpp's interface; they are not here.
+ //
+ // The positional cells below a snapshot are the live session's (exactly as for ConvCheckpoint); the payloads
+ // below are self-contained host copies: with --kv-resident the authoritative host ranges are copied (no D2H),
+@@ -1247,16 +1245,16 @@ bool saved_snapshot_stage(const strata::core::SessionState& ss, const strata::co
+     return true;
+ }
+ 
+-// ---- E2/F1: SavedState restore (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum;
+-// F1: BRIEF-CACHE-FIX-1 - failed restores fall through to the next candidate, never to cold).
+-// Implemented: Muse / review: Sol. Unified longest-first walk over {live, chain, tip, root} (chain wins
++// ---- SavedState restore (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum;
++// failed restores fall through to the next candidate, never to cold).
++// Unified longest-first walk over {live, chain, tip, root} (chain wins
+ // ties); roots/tips are independent of chain pruning and --prompt-cache. ALL validation (geometry, payload
+ // sizes, MTP reachable valid_from) plus the chain/live boundary-repair pre-check runs BEFORE any GPU state
+ // is touched; any mount/boundary failure at any stage resets for coherence (session_zero on ALL stages,
+ // chain cleared) and tries the next shorter candidate - cold (resume 0) only when exhausted. Never a stale
+ // chain after overwritten KV, never silently consuming corrupted state.
+ //
+-// E2 REVIEW MAP (for Sol) - where each repair lives:
++// REPAIR MAP - where each repair lives:
+ //   KV repair:    saved_restore_kv() per layer: host copy for kv-resident streamed/ring layouts, device pools
+ //                 + identity page table when fully resident. Streamed slots are invalidated via kv_stream_reset
+ //                 so the next resolve reloads from the restored host (never a stale slot under a remapped block).
+@@ -1273,13 +1271,13 @@ bool saved_snapshot_stage(const strata::core::SessionState& ss, const strata::co
+ //                 MTP via prefill-from-0 - never a stale chain over overwritten KV. A failed reset fails the
+ //                 request outright (no coherent fallback exists). Fork parent tips survive: the store is never
+ //                 pruned by traffic, and a successful mount calls note_use.
+-/// Device staging buffer that frees on every exit path, including exceptions (blocker 4). Declared
++/// Device staging buffer that frees on every exit path, including exceptions. Declared
+ /// AFTER the OnDevice guard at each use site so cudaFree runs on the right device on a split.
+ struct CudaFreeDel {
+     void operator()(void* p) const noexcept { if (p != nullptr) cudaFree(p); }
+ };
+ 
+-/// Blocker 5 review: every pool a KV upload dereferences - device pools always, the authoritative host
++/// Every pool a KV upload dereferences - device pools always, the authoritative host
+ /// pools on kv-resident layouts. Used for main stages and the MTP drafter alike.
+ bool saved_kv_ptrs_ok(const strata::core::QsaState& st, std::string& why) {
+     if (st.kv_q4) {
+@@ -1324,7 +1322,7 @@ inline saved::SnapshotGeom saved_live_geom(const strata::core::ModelGeometry& g)
+ /// so resolve refills slots from the restored host. Mode 2 (ring): memcpy into the host copy; the caller
+ /// refills the ring (mtp.kv_restore). `st` is const: every destination is a mutable pool through it.
+ ///
+-/// F2 prefix upload: `pay` may hold MORE than cells (a prompt point mounting from its generation owner's
++/// Shared-backing prefix upload: `pay` may hold MORE than cells (a prompt point mounting from its generation owner's
+ /// backing - pages are contiguous, so [0, cells) is a byte-prefix). Exact payloads behave exactly as before.
+ bool saved_restore_kv(const strata::core::QsaState& st, const strata::core::ModelGeometry& g,
+                        const saved::KvLayerPayload& pay, int64_t cells, void* stream, std::string& e) {
+@@ -1416,7 +1414,7 @@ bool saved_restore_indexer(const strata::core::QsaState& st, const strata::core:
+ 
+ /// One session's full state at L tokens: recurrent (via the checkpoint contract) + indexer + KV per layer.
+ /// The caller holds the stage's OnDevice guard; the caller syncs the device after (orders kv_stream_reset).
+-/// F2: `kv_src` (a paired entry's generation stage) supplies the KV when `sp` carries none - the prompt point
++/// `kv_src` (a paired entry's generation stage) supplies the KV when `sp` carries none - the prompt point
+ /// shares the owner's backing, uploaded as the [0, L) prefix (no copy, no clone). Null restores owned state.
+ bool saved_restore_stage(strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                           const saved::StagePayload& sp, const std::vector<int32_t>& ids, int64_t L, void* stream,
+@@ -1464,7 +1462,7 @@ bool saved_restore_mtp(strata::core::MtpDrafter& mtp, const strata::core::ModelG
+ /// (GDN, tails, PLE exactly as the live session holds them, ple_prev equal to the ids' last two) are gated
+ /// here - a truncated payload must fail here, never mid-upload. `mtp`'s prompt length must already be the new
+ /// request's (the call site sets it before the chain scan), so prefill_valid_from() is the new window's.
+-/// F2: `kv_owner` (a paired entry's generation item, from tip_gen_for) validates a PROMPT point against the
++/// `kv_owner` (a paired entry's generation item, from tip_gen_for) validates a PROMPT point against the
+ /// shared backing - recurrent/indexer/boundary/MTP-metadata from `it`, main KV as the [0, L) prefix and
+ /// (when shared) MTP rows as [0, L-1). Null validates owned state exactly as before.
+ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<int32_t>& ids32,
+@@ -1509,7 +1507,7 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+             why = "stage layer count changed";
+             return false;
+         }
+-        // F2: a prompt point carries no KV of its own - the owner's layers cover [0, L) as a prefix.
++        // A prompt point carries no KV of its own - the owner's layers cover [0, L) as a prefix.
+         const saved::StagePayload* ksp = &sp;
+         if (kv_owner != nullptr) {
+             if (s >= kv_owner->stages.size() ||
+@@ -1523,7 +1521,7 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+             why = "stage layer count changed";
+             return false;
+         }
+-        // blocker 3: the exact recurrent sizes checkpoint_restore assumes (ple matches the live session's
++        // the exact recurrent sizes checkpoint_restore assumes (ple matches the live session's
+         // own presence bit, ple_prev the ids' last two) - gated before any copy starts.
+         // The 030 carve-aware sizes (tails AND dead/cursors per owned layer) are enforced through the
+         // shared pure predicate, so a truncated/029-shaped payload fails here, never mid-upload.
+@@ -1544,7 +1542,7 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+         }
+         for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+             const strata::core::QsaState& q = ls.qsa_states[i];
+-            // blocker 3: every pointer the upload dereferences, on every layer of every stage.
++            // Every pointer the upload dereferences, on every layer of every stage.
+             if (q.page_table == nullptr || q.idx_pooled == nullptr || q.idx_tail == nullptr ||
+                 q.idx_dead == nullptr || q.idx_block_pos == nullptr) {
+                 why = "indexer pointers missing";
+@@ -1579,7 +1577,7 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+     if (mst.max_cells <= 0) {
+         if (!it.mtp.kv.empty()) { why = "drafter off but snapshot has MTP rows"; return false; }
+     } else if (L > 1) {
+-        // F2: a prompt point with an empty mtp.kv shares the owner's rows (decode never rewrites [0, L-1));
++        // A prompt point with an empty mtp.kv shares the owner's rows (decode never rewrites [0, L-1));
+         // its own cells/valid_from metadata still gates the new request's window. Coverage (owner valid_from
+         // <= prompt valid_from) rides on prompt_for_shared_ok above.
+         const saved::MtpPayload* msrc = &it.mtp;
+@@ -1607,7 +1605,7 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+             why = "MTP blob size";
+             return false;
+         }
+-        // blocker 1 (Sol review): the new request's drafter window reaching BELOW the snapshot's first real
++        // the new request's drafter window reaching BELOW the snapshot's first real
+         // pair resumes under unwritten zeros (garbage) - reject. Reaching ABOVE it is safe: the request
+         // simply needs a subset of the saved real pairs. prefill_valid_from() is the conservative
+         // (window+margin) lower bound of what the new request reaches.
+@@ -1620,7 +1618,7 @@ bool saved_validate_for_restore(const saved::SavedItem& it, const std::vector<in
+ }
+ 
+ // ---- SavedState restore request (DESIGN-HERMES-CACHE.md sections 1, 2 and the section 7 addendum;
+-// F1: BRIEF-CACHE-FIX-1 - failed restores fall through to the next candidate, never to cold).
++// Failed restores fall through to the next candidate, never to cold).
+ //
+ // The per-request selection/attempt loop, extracted from the serve loop with explicit context:
+ // main() fills an F1RestoreCtx, calls f1_restore_run(), and unpacks the outputs for promotion,
+@@ -1670,7 +1668,7 @@ struct F1RestoreCtx {
+     restore::RestoreResult outcome;
+ };
+ 
+-// E2 (blocker 4): the full reset after ANY attempted mount failed (upload, boundary repair, or an
++// The full reset after ANY attempted mount failed (upload, boundary repair, or an
+ // exception mid-mount). session_zero is async-enqueued; the stream syncs surface its errors, so a
+ // false return means NO coherent fallback exists - the caller must fail the request, never serve
+ // from the half-reset state. MTP has no zero: its coherence comes from the cold suffix prefill
+@@ -1834,17 +1832,17 @@ static int f1_restore_run(F1RestoreCtx& c) {
+     int64_t& reread_to = c.reread_to;
+     restore::RestoreResult& f1_outcome = c.outcome;
+     try {
+-        // E3: the disk side's own skip set (paths, owned by the walk): a failed lazy load or
++                // The disk side's own skip set (paths, owned by the walk): a failed lazy load or
+         // validation tries the next shorter on-disk root, never the same file twice. The disk peek
+         // in the loop below is metadata-only; the payload is lazy-loaded only when the disk entry
+         // is the longest side.
+         // K8V4: no disk offers either (the store never started under hybrid; belt-and-braces).
+         const bool use_disk = saved_state_kv_ok() && root_disk_store.enabled();
+-        // F1 (BRIEF-CACHE-FIX-1) + E3 disk: unified longest-first walk over {live, chain,
++                // Unified longest-first walk over {live, chain,
+         // RAM saved, on-disk roots}. Collection is CPU-only (no GPU touched): chain/live prefix matches WITH an MTP boundary repair source (a
+         // chain checkpoint carries no MTP rows of its own - without the live row or a same-length saved
+         // boundary the k-1 cell cannot be paired, so the candidate is not offered), saved longest-first
+-        // WITH full restore validation (independent of chain pruning and --prompt-cache, finding 4:
++                // WITH full restore validation (independent of chain pruning and --prompt-cache:
+         // tips work with cache 0). The attempt loop mounts in that order, ties preferring live/chain
+         // (no upload); ANY mount/boundary failure logs and continues with the next shorter candidate -
+         // cold only when exhausted. After any mount attempt the GPU may be partially written:
+@@ -1884,7 +1882,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+             f1_walk.set_ram(restore::collect_ram_candidates(
+                 saved_states, ids32, req_simgs, cvec_cached, n,
+                 [&](const saved::SavedItem& cand, std::string& why) -> bool {
+-                    // F2: a prompt point validates against its generation owner's shared backing.
++                            // A prompt point validates against its generation owner's shared backing.
+                     const saved::SavedItem* owner = saved_states.tip_gen_for(&cand);
+                     return saved_validate_for_restore(cand, ids32, req_simgs, cvec_cached, n,
+                                                       g, ss, stages, mtp, why, owner);
+@@ -1895,12 +1893,12 @@ static int f1_restore_run(F1RestoreCtx& c) {
+         f1_walk.set_disk(use_disk ? &root_disk_store : nullptr, &ids32, &req_simgs,
+                          cvec_cached, n);
+         for (;;) {
+-            // E3: longest on-disk root below n (chain wins ties; k == n never mounts).
++                    // Longest on-disk root below n (chain wins ties; k == n never mounts).
+             // Metadata-only: no payload is read until the entry is the longest side.
+             restore::RestoreCandidate f1_cand = f1_walk.next();
+             if (f1_cand.exhausted) break;   // exhausted: cold below
+             const bool take_chain = f1_cand.take_chain;
+-            // E3: the disk side mounts here (strict-longer only over RAM: an equal-length RAM
++                    // The disk side mounts here (strict-longer only over RAM: an equal-length RAM
+             // item needs no disk read). Load/validation failures retire the file and try shorter.
+             if (!take_chain && f1_cand.source == restore::RestoreCandidate::Source::Disk) {
+                 // Retire first: every continue below moves to a shorter candidate, never this
+@@ -2021,7 +2019,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                             }
+                         }
+                         if (!mounted) {
+-                            // F1: a failed mount falls through to shorter candidates (never fatal, never cold
++                            // A failed mount falls through to shorter candidates (never fatal, never cold
+                             // yet). The GPU may be partially written: reset for coherence, drop live/chain.
+                             std::fprintf(stderr, "strata serve: conversation checkpoint restore at %lld tokens "
+                                                  "failed: trying shorter\n", (long long) k);
+@@ -2037,7 +2035,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                         // KV streaming: the drafter's ring may hold cells past k from a longer turn; refill it
+                         // from the live host rows before the boundary pairing below overwrites cell k-1.
+                         mtp.kv_restore(k);
+-                        // E2b boundary repair (was below: ALWAYS repair cell k-1, no proven-older shortcut).
++                        // Boundary repair (was below: ALWAYS repair cell k-1, no proven-older shortcut).
+                         // The repairability pre-check above ran on untouched state, so a failure here is
+                         // transient: reset and fall through, same as a failed mount. K8V4 skips repair
+                         // entirely: upstream mounts on checkpoint_restore + kv_restore alone.
+@@ -2099,7 +2097,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                         f1_outcome = restore::RestoreResult::restored_at(k, saved::ResumeSource::Chain);
+                         break;
+                         } catch (const std::exception& ex) {
+-                            // F1: a throwing mount/repair/ring-refill is a failed candidate, not a cold request:
++                            // A throwing mount/repair/ring-refill is a failed candidate, not a cold request:
+                             // log, reset for coherence (the GPU may be touched), drop live/chain, continue.
+                             std::fprintf(stderr, "strata serve: live/chain candidate at %lld tokens threw (%s): "
+                                                  "trying shorter\n", (long long) k, ex.what());
+@@ -2129,7 +2127,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                     const int64_t sk = (int64_t) cand->ids.size();
+                     std::string why;
+                     try {
+-                    // F2: a prompt point mounts from its generation owner's shared backing (main KV as the
++                    // A prompt point mounts from its generation owner's shared backing (main KV as the
+                     // [0, sk) prefix, shared MTP rows as [0, sk-1); recurrent/indexer/boundary/MTP-metadata
+                     // from the prompt itself). K8V4: no saved candidates exist - defensive null owner.
+                     const saved::SavedItem* kv_owner =
+@@ -2147,7 +2145,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                             ok = false;
+                     }
+                     if (ok && kv_owner != nullptr && cand->mtp.kv.empty()) {
+-                        // F2 shared MTP rows: upload [0, sk-1) pairs from the owner (no-op when sk <= 1: no
++                        // Shared MTP rows: upload [0, sk-1) pairs from the owner (no-op when sk <= 1: no
+                         // pair exists yet). kv_restore below then refills the ring from the restored rows.
+                         if (sk <= 1) {
+                             if (cand->mtp.cells != 0) { why = "MTP pair count"; ok = false; }
+@@ -2170,7 +2168,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                         }
+                     }
+                     if (!ok) {
+-                        // F1: fall through to the next shorter candidate (cold only when exhausted). Reset
++                        // Fall through to the next shorter candidate (cold only when exhausted). Reset
+                         // for coherence first: the GPU may be partially written, so live/chain are dead.
+                         std::fprintf(stderr, "strata serve: SavedState restore at %lld tokens failed (%s): "
+                                              "trying shorter\n",
+@@ -2187,7 +2185,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                     // After a saved mount refill the ring from the RESTORED host rows (saved_restore_mtp put
+                     // them there) - so the boundary pairing below runs after it, overwriting cell k-1.
+                     mtp.kv_restore(sk);
+-                    // E2 boundary repair (MtpPayload invariant: cell i pairs R_i with tok_{i+1}): pair cell
++                    // Boundary repair (MtpPayload invariant: cell i pairs R_i with tok_{i+1}): pair cell
+                     // k-1 with the first suffix token BEFORE the suffix prefill (which still starts at k).
+                     {
+                         const saved::BoundaryRow& b = cand->boundary;
+@@ -2236,7 +2234,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                     live_bdry_L = -1;   // the session now holds the snapshot's line, not the old live one
+                     break;
+                     } catch (const std::exception& ex) {
+-                        // F1: same as the chain branch above - a throw retires this candidate, never colds the
++                        // Same as the chain branch above - a throw retires this candidate, never colds the
+                         // request while shorter candidates remain.
+                         std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens threw (%s): "
+                                              "trying shorter\n",
+@@ -5217,14 +5215,14 @@ int main(int argc, char** argv) {
+         bool live_ok = false;
+         std::vector<ConvCheckpoint> checks;
+         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+-        // E1: the SavedState store (DESIGN-HERMES-CACHE.md): pinned roots + byte-budget LRU tips. The live
++        // The SavedState store (DESIGN-HERMES-CACHE.md): pinned roots + byte-budget LRU tips. The live
+         // chain above is preserved untouched; roots pin at the upstream system-prefix boundary, tips snapshot
+-        // after DONE is flushed. Restore (E2), disk (E3), stats (E4) and /v1/cache (S2) consume the interface.
++        // after DONE is flushed. Restore, disk, stats and /v1/cache (S2) consume the interface.
+         saved::SavedStateStore saved_states;
+         saved_states.set_tip_budget_gib(o.tip_cache_gib);
+         saved_states.set_stage_count((int) stages.size() + 1);
+-        saved::ResumeStats saved_stats;   // E4: per-request resume stats; reset every GEN/GENI at the loop top
+-        // E3: the on-disk root cache (DESIGN-HERMES-CACHE.md section 2). The startup scan indexes headers
++        saved::ResumeStats saved_stats;   // per-request resume stats; reset every GEN/GENI at the loop top
++        // The on-disk root cache (DESIGN-HERMES-CACHE.md section 2). The startup scan indexes headers
+         // + ids metadata only (bulk blobs are seek-skipped, never read); payloads lazy-load on the first
+         // exact full-ids match. Disabled by --no-root-disk (true-cold) or when the scan fails (nonfatal:
+         // the engine then serves from chain/tips only). The destructor drains the writer and joins it.
+@@ -5266,14 +5264,14 @@ int main(int argc, char** argv) {
+                          !g_saved_startup_on ? "SavedState mode off (see above)" :
+                          "K8V4 KV (SavedState unsupported)");
+         }
+-        // E1 final review: the MTP repair row R_(root_at-1) for roots. R rows are borrowed prompt-path scratch
++        // the MTP repair row R_(root_at-1) for roots. R rows are borrowed prompt-path scratch
+         // (batched chunks, verify windows), overwritten by the next chunk/window - so on_chunk/read_windows stash
+         // the boundary row inside the callback while it is valid. e1_root_at is published per request (from
+         // root_at); the row belongs to e1_root_row_L. The root hook rejects the snapshot when they disagree.
+         int64_t e1_root_at = -1;
+         std::vector<float> e1_root_row;
+         int64_t e1_root_row_L = -1;
+-        // F2b: the retained boundary row R_(f2_bdry_at-1) for the tip's turn-boundary point. Same
++        // the retained boundary row R_(f2_bdry_at-1) for the tip's turn-boundary point. Same
+         // scratch lifetime as the root row above: stashed from the authoritative prompt source inside
+         // on_chunk/read_windows before overwrite. Valid iff f2_bdry_row_L == f2_bdry_at; published per
+         // request below (from f2_at). The snapshot at the segment end rejects a missing row (never
+@@ -5281,7 +5279,7 @@ int main(int argc, char** argv) {
+         int64_t f2_bdry_at = -1;
+         std::vector<float> f2_bdry_row;
+         int64_t f2_bdry_row_L = -1;
+-        // F2b: stash one exact residual row R_(want-1) from prompt-path scratch (a chunk's R_rows or a
++        // Stash one exact residual row R_(want-1) from prompt-path scratch (a chunk's R_rows or a
+         // window's final_R) before the next chunk/window overwrites it. Split-device handling matches
+         // the root row path (the drafter's rows live on the last stage). Never fatal: a failed copy
+         // only leaves the row unavailable and the boundary snapshot is skipped.
+@@ -5307,7 +5305,7 @@ int main(int argc, char** argv) {
+             }
+             return dst_L == want;
+         };
+-        // E2b (blocker 5): the retained live boundary row R_(live_bdry_L-1). The post-DONE flush feeds the
++        // Retained live boundary row R_(live_bdry_L-1). The post-DONE flush feeds the
+         // last emitted token through the main model only, so a chain/live mount at k == live size would
+         // otherwise leave MTP cell k-1 unpaired (the live residual scratch is long overwritten). Valid iff
+         // live_bdry_L >= 0; invalidated with live everywhere below. Lets chain/live mounts repair k-1
+@@ -5319,7 +5317,7 @@ int main(int argc, char** argv) {
+         int64_t live_bdry_L = -1;
+         uint64_t live_bdry_hash = 0;
+         int64_t live_bdry_vf = 0;
+-        // E1: a complete snapshot at exactly L tokens: ids + image/cvec identity (passed in: the keyed
++        // A complete snapshot at exactly L tokens: ids + image/cvec identity (passed in: the keyed
+         // state lives below this point), every stage's recurrent + indexer + KV state, and the MTP draft rows.
+         // The session must be idle at the boundary (the caller synchronized); stage sessions sync under their
+         // own device guard. False = store nothing.
+@@ -5336,7 +5334,7 @@ int main(int argc, char** argv) {
+                 if (k.start < L) item.imgs.push_back({k.start, k.hash});
+             item.cvec = cvec;
+             item.n_stages = (int) stages.size() + 1;
+-            // the geometry/layout these bytes were captured under: E2 validates it before any restore
++            // the geometry/layout these bytes were captured under: validated before any restore
+             {
+                 const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+                 item.geom.n_qsa_layers = g.n_qsa_layers();
+@@ -5346,7 +5344,7 @@ int main(int argc, char** argv) {
+                 item.geom.idx_block = qs.idx_block;
+                 item.geom.page_size = qs.page_size;
+             }
+-            // the MTP repair row R_(L-1) for E2's boundary pairing (Sol final review).
++            // the MTP repair row R_(L-1) for the boundary pairing (see MtpPayload's invariant).
+             item.boundary.hc = bhc;
+             item.boundary.n_embd = bnembd;
+             item.boundary.row.assign(brow, brow + (size_t) bhc * (size_t) bnembd);
+@@ -5365,13 +5363,13 @@ int main(int argc, char** argv) {
+                 sp.rec.ple_prev[1] = ids[(size_t) (L - 1)];
+                 item.stages.push_back(std::move(sp));
+             }
+-            // the MTP drafter's valid pairs (finding 3 - see MtpPayload's invariant): cell i pairs
++            // the MTP drafter's valid pairs (see MtpPayload's invariant): cell i pairs
+             // (R_i, tok_{i+1}), so L main tokens hold exactly L-1 real pairs - the last cell's pairing needs
+             // tok_L, which does not exist yet, and is NEVER invented. Prompt pairs are exact (on_chunk /
+             // read_windows prefill with real next tokens); decode pairs are exact over kept rows (draft()
+             // catch-up pairs kept rows with their real argmaxes; the final window gets its exact catch-up
+             // post-DONE before any snapshot runs). valid_from bounds the windowed drafter's reachable range
+-            // (prefill skips cells the window can never reach; E2 repairs the boundary by re-pairing from the
++            // (prefill skips cells the window can never reach; the restore repairs the boundary by re-pairing from the
+             // suffix on resume). The host copy holds the full history even for a ring, so all pairs are
+             // captured; the helper still fails safe on oversize. No indexer: the drafter has none.
+             item.mtp = saved::MtpPayload{};
+@@ -5504,7 +5502,7 @@ int main(int argc, char** argv) {
+             }
+             return true;
+         };
+-        // E2 (blocker 4): mount-failure resets run through f1_cold_reset_all (file scope above),
++        // Mount-failure resets run through f1_cold_reset_all (file scope above),
+         // which the restore request calls with its explicit context.
+         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+             std::vector<int32_t> nxt((size_t) T);
+@@ -5514,17 +5512,17 @@ int main(int argc, char** argv) {
+             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+             // (no second prefill: prefill writes absolute cells, so a repeat only redoubles the drafter work -
+             // on a batched chunk it would clobber E-9's values with the slow path's. R_rows below is only read.)
+-            // F2b: stash the turn-boundary residual R_(f2_bdry_at-1) - this chunk's row
++            // Stash the turn-boundary residual R_(f2_bdry_at-1) - this chunk's row
+             // (f2_bdry_at-1-p0). Same borrowed-scratch lifetime as the root row above.
+             stash_bdry_row(f2_bdry_row, f2_bdry_row_L, f2_bdry_at, R_rows, p0, T, "boundary");
+-            // E1 final review: stash the root boundary residual R_(e1_root_at-1) - this chunk's row
++            // stash the root boundary residual R_(e1_root_at-1) - this chunk's row
+             // (e1_root_at-1-p0). R_rows is borrowed prompt-path scratch, overwritten by the next chunk, so the
+             // D2H happens here, inside on_chunk, while valid. Reporting stage is the last one when split (the
+             // drafter's rows live there). A failed copy just leaves the row unavailable: the root hook then
+             // rejects the snapshot (the chain still stands), it never fails the request.
+             if (e1_root_at > 0 && e1_root_row_L != e1_root_at && saved_state_kv_ok() &&
+                 p0 <= e1_root_at - 1 && e1_root_at - 1 < p0 + T) {
+-                // Sol final-review fix: the assign below can throw (allocation) - an OPTIONAL root capture
++                // the assign below can throw (allocation) - an OPTIONAL root capture
+                 // must never kill the request. A failed stash only leaves the row unavailable (root rejected).
+                 try {
+                     const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
+@@ -5915,7 +5913,7 @@ int main(int argc, char** argv) {
+             } busy_scope;
+             stop_req.store(false);   // a STOP that arrived between requests is stale
+             err.clear();
+-            saved_stats = saved::ResumeStats{};   // E4: fresh counters every GEN/GENI (aux/cancel/recovery
++            saved_stats = saved::ResumeStats{};   // fresh counters every GEN/GENI (aux/cancel/recovery
+                                                   // included); early continues log nothing, so no stale stats
+             const bool geni = line.rfind("GENI ", 0) == 0;
+             if (!geni && line.rfind("GEN ", 0) != 0) {
+@@ -5933,7 +5931,7 @@ int main(int argc, char** argv) {
+             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
+             int req_penalty_last_n = 0;
+             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+-            // E1/S1: aux=1 marks a side request (titles): it may resume from a main tip but snapshots nothing
++            // Aux=1 marks a side request (titles): it may resume from a main tip but snapshots nothing
+             // and evicts nothing, so it never costs the main path anything. Set by the server from its own
+             // is_aux_request() (no tools + response_format); unknown to older servers, defaulting to main.
+             bool req_aux = false;
+@@ -6127,7 +6125,7 @@ int main(int argc, char** argv) {
+             // skips the needless park_current snapshot below and no reuse is lost. Parking itself stays
+             // gated by conversations.enabled() (park_current/best are inert when disabled). SavedState mode
+             // skips this scan: the unified walk collects live/chain itself (with repair sources), and
+-            // from_live is set on mount there. K8V4 keeps the F1 walk (runtime-gated, startup stays on).
++            // from_live is set on mount there. K8V4 keeps the unified walk (runtime-gated, startup stays on).
+             const bool upstream_resume_mode = !g_saved_startup_on;
+             if (upstream_resume_mode && o.prompt_cache > 0 && want_cvec == cvec_cached) {
+                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
+@@ -6200,7 +6198,7 @@ int main(int argc, char** argv) {
+             std::string disk_hit_path;
+             // The walk's outcome (restored k + source, or the last typed failure).
+             // Set at every success/failure site of the SavedState walk (f1_restore_run);
+-            // the E4 stats block reads it. Untouched (cold) on the upstream path, which
++            // the stats block reads it. Untouched (cold) on the upstream path, which
+             // keeps its own readout.
+             restore::RestoreResult f1_outcome = restore::RestoreResult::cold();
+             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+@@ -6259,13 +6257,13 @@ int main(int argc, char** argv) {
+                 if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+                 mtp.set_prompt_len(n);
+             } else {
+-            // SavedState path (the default): the unified F1 walk runs inside f1_restore_run below
++            // SavedState path (the default): the unified restore walk runs inside f1_restore_run below
+             // (file scope, explicit context); this branch only sets up, calls, and unpacks.
+-            // E3: a disk-loaded mount lives in the restore context for the request (no store mutation
++            // A disk-loaded mount lives in the restore context for the request (no store mutation
+             // can move it), so the payload stays alive through promotion and stats below.
+-            mtp.set_prompt_len(n);   // E2: the new request's length before resume selection - the restore
++            mtp.set_prompt_len(n);   // the new request's length before resume selection - the restore
+                                      // validation reads prefill_valid_from() (the new drafter window) from it
+-            // E4: actual restore cost (uploads + the repairs below, not cold prefill): the whole F1 walk.
++            // Actual restore cost (uploads + the repairs below, not cold prefill): the whole walk.
+             const auto e4_restore_t0 = Clock::now();
+             f1.n = n;
+             f1.ids = &ids;
+@@ -6325,13 +6323,13 @@ int main(int argc, char** argv) {
+                 checks.clear();
+                 live_bdry_L = -1;
+             }
+-            // F1: live/chain/saved/disk mounts (and their boundary repairs) all ran inside the attempt
++            // Live/chain/saved/disk mounts (and their boundary repairs) all ran inside the attempt
+             // loop above; resume/from_live/from_saved/saved_hit/disk_hit/reread_to are final here. Cold (resume==0) reads from 0.
+             tr("request", n, geni ? 1 : 0);
+-            // F1: boundary repairs ran inside the attempt loop (each mount pairs cell k-1 before the
++            // Boundary repairs ran inside the attempt loop (each mount pairs cell k-1 before the
+             // suffix prefill, disk mounts included); resume is final here.
+             if (from_saved && saved_hit != nullptr) saved_states.note_use(saved_hit);   // mounts count as use
+-            // E3: a successful disk mount joins the RAM roots (later requests find it with no disk read)
++            // A successful disk mount joins the RAM roots (later requests find it with no disk read)
+             // and refreshes the file's mtime for the LRU trim. insert_root re-validates the payload;
+             // mark_used is best-effort. Both run only on success (from_saved still true after repair).
+             // The promotion copy runs inside its own guard: a failure after a successful GPU restore
+@@ -6358,7 +6356,7 @@ int main(int argc, char** argv) {
+                     // best-effort mtime refresh: never fatal.
+                 }
+             }
+-            // E4: the source the walk chose (chain wins ties: both hits stay null then). k/suffix
++            // The source the walk chose (chain wins ties: both hits stay null then). k/suffix
+             // are final: the loop cold-resets resume to 0 only when no candidate restores.
+             if (reread_to > 0) {
+                 // STRATA_CKPT_REREAD debug mode: the checkpoint was re-read, not mounted - actual reuse is
+@@ -6441,17 +6439,17 @@ int main(int argc, char** argv) {
+                         return false;
+                     }
+                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
+-                    // F2b: stash the turn-boundary residual R_(f2_bdry_at-1) - this window's row
++                    // Stash the turn-boundary residual R_(f2_bdry_at-1) - this window's row
+                     // (f2_bdry_at-1-q) of final_R. Same verify-scratch lifetime as the root row below.
+                     stash_bdry_row(f2_bdry_row, f2_bdry_row_L, f2_bdry_at, ver.final_R_all(), q, T,
+                                    "boundary");
+-                    // E1 final review: stash the root boundary residual R_(e1_root_at-1) - this window's row
++                    // stash the root boundary residual R_(e1_root_at-1) - this window's row
+                     // (e1_root_at-1-q) of final_R. The rows are verify scratch, reused by the next window, so the
+                     // D2H happens here, before it. final_R_all is the last stage's on a split. A failed copy only
+                     // leaves the row unavailable (root hook rejects the snapshot); the request proceeds.
+                     if (e1_root_at > 0 && e1_root_row_L != e1_root_at && saved_state_kv_ok() &&
+                         q <= e1_root_at - 1 && e1_root_at - 1 < q + T) {
+-                        // Sol final-review fix: see on_chunk - an allocation fault here must not fail the request.
++                        // see on_chunk - an allocation fault here must not fail the request.
+                         try {
+                             const strata::core::OnDevice on_row(stages.empty() ? -1 : stages.back()->dev);
+                             const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
+@@ -6594,13 +6592,13 @@ int main(int argc, char** argv) {
+                         if (i >= o.prompt_cache_root) root_at = i;
+                         break;
+                     }
+-            // E1 final review: publish the root boundary for the R-row stash (on_chunk/read_windows above) and
++            // publish the root boundary for the R-row stash (on_chunk/read_windows above) and
+             // reset any previous request's row. The stash fires at most once: only the segment ending at root_at
+             // covers row root_at-1. K8V4: never published (SavedState unsupported) - both stash sites stay idle.
+             e1_root_at = saved_state_kv_ok() ? root_at : -1;
+             e1_root_row.clear();
+             e1_root_row_L = -1;
+-            // F2b: the LAST TURN BOUNDARY inside this prompt - the start of the trailing assistant
++            // the LAST TURN BOUNDARY inside this prompt - the start of the trailing assistant
+             // generation header, i.e. the preceding <|im_end|> + newline end (verified by real
+             // tokenization in tools/probe_turn_prefix.py: the raw prompt end n is NOT a prefix of the
+             // next turn - the header re-renders as a history assistant turn - but L is, for the same
+@@ -6613,7 +6611,7 @@ int main(int argc, char** argv) {
+             if (o.turn_token >= 0)
+                 for (int64_t i = n - 1; i > 0; --i)
+                     if (ids[(size_t) i] == o.turn_token) { f2_at = i; break; }
+-            // F2b: the prompt point of the paired tip, captured at the segment ending at f2_at below
++            // the prompt point of the paired tip, captured at the segment ending at f2_at below
+             // (exact boundary-L recurrent/indexer state + stashed R_(L-1); main/MTP KV shared post-DONE).
+             // Main KV and MTP rows are NOT copied here: they come from the post-DONE generation backing
+             // (see TipEntry). Failures only drop the prompt point (the generation tip still records).
+@@ -6667,13 +6665,13 @@ int main(int argc, char** argv) {
+                     return 1;
+                 }
+                 if (to == root_at && root_at > 0 && saved_state_kv_ok()) {
+-                    // E1: pin the upstream system-prefix root at its exact boundary (never evicted by traffic).
+-                    // Sol final review: the snapshot needs the MTP repair row R_(root_at-1) stashed from the
++                    // Pin the upstream system-prefix root at its exact boundary (never evicted by traffic).
++                    // The snapshot needs the MTP repair row R_(root_at-1) stashed from the
+                     // authoritative prompt source above - reject it when unavailable (never invent it).
+-                    // Never fatal (finding 5): snapshot/insert failures - including allocation faults - only drop
++                    // Never fatal: snapshot/insert failures - including allocation faults - only drop
+                     // the root; the chain checkpoint above still stands. insert_root also rejects incomplete
+                     // payloads (SavedItem::complete).
+-                    // E4: the root snapshot cost (saved_snapshot + insert) adds to snapshot_ms; a later tip
++                    // The root snapshot cost (saved_snapshot + insert) adds to snapshot_ms; a later tip
+                     // in this request adds too. Excluded setup: the boundary-row stash D2H, which rides the
+                     // prompt read above (one hc x n_embd row, sub-ms) rather than the snapshot.
+                     const auto e4_root_t0 = Clock::now();
+@@ -6692,7 +6690,7 @@ int main(int argc, char** argv) {
+                             std::fprintf(stderr, "strata serve: SavedState root snapshot at %lld tokens failed "
+                                                  "(the chain checkpoint above still stands)\n", (long long) root_at);
+                         } else {
+-                            // E3: queue the immutable capture for the background disk writer first (one copy;
++                            // Queue the immutable capture for the background disk writer first (one copy;
+                             // deduplicated by file key, bounded, no-op when root-disk is disabled - never fatal,
+                             // never blocking the reply), then move the original into the RAM store. The disk
+                             // call is wrapped separately: a disk queue/copy failure must never suppress the
+@@ -6723,7 +6721,7 @@ int main(int argc, char** argv) {
+                 }
+                 if (to == f2_bdry_at && f2_bdry_at > 0 && !stop_req.load() && !cancelled &&
+                     saved_state_kv_ok()) {
+-                    // F2b: snapshot the tip's turn-boundary point at exactly L = f2_at tokens. The session
++                    // Snapshot the tip's turn-boundary point at exactly L = f2_at tokens. The session
+                     // just read [at, L), so recurrent/PLE/tails/indexer are prompt-only boundary-L state -
+                     // never later decode state sliced to shorter ids. MTP pairs [0, L-1) are exact (every
+                     // row below L went through on_chunk/read_windows prefill with real next tokens); the
+@@ -6731,7 +6729,7 @@ int main(int argc, char** argv) {
+                     // cells/valid_from metadata is stored (cells = L-1). The boundary row R_(L-1) is the
+                     // stashed exact residual (retained for repair with the next prompt's P[L]); a missing
+                     // row skips the capture (never invented). Rec/indexer-only: no duplicate full main or
+-                    // MTP KV copy. E4: the capture cost lands in snapshot_ms, success and failure alike.
++                    // MTP KV copy. The capture cost lands in snapshot_ms, success and failure alike.
+                     const int64_t L = f2_bdry_at;
+                     const auto f2b_cap_t0 = Clock::now();
+                     try {
+@@ -6769,7 +6767,7 @@ int main(int argc, char** argv) {
+                             }
+                             if (cudaDeviceSynchronize() != cudaSuccess)
+                                 throw std::runtime_error("device not idle");
+-                            // Sol F2b review: the chain just saved this exact boundary's running state via
++                            // The chain just saved this exact boundary's running state via
+                             // checkpoint_at(turn_at) above when enabled (same session, no GPU work since -
+                             // the root block cannot run at this `to`, and nothing else mutates between).
+                             // Reuse its host gdn/ple/tails (+stage_parts) instead of a second device copy.
+@@ -6894,7 +6892,7 @@ int main(int argc, char** argv) {
+             bool first_window = true;
+             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+             int64_t draft_offered = 0, draft_accepted = 0;
+-            // E1 exact emitted boundary (Sol review finding 2): the last token actually SENT and its absolute
++            // Exact emitted boundary: the last token actually SENT and its absolute
+             // position, plus the final window's (pos0, kept rows) for the post-DONE MTP catch-up. Updated ONLY
+             // for tokens the client received (the emit loop), never for speculative or accepted-but-unemitted
+             // rows: eos breaks before x/p update and a truncated window's tail is never emitted.
+@@ -6983,7 +6981,7 @@ int main(int argc, char** argv) {
+                 bool adapt_ok = true;
+                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+-                // E1 exact boundary (Sol review finding 2): commit ONLY the rows that feed emitted picks.
++                // Exact boundary: commit ONLY the rows that feed emitted picks.
+                 // The accepted window (a+1 rows) can exceed the emitted range when eos or max_new stops the
+                 // emission loop below early; committing those un-emitted drafts would put tokens the client never
+                 // saw into `consumed`/live, breaking the tip's transcript identity (a forked child's prompt is
+@@ -7017,7 +7015,7 @@ int main(int argc, char** argv) {
+                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                     strata::core::progress_beat();
+                     ++produced_n;
+-                    emit_last = outv[(size_t) i];   // exact sent boundary (finding 2: independent of x/p)
++                    emit_last = outv[(size_t) i];   // exact sent boundary (independent of x/p)
+                     emit_pos = p + i + 1;            // outv[i] is the pick AFTER row i, i.e. position p+i+1
+                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
+                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+@@ -7053,7 +7051,7 @@ int main(int argc, char** argv) {
+                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                 if (eos) { finish = "stop"; break; }
+                 if (stop_req.load()) { finish = "cancel"; break; }
+-                x = outv[(size_t) (e - 1)];   // the last EMITTED pick, not the last accepted one (finding 2)
++                x = outv[(size_t) (e - 1)];   // the last EMITTED pick, not the last accepted one
+                 p += e;
+             }
+             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+@@ -7072,7 +7070,7 @@ int main(int argc, char** argv) {
+                 const std::string pr = ver.profile_report();
+                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+             }
+-            // E1 (Sol review findings 1, 2, 4): NO extra token processing before DONE. `consumed` is exactly
++            // NO extra token processing before DONE. `consumed` is exactly
+             // prompt + EMITTED inputs (the loop commits only rows that feed emitted picks); `boundary_ok` says
+             // state == consumed, independent of the chain (`live_ok` additionally needs --prompt-cache, so tips
+             // work with cache 0). A prompt-stop or mid-decode STOP leaves the session between two commits: swap
+@@ -7086,7 +7084,7 @@ int main(int argc, char** argv) {
+                 live_ok = o.prompt_cache > 0;
+                 boundary_ok = true;
+             }
+-            // E1 finding 1: the boundary diagnostics are DEFINED here (every name is in scope) but CALLED
++            // Boundary diagnostics are DEFINED here (every name is in scope) but CALLED
+             // after DONE below, once the post-DONE flush has brought live+state to the exact tip boundary the
+             // fingerprint covers. The guard reads boundary_ok at CALL time (by reference).
+             auto state_hash_dump = [&]() {
+@@ -7217,7 +7215,7 @@ int main(int argc, char** argv) {
+                         (long long) req_hits, (long long) req_look);
+             std::fflush(stdout);
+             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
+-            // E1 findings 1-3, 5: ALL extra end-of-turn work runs AFTER DONE is flushed - the reply never
++            // ALL extra end-of-turn work runs AFTER DONE is flushed - the reply never
+             // waits for it. (a) MTP exact catch-up for the final window (its draft() was skipped on eos/length/
+             // stop): pair kept cells [q,q+e) with (R row, real next token). R rows + window/outv are still valid
+             // - nothing ran since the final ver.run. Drafter-only: a failure suppresses the tip (mtp_ok) but
+@@ -7226,13 +7224,13 @@ int main(int argc, char** argv) {
+             // emitted range) through run+commit with head sampling off, extending the exact boundary by one.
+             // max_context is safe by the admission margin (L+8 <= max_context) and re-checked below. Any
+             // failure - or a STOP landing post-DONE - invalidates live (live_ok/boundary_ok=false) and suppresses
+-            // the tip; the served answer and earlier checkpoints are untouched. Allocation faults are caught
+-            // (finding 5), never fatal.
++            // the tip; the served answer and earlier checkpoints are untouched. Allocation faults are caught,
++            // never fatal.
+             bool mtp_ok = true;
+-            // E1 final review: the tip's MTP repair row R_(L-1), D2H'd from the flush residual below (last
+-            // stage on a split). A tip without it is rejected - E2 cannot repair pair L-1 without R_(L-1).
++            // the tip's MTP repair row R_(L-1), D2H'd from the flush residual below (last
++            // stage on a split). A tip without it is rejected - the restore cannot repair pair L-1 without R_(L-1).
+             std::vector<float> flush_R;
+-            // E4: the full post-DONE cache preparation (catch-up, flush, residual copy, snapshot incl.
++            // The full post-DONE cache preparation (catch-up, flush, residual copy, snapshot incl.
+             // failures) lands in snapshot_ms once, below the catches. No nested timers (no double count).
+             const auto e4_post_t0 = Clock::now();
+             try {
+@@ -7280,7 +7278,7 @@ int main(int argc, char** argv) {
+                         boundary_ok = false;
+                         live_bdry_L = -1;
+                     } else {
+-                        // Sol final-review fix: the commit above advanced main state for emit_last, so live
++                        // the commit above advanced main state for emit_last, so live
+                         // advances INDEPENDENTLY of the repair-row copy below - otherwise live_ok would claim
+                         // the old length for advanced state. A failed row copy only suppresses the tip.
+                         live.push_back(emit_last);
+@@ -7297,7 +7295,7 @@ int main(int argc, char** argv) {
+                                                  "tip suppressed (live still advanced)\n");
+                             flush_R.clear();
+                         } else {
+-                            // E2b (blocker 5): retain the live boundary row even when no tip comes of it
++                            // Retain the live boundary row even when no tip comes of it
+                             // (aux lines, budget off): the next chain/live mount at this L repairs its
+                             // k-1 MTP cell from it without any upload. The hash pins the row to this
+                             // transcript (same length, different tokens must never pair from it). The valid_from
+@@ -7309,13 +7307,13 @@ int main(int argc, char** argv) {
+                         }
+                     }
+                 }
+-                // (c) boundary diagnostics on the exact tip boundary (finding 1).
++                // (c) boundary diagnostics on the exact tip boundary.
+                 state_hash_dump();
+-                // (d) tip snapshot (finding 3: MTP rows are the L-1 real pairs; finding 4: live_ok is NOT
+-                // required, so tips work with --prompt-cache 0; final review: the boundary repair row is
+-                // required - a tip without R_(L-1) leaves E2 unable to pair cell L-1. Finding 5: failures only
+-                // drop the tip).
+-                // F2b: one tip LINE holds both restorable points - the turn-boundary point (captured at
++                // (d) tip snapshot (MTP rows are the L-1 real pairs; live_ok is NOT
++                // required, so tips work with --prompt-cache 0; the boundary repair row is
++                // required - a tip without R_(L-1) leaves the restore unable to pair cell L-1.
++                // Failures only drop the tip).
++                // One tip LINE holds both restorable points - the turn-boundary point (captured at
+                 // the prefill segment ending at f2_at, sharing this generation's KV/MTP backing) and the
+                 // generation end (below). Coherence is pre-checked on CPU before either item moves; an
+                 // incoherent pair still records the generation tip alone. The pairing gate uses the ACTUAL
+@@ -7372,10 +7370,10 @@ int main(int argc, char** argv) {
+                 boundary_ok = false;
+                 live_bdry_L = -1;
+             }
+-            // E4: one timing for all of the above, success and failure paths alike; adds to any root cost.
++            // One timing for all of the above, success and failure paths alike; adds to any root cost.
+             saved_stats.snapshot_ms +=
+                 std::chrono::duration<double, std::milli>(Clock::now() - e4_post_t0).count();
+-            // E4: one stats line per request, stderr only (stdout keeps the GEN protocol: RESUME/PP/T/DONE).
++            // One stats line per request, stderr only (stdout keeps the GEN protocol: RESUME/PP/T/DONE).
+             // After post-DONE work, so snapshot_ms holds root + full post-DONE cost and k/suffix are final.
+             {
+                 const char* e4_src = "none";
+diff --git a/src/program/restore.cpp b/src/program/restore.cpp
+index f0e1410..c090e07 100644
+--- a/src/program/restore.cpp
++++ b/src/program/restore.cpp
+@@ -1,6 +1,6 @@
+ // src/program/restore.cpp - restore candidate selection (readability refactor).
+ //
+-// Behaviour-preserving extraction from src/program/generate.cpp's F1 unified restore walk.
++// Behaviour-preserving extraction from src/program/generate.cpp's unified restore walk.
+ // CPU-only: no CUDA here.
+ //
+ // What moved where (all from generate.cpp's per-request restore block):
+@@ -105,7 +105,7 @@ std::vector<const saved_state::SavedItem*> collect_ram_candidates(
+     const std::vector<saved_state::ImgKey>& imgs, bool cvec, int64_t n,
+     RamEligibilityFn eligible, void* ctx) {
+     std::vector<const saved_state::SavedItem*> out;   // validated, longest-first
+-    // Accumulating skip set (blocker 5 review): each rejected candidate joins, so the walk is
++    // Accumulating skip set: each rejected candidate joins, so the walk is
+     // longest-first without revisit and always terminates (cand==nullptr ends it).
+     std::vector<const saved_state::SavedItem*> skip;
+     for (;;) {
+diff --git a/src/program/restore_test.cpp b/src/program/restore_test.cpp
+index 43da5c6..eaf1dc8 100644
+--- a/src/program/restore_test.cpp
++++ b/src/program/restore_test.cpp
+@@ -149,7 +149,7 @@ void write_file(const std::string& path, const std::vector<uint8_t>& buf) {
+     o.close();
+ }
+ 
+-// ---- Step-2 phase seams (non-owning fakes; production wires the GPU-backed versions) ----
++// ---- Disk phase seams (non-owning fakes; production wires the GPU-backed versions) ----
+ bool dval_accept(const saved::SavedItem&, std::string&, void*) { return true; }
+ 
+ bool dval_reject(const saved::SavedItem&, std::string& why, void*) {
+diff --git a/src/program/root_disk_codec.cpp b/src/program/root_disk_codec.cpp
+index 4275328..3f6bdb9 100644
+--- a/src/program/root_disk_codec.cpp
++++ b/src/program/root_disk_codec.cpp
+@@ -135,7 +135,7 @@ struct RootReader {
+     // dictates, so the allocation below is exact and bounded before it happens. Used for every blob
+     // whose size SnapshotGeom determines (KV codes/scales, indexer pools/keys); the recurrent state
+     // keeps the absolute kMaxRootRecBytes cap (its exact size needs the full model geometry, which
+-    // E2's saved_validate_for_restore checks against the live session instead).
++    // the restore-time saved_validate_for_restore checks against the live session instead).
+     bool blob_exact(std::vector<uint8_t>& v, bool want, uint64_t expected, std::string& why) {
+         const uint64_t L = u64();
+         if (!ok) {
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index 084c4ae..aa5194a 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -1,7 +1,7 @@
+-// src/program/saved_state.cpp - E1: the SavedState store policy (CPU-only, no CUDA).
++// src/program/saved_state.cpp - the SavedState store policy (CPU-only, no CUDA).
+ //
+-// Implemented: Muse / review: Sol. See saved_state.hpp for the design contract.
+-// E3 (same attribution): the on-disk codec lives in root_disk_codec.cpp and the disk cache
++// See saved_state.hpp for the design contract.
++// The on-disk codec lives in root_disk_codec.cpp and the disk cache
+ // (index/background writer/trim) in root_disk_store.cpp (CPU-only, no CUDA, no device code).
+ #include "strata/program/saved_state.hpp"
+ 
+@@ -38,7 +38,7 @@ void SavedStateStore::set_stage_count(int n) {
+ 
+ bool SavedStateStore::insert_root(SavedItem item) {
+     if ((int)item.stages.size() != n_stages_ || item.n_stages != n_stages_) return false;
+-    if (!item.complete()) return false;   // finding 5: never store an inconsistent/incomplete payload
++    if (!item.complete()) return false;   // never store an inconsistent/incomplete payload
+     item.kind = Kind::Root;
+     item.bytes = item.payload_bytes();
+     item.last_use = ++clock_;
+@@ -55,7 +55,7 @@ bool SavedStateStore::insert_root(SavedItem item) {
+ bool SavedStateStore::insert_tip(SavedItem item, bool is_aux) {
+     if (is_aux) return false;   // S1: aux lines get no tip and never evict a main line
+     if ((int)item.stages.size() != n_stages_ || item.n_stages != n_stages_) return false;
+-    if (!item.complete()) return false;   // finding 5: never store an inconsistent/incomplete payload
++    if (!item.complete()) return false;   // never store an inconsistent/incomplete payload
+     if (item.ids.empty()) return false;   // resume 0 is "read from the start": nothing to save
+     TipEntry e;
+     e.gen = std::move(item);
+@@ -91,7 +91,7 @@ bool SavedStateStore::insert_tip_pair(SavedItem prompt, SavedItem gen, bool is_a
+     e.prompt.kind = Kind::Tip;
+     e.gen.kind = Kind::Tip;
+     e.has_prompt = true;
+-    if (!e.complete()) return false;   // F2 gate: incoherent pairs (incl. duplicate-KV prompts) never store
++    if (!e.complete()) return false;   // coherence gate: incoherent pairs (incl. duplicate-KV prompts) never store
+     e.bytes = e.entry_bytes();   // shared KV/MTP rows counted once (they only exist in gen); both recs counted
+     e.last_use = ++clock_;
+     e.gen.bytes = e.gen.payload_bytes();   // the store sets each point's own metadata consistently
+@@ -142,8 +142,8 @@ const SavedItem* SavedStateStore::find_best_except(const std::vector<int32_t>& i
+         if (best == nullptr || it.ids.size() > best->ids.size()) best = &it;
+     };
+     for (const SavedItem& r : roots_) consider(r);
+-    // F2: every paired tip offers BOTH points; resume takes the longest valid one across both. The skip set
+-    // holds sub-item pointers (prompt or gen members); each retires independently, so the F1 walk terminates.
++    // Every paired tip offers BOTH points; resume takes the longest valid one across both. The skip set
++    // holds sub-item pointers (prompt or gen members); each retires independently, so the restore walk terminates.
+     for (const TipEntry& t : tips_) {
+         consider(t.gen);
+         if (t.has_prompt) consider(t.prompt);
+@@ -177,7 +177,7 @@ bool SavedStateStore::note_use(const SavedItem* it) {
+             r.last_use = ++clock_;
+             return true;
+         }
+-    // F2: a mount of either point refreshes the LINE and both points' metadata, so the pair evicts
++    // A mount of either point refreshes the LINE and both points' metadata, so the pair evicts
+     // coherently and inventory rows stay fresh.
+     for (TipEntry& t : tips_)
+         if (&t.gen == it || (t.has_prompt && &t.prompt == it)) {
+@@ -197,7 +197,7 @@ const SavedItem* SavedStateStore::tip_gen_for(const SavedItem* p) const {
+ }
+ 
+ size_t SavedStateStore::drop_non_pinned() {
+-    // S2 rows, not F2 lines: inventory lists BOTH points of a paired tip, so the dropped count is the
++    // Inventory rows, not tip lines: inventory lists BOTH points of a paired tip, so the dropped count is the
+     // removed restorable-point rows (tip_points()), matching what inventory reported.
+     const size_t n = tip_points();
+     tips_.clear();
+@@ -209,7 +209,7 @@ std::vector<InventoryEntry> SavedStateStore::inventory() const {
+     std::vector<InventoryEntry> out;
+     out.reserve(roots_.size() + tip_points());
+     for (const SavedItem& r : roots_) out.push_back({Kind::Root, r.ids.size(), r.bytes, r.last_use});
+-    // F2: a paired tip lists both points (prompt, then generation); their stored bytes sum to the entry
++    // A paired tip lists both points (prompt, then generation); their stored bytes sum to the entry
+     // bytes (the shared KV/MTP rows sit in the gen row only).
+     for (const TipEntry& t : tips_) {
+         if (t.has_prompt) out.push_back({Kind::Tip, t.prompt.ids.size(), t.prompt.bytes, t.prompt.last_use});
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index 570f329..b48fa0e 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -1,12 +1,12 @@
+ // src/program/saved_state_test.cpp - SavedState store policy + payload validation (CPU-only).
+ //
+-// E2 (Sol final-review regression): skipping ONE rejected pointer loops forever with two invalid candidates
++// Walk termination: skipping ONE rejected pointer loops forever with two invalid candidates
+ // (A skipped -> B invalid -> A returned again). The store therefore walks with an accumulating skip set
+ // (find_best_except) plus an exact-length lookup (find_exact) that sees an item even under a longer tip.
+ // CPU-only (saved_state.{hpp,cpp}, no CUDA); mirrors the serve loop's selection structure with a fake
+-// eligibility predicate. Termination IS the regression: every walk below must end.
++// eligibility predicate. Every walk below must end.
+ //
+-// E5 (DESIGN-HERMES-CACHE.md section 5): dedicated store/payload suite - exact full-ids matching (two
++// Dedicated store/payload suite (DESIGN-HERMES-CACHE.md section 5): exact full-ids matching (two
+ // unrelated equal-length lines), longest prefix, cvec/image identity, pinned roots, byte-budget LRU and
+ // note_use, aux insertion as a strict no-op (no insert, no eviction, no clock), depth+1 fork retention
+ // (section 7: parent and forked-child tips coexist, no prefix collapsing), duplicate replacement, stage
+@@ -14,28 +14,26 @@
+ // rejection. Fixture sizes below are hand-derived literals (see the geometry comments), not calls into the
+ // implementation's own size helpers, so the tests check the policy rather than re-stating it.
+ //
+-// E3 (DESIGN-HERMES-CACHE.md section 2, same attribution): the disk-persistence suite below - codec
++// Disk-persistence suite (DESIGN-HERMES-CACHE.md section 2): codec
+ // roundtrip/meta/corruption/trailing/bounds, filename gates, streaming scan, index ignore + exact-match
+ // rules, background writer lifecycle, cap trim ownership, disabled no-ops.
+ //
+-// E3 (DESIGN-HERMES-CACHE.md section 2): root disk persistence - versioned bounded binary codec,
++// Root disk persistence (DESIGN-HERMES-CACHE.md section 2): versioned bounded binary codec,
+ // streaming metadata scan, RAM index with lazy payloads (never hash-only), background writer lifecycle,
+ // mtime LRU cap, recognized-files-only trimming. All filesystem work happens in temp dirs under the
+ // test's working directory (inside the workspace build tree): the real default root dir is never
+ // touched here.
+ //
+-// F2 (BRIEF-CACHE-FIX-1): one tip line holds TWO coherent restorable points - the prompt point (exact
++// One tip line holds TWO coherent restorable points - the prompt point (exact
+ // boundary-L ids, for re-rendered next turns and forked children) and the generation end (for verbatim
+ // echoes). The prompt point shares the generation KV (no duplicate copy) with boundary-only
+ // recurrent/indexer/boundary/MTP payloads; the entry counts both recs + the shared KV once and evicts
+ // coherently. CPU store tests only, no parity asserts.
+ //
+-// F2b: the prompt point moved from the raw prompt end n to the LAST TURN BOUNDARY L inside the prompt
+-// (Round 2 GPU finding: n carries the generation header, which the next turn re-renders as a history
+-// assistant turn, so n is never a prefix). CPU-verified with the real tokenizer + pack template in
++// The prompt point sits at the LAST TURN BOUNDARY L inside the prompt (the raw prompt end n carries
++// the generation header, which the next turn re-renders as a history assistant turn, so n is never
++// a prefix). Verified with the real tokenizer + pack template in
+ // tools/probe_turn_prefix.py (parent1 n=11731, L=11726, LCP=11730, L a prefix of parent2/fork).
+-//
+-// Implemented: Muse / reviewed: Sol.
+ #include "strata/program/saved_state.hpp"
+ 
+ #include <chrono>
+@@ -113,7 +111,7 @@ std::vector<int32_t> req_ids(int n) {
+     return v;
+ }
+ 
+-// ---- E5 fixtures -----------------------------------------------------------
++// ---- Store fixtures -----------------------------------------------------------
+ //
+ // Two small geometries with hand-derived byte sizes (literals, worked out by hand from the layout
+ // contract in saved_state.hpp - not via kv_pool_bytes - so a wrong formula fails the test):
+@@ -285,7 +283,7 @@ std::vector<int32_t> req_at(int base, int n) {
+     return v;
+ }
+ 
+-// ---- F2 fixtures -----------------------------------------------------------
++// ---- Paired-tip fixtures -----------------------------------------------------------
+ //
+ // A prompt-end point for the first n ids of a gen line (same base, so it is a strict prefix of the gen ids):
+ // own recurrent/indexer/boundary/MTP payloads (prompt-only, marker-filled to prove no aliasing with the
+@@ -309,7 +307,7 @@ saved::SavedItem make_prompt_item(int n, int base) {
+     return it;
+ }
+ 
+-// F2 shared-MTP prompt: the engine keeps no second draft-KV copy - rows [0, n-1) come from the generation
++// Shared-MTP prompt: the engine keeps no second draft-KV copy - rows [0, n-1) come from the generation
+ // backing (immutable during decode); only cells/valid_from metadata is the prompt's own.
+ saved::SavedItem make_shared_prompt_item(int n, int base) {
+     saved::SavedItem it = make_prompt_item(n, base);
+@@ -328,7 +326,7 @@ void rejects(saved::SavedItem good, const std::function<void(saved::SavedItem&)>
+     check(!st.insert_tip(good, false) && st.tips() == 0, what_ins);
+ }
+ 
+-// ---- E3 helpers ---------------------------------------------------------------
++// ---- Disk helpers ---------------------------------------------------------------
+ 
+ saved::RootDiskHeader e3_header() {
+     saved::RootDiskHeader h;
+@@ -442,7 +440,7 @@ int main() {
+               "walk terminates picking the eligible shorter root");
+     }
+     {
+-        // F1 (BRIEF-CACHE-FIX-1): the serve loop's fall-through policy at the store level. Three longest
++        // Fall-through policy at the store level. Three longest
+         // candidates fail in turn (validation rejection, mount failure, repair failure - the loop cannot
+         // tell them apart, each just joins the skip set), the walk visits each exactly once longest-first,
+         // and terminates on the pinned root. Cold only when the walk ends with no pick.
+@@ -471,10 +469,10 @@ int main() {
+               "F1 multiple failures fall through to the root");
+     }
+     {
+-        // F1 tie behavior (store-level half): an equal-length root+tip are both eligible; the walk offers
++        // Tie behavior (store-level half): an equal-length root+tip are both eligible; the walk offers
+         // the root first (roots enumerate before tips), and rejecting it falls through to the tip instead
+-        // of cold. (The other half - live/chain winning ties over saved with no upload - is call-site
+-        // policy in generate.cpp's F1 attempt loop, not unit-testable on CPU.)
++        // of cold. (The other half - live/chain winning ties over saved with no upload - is covered
++        // by the selection rule in restore_test.cpp; only the actual device mount runs on GPU.)
+         saved::SavedStateStore st;
+         check(st.insert_root(make_item(120)), "F1 tie root(120) stores");
+         check(st.insert_tip(make_item(120), false), "F1 tie tip(120) stores alongside");
+@@ -527,7 +525,7 @@ int main() {
+         check(st.find_exact(div, no_imgs, true, 100) == nullptr, "divergent ids miss");
+         check(st.find_best(div, no_imgs, true) == nullptr, "divergent ids have no best either");
+     }
+-    {   // E5: is_prefix compares exact full ids; empty is never a prefix (resume 0 reads fresh).
++    {   // is_prefix compares exact full ids; empty is never a prefix (resume 0 reads fresh).
+         check(saved::is_prefix({1, 2, 3}, {1, 2, 3, 4}), "proper prefix matches");
+         check(saved::is_prefix({1, 2, 3}, {1, 2, 3}), "equal ids are a prefix (exact-length hit)");
+         check(!saved::is_prefix({}, {1, 2, 3}), "empty prefix never matches");
+@@ -535,14 +533,14 @@ int main() {
+         check(!saved::is_prefix({1, 2, 9}, {1, 2, 3, 4}), "one divergent id rejects");
+         check(!saved::is_prefix({9}, {1, 2, 3}), "divergent first id rejects");
+     }
+-    {   // E5: imgs_below keeps images strictly below L (an image AT the resume point is suffix).
++    {   // imgs_below keeps images strictly below L (an image AT the resume point is suffix).
+         const std::vector<saved::ImgKey> all = {{3, 99}, {10, 7}, {20, 8}};
+         check(saved::imgs_below(all, 11) == std::vector<saved::ImgKey>{{3, 99}, {10, 7}},
+               "imgs_below keeps starts strictly below L");
+         check(saved::imgs_below(all, 10).size() == 1, "an image at exactly L is suffix, not state");
+         check(saved::imgs_below(all, 0).empty(), "nothing is below 0");
+     }
+-    {   // E5: two unrelated equal-length lines never cross-match: validity needs the full ids,
++    {   // two unrelated equal-length lines never cross-match: validity needs the full ids,
+         // not a length or a hash. Line A lives at ids 1000.., line B at 5000...
+         saved::SavedStateStore st;
+         check(st.insert_tip(make_line(50, 1000), false), "line A(50) stores");
+@@ -558,7 +556,7 @@ int main() {
+         check(st.find_exact(req_a, no_imgs, true, 50)->ids[0] == 1000, "find_exact sees A under no longer tip");
+         check(st.find_exact(req_b, no_imgs, true, 50)->ids[0] == 5000, "find_exact sees B under no longer tip");
+     }
+-    {   // E5: longest exact prefix wins across kinds; a longer divergent item is skipped for a
++    {   // longest exact prefix wins across kinds; a longer divergent item is skipped for a
+         // shorter true prefix. Root 120 beats tip 80 on the root's line; on a line diverging at
+         // 120 the 150/200 tips are out and root 100 still matches.
+         saved::SavedStateStore st;
+@@ -576,7 +574,7 @@ int main() {
+         const saved::SavedItem* bd = st2.find_best(div, no_imgs, true);
+         check(bd != nullptr && bd->ids.size() == 100, "divergence at 120 falls back to root(100)");
+     }
+-    {   // E5: cvec identity. A flipped request misses; same ids under both cvec values coexist
++    {   // cvec identity. A flipped request misses; same ids under both cvec values coexist
+         // and each request finds its own.
+         saved::SavedStateStore st;
+         check(st.insert_tip(make_line(40, 0), false), "cvec=true tip stores");
+@@ -590,7 +588,7 @@ int main() {
+         check(st2.find_best(req_at(0, 60), no_imgs, false) == nullptr, "flipped cvec request misses");
+         check(st2.find_exact(req_at(0, 60), no_imgs, false, 40) == nullptr, "flipped cvec exact misses");
+     }
+-    {   // E5: image identity mirrors generate.cpp's ImgKey: same pads with a different grid hash,
++    {   // image identity mirrors generate.cpp's ImgKey: same pads with a different grid hash,
+         // a shifted image, or an extra image below L all reject; an image at/above L is suffix.
+         saved::SavedStateStore st;
+         saved::SavedItem it = make_line(40, 0);
+@@ -609,7 +607,7 @@ int main() {
+         check(st.find_best(req_at(0, 60), no_imgs, true) == nullptr, "missing image misses");
+         check(st.find_exact(req_at(0, 60), same, true, 40) != nullptr, "exact lookup respects images too");
+     }
+-    {   // E5: roots are pinned - a tip budget that rotates tips never takes a root, and S2's
++    {   // roots are pinned - a tip budget that rotates tips never takes a root, and S2's
+         // drop keeps every root while reporting the dropped tip count.
+         saved::SavedStateStore st;
+         check(st.insert_root(make_line(100, 0)), "root(100) stores");
+@@ -650,7 +648,7 @@ int main() {
+         check(st.find_exact(req_at(0, 60), no_imgs, true, 40) != nullptr, "s2 root still addressable");
+         check(st.drop_non_pinned() == 0, "s2 repeated delete reports zero");
+     }
+-    {   // E5: byte-budget LRU counts mounts, not just inserts - note_use refreshes A so the
++    {   // byte-budget LRU counts mounts, not just inserts - note_use refreshes A so the
+         // next insert evicts B. (Design: a mount MUST call note_use.)
+         saved::SavedStateStore st;
+         check(st.insert_tip(make_line(20, 100), false), "tip A stores");
+@@ -668,7 +666,7 @@ int main() {
+         check(st.find_best(req_at(200, 60), no_imgs, true) == nullptr, "stale B is the LRU victim");
+         check(st.find_best(req_at(300, 60), no_imgs, true) != nullptr, "newcomer C stays");
+     }
+-    {   // E5: aux insertion (titles, S1) is a strict no-op - false, no insert, no eviction of a
++    {   // aux insertion (titles, S1) is a strict no-op - false, no insert, no eviction of a
+         // full store, and the LRU clock frozen.
+         saved::SavedStateStore st;
+         check(st.clock() == 0, "fresh clock is 0");
+@@ -683,7 +681,7 @@ int main() {
+         check(st.find_best(req_at(100, 60), no_imgs, true) != nullptr, "main A intact after aux traffic");
+         check(st.find_best(req_at(200, 60), no_imgs, true) != nullptr, "main B intact after aux traffic");
+     }
+-    {   // E5 section 7: depth+1 fork retention. The parent tip covers prompt + GENERATED tokens at
++    {   // Depth+1 fork retention (section 7). The parent tip covers prompt + GENERATED tokens at
+         // the DONE boundary; the forked child extends those ids with its tool result. Both tips
+         // coexist (no prefix collapsing) and each line resumes from its own tip, even when the
+         // budget holds exactly depth+1 lines.
+@@ -699,7 +697,7 @@ int main() {
+         check(st.find_best(req_at(0, 45), no_imgs, true)->kind == saved::Kind::Root,
+               "short request still finds the root");
+     }
+-    {   // F2: a re-rendered assistant turn resumes at the prompt point, suffix = rendered assistant + new
++    {   // a re-rendered assistant turn resumes at the prompt point, suffix = rendered assistant + new
+         // user only. Parent line: prompt 60 + 40 generated (reasoning) = gen 100. The next request renders
+         // the assistant WITHOUT the reasoning (diverges at 60), so the generation point is not a prefix.
+         saved::SavedStateStore st;
+@@ -724,7 +722,7 @@ int main() {
+               "F2 prompt recurrent state is prompt-only (no aliasing)");
+         check(pe != nullptr && pe->mtp.cells == 59, "F2 prompt MTP covers the exact [0, n-1) pairs");
+     }
+-    {   // F2: a verbatim echo of the generated ids takes the LONGER generation point (longest valid
++    {   // a verbatim echo of the generated ids takes the LONGER generation point (longest valid
+         // point across both). Its boundary/recurrent state are the generation's own.
+         saved::SavedStateStore st;
+         check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 paired tip stores");
+@@ -734,7 +732,7 @@ int main() {
+               "F2 generation point keeps its own boundary row");
+         check(b != nullptr && !b->stages[0].kv.empty(), "F2 generation point owns the shared KV");
+     }
+-    {   // F2: the prompt point survives an unrelated child line (store-level, independent of the chain).
++    {   // the prompt point survives an unrelated child line (store-level, independent of the chain).
+         saved::SavedStateStore st;
+         check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 parent pair stores");
+         check(st.insert_tip(make_line(75, 5000), false), "F2 unrelated child tip stores alongside");
+@@ -747,7 +745,7 @@ int main() {
+         const saved::SavedItem* bc = st.find_best(req_at(5000, 90), no_imgs, true);
+         check(bc != nullptr && bc->ids.size() == 75 && bc->ids[0] == 5000, "F2 child line finds its own tip");
+     }
+-    {   // F2: shared-KV accounting and coherent eviction. Entry bytes = gen + prompt (KV once, both recs);
++    {   // shared-KV accounting and coherent eviction. Entry bytes = gen + prompt (KV once, both recs);
+         // budget pressure evicts the whole LINE - neither point survives alone.
+         saved::SavedStateStore st;
+         saved::SavedItem pr = make_prompt_item(60, 0);
+@@ -772,7 +770,7 @@ int main() {
+         const saved::SavedItem* bb = st.find_best(req_at(5000, 90), no_imgs, true);
+         check(bb != nullptr && bb->ids.size() == 80, "F2 surviving line B resumes at its generation point");
+     }
+-    {   // F2: mounting the PROMPT point refreshes the line (LRU counts mounts, not just inserts) - the pair
++    {   // mounting the PROMPT point refreshes the line (LRU counts mounts, not just inserts) - the pair
+         // survives together while the stale line is the victim.
+         saved::SavedStateStore st;
+         check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false), "F2 line A stores");
+@@ -789,7 +787,7 @@ int main() {
+               "F2 generation point survives with its prompt");
+         check(st.find_best(req_at(5000, 60), no_imgs, true) == nullptr, "F2 stale B is the LRU victim");
+     }
+-    {   // F2: kv_prefix_ok - exact, longer backing (prompt prefix of generation), and rejections.
++    {   // kv_prefix_ok - exact, longer backing (prompt prefix of generation), and rejections.
+         const saved::SavedItem gen = make_line(100, 0);   // fp16 gA: k/v ceil(100/4)*64 = 1600 B
+         const saved::KvLayerPayload& kv = gen.stages[0].kv[0];
+         check(saved::kv_prefix_ok(kv, 100, gen.geom), "F2 prefix_ok holds exactly");
+@@ -815,7 +813,7 @@ int main() {
+         check(!saved::kv_prefix_ok(hybrid, 60, gen.geom), "K8V4 hybrid prefix rejected");
+         // K8V4 chain policy (shared helpers the engine branches call): mounts stand on
+         // checkpoint_restore + kv_restore as upstream - no saved-boundary repair source required
+-        // and no E2b repair block runs; int8 keeps the repair requirement.
++        // and no boundary repair block runs; int8 keeps the repair requirement.
+         check(saved::kv_saved_supported(false), "non-hybrid KV keeps SavedState support");
+         check(!saved::kv_saved_supported(true), "K8V4 disables SavedState support");
+         check(saved::kv_chain_mount_needs_repair(false), "int8 chain mounts require boundary repair");
+@@ -827,7 +825,7 @@ int main() {
+                   empty.find_exact(req60, no_imgs, true, 60) == nullptr,
+               "K8V4 empty store offers no repair source, yet the chain policy above lets it mount");
+     }
+-    {   // F2 shared-MTP pair (the engine form): the prompt keeps cells/valid_from metadata only, rows come
++    {   // Shared-MTP pair (the engine form): the prompt keeps cells/valid_from metadata only, rows come
+         // from the generation backing - entry bytes drop by the second MTP copy, both points still restore.
+         saved::SavedStateStore st;
+         saved::SavedItem gen = make_line(100, 0);
+@@ -857,7 +855,7 @@ int main() {
+         check(!st.insert_tip_pair(std::move(bad), make_line(100, 0), false) && st.tips() == 1,
+               "F2 shared prompt with short cells rejected");
+     }
+-    {   // F2 shared-MTP coverage: the backing must really hold every row the prompt claims - an owner
++    {   // Shared-MTP coverage: the backing must really hold every row the prompt claims - an owner
+         // valid_from above the prompt's means the prompt claims rows absent from the backing.
+         saved::SavedItem gen = make_line(100, 0);
+         check(gen.complete(), "F2 coverage fixture itself is complete");
+@@ -874,7 +872,7 @@ int main() {
+         check(st.insert_tip_pair(std::move(shr_eq), std::move(gen), false),
+               "F2 equal-bound shared pair stores");
+     }
+-    {   // F2b: the prompt point sits at the LAST TURN BOUNDARY L, not the raw prompt end n. Minimal
++    {   // the prompt point sits at the LAST TURN BOUNDARY L, not the raw prompt end n. Minimal
+         // fixture modelled on the probe (raw n=70, boundary L=60, 10-token generation-header tail):
+         // the parent prompt's raw end can never be a prefix of the next turn (the header re-renders as
+         // a history assistant turn), while L is. The pair stores (boundary@60, gen@100); the next-turn
+@@ -906,7 +904,7 @@ int main() {
+         check(pe != nullptr && pe->stages[0].rec.ple_prev[0] == 58 && pe->stages[0].rec.ple_prev[1] == 59,
+               "F2b ple window is the boundary ids' last two");
+     }
+-    {   // F2b old-vs-new: the same next-turn request (shared [0, 60), changed header past L)
++    {   // Old-vs-new: the same next-turn request (shared [0, 60), changed header past L)
+         // against the OLD raw-end store resumes the root at 40, while the boundary store resumes tip60
+         // after unrelated child traffic. Rejection of the raw point and the improvement, together.
+         std::vector<int32_t> next = req_at(0, 60);
+@@ -933,7 +931,7 @@ int main() {
+                   "F2b-new suffix is the re-rendered tail only (20, not 40)");
+         }
+     }
+-    {   // F2b: a boundary point with a malformed or missing MTP repair row is rejected (E2 cannot pair
++    {   // a boundary point with a malformed or missing MTP repair row is rejected (the restore cannot pair
+         // cell L-1 without R_(L-1)); the generation tip still stores alone.
+         {
+             saved::SavedItem bad = make_shared_prompt_item(60, 0);
+@@ -970,7 +968,7 @@ int main() {
+                   "F2b out-of-range valid_from rejected");
+         }
+     }
+-    {   // F2 point metadata: the store sets each point's bytes/last_use (prior API contract); note_use
++    {   // Point metadata: the store sets each point's bytes/last_use (prior API contract); note_use
+         // refreshes the entry AND both points together.
+         saved::SavedStateStore st;
+         check(st.insert_tip_pair(make_shared_prompt_item(60, 0), make_line(100, 0), false),
+@@ -987,7 +985,7 @@ int main() {
+         check(pe->last_use == ge->last_use && pe->last_use == st.clock(),
+               "F2 note_use refreshes both points plus the entry clock");
+     }
+-    {   // F2 x F1: the retry walk composes with pairs - longest-first over gen, prompt, then the root, with
++    {   // Paired-tip retry walk: the retry walk composes with pairs - longest-first over gen, prompt, then the root, with
+         // each sub-point retiring independently so the walk always terminates on the eligible root.
+         saved::SavedStateStore st;
+         check(st.insert_root(make_line(40, 0)), "F2 root(40) stores");
+@@ -1002,7 +1000,7 @@ int main() {
+         }
+         check(seen == std::vector<int>{100, 60, 40}, "F2 walk visits gen, prompt, then root (no revisit)");
+     }
+-    {   // F2: incoherent pairs never store; aux pair inserts are a strict no-op (clock frozen); exact
++    {   // incoherent pairs never store; aux pair inserts are a strict no-op (clock frozen); exact
+         // duplicates replace in place; a single insert over a paired gen key replaces the whole entry.
+         saved::SavedStateStore st;
+         {
+@@ -1045,7 +1043,7 @@ int main() {
+         check(st3.insert_tip(make_line(100, 0), false), "F2 single over the paired gen key returns true");
+         check(st3.tips() == 1 && st3.tip_points() == 1, "F2 single replaces the pair (downgrade)");
+     }
+-    {   // E5: exact-duplicate replacement refreshes in place (one recent tip per line for re-runs).
++    {   // exact-duplicate replacement refreshes in place (one recent tip per line for re-runs).
+         saved::SavedStateStore st;
+         check(st.insert_tip(make_line(50, 1000), false), "tip stores");
+         const uint64_t b0 = st.tip_bytes();
+@@ -1055,7 +1053,7 @@ int main() {
+         check(st.insert_root(make_line(100, 0)), "duplicate root returns true");
+         check(st.roots() == 1, "duplicate root replaces in place");
+     }
+-    {   // E5: stage-count mismatch is rejected at insert, and a stage-layout change clears the
++    {   // stage-count mismatch is rejected at insert, and a stage-layout change clears the
+         // store rather than risk a cross-layout restore. Same count is a no-op (roots survive).
+         saved::SavedStateStore st;
+         saved::SavedItem two = make_line(20, 0);
+@@ -1074,7 +1072,7 @@ int main() {
+         check(st.roots() == 0 && st.tips() == 0 && st.stage_count() == 2, "layout change clears the store");
+         check(st.insert_tip(two, false), "two-stage item stores under the new layout");
+     }
+-    {   // E5: RootDiskHeader gates E3 loads - every numerics/model identity field must match.
++    {   // RootDiskHeader gates disk loads - every numerics/model identity field must match.
+         // ids_len/ids_hash do NOT gate compatibility (the full-ids prefix rule applies after load).
+         saved::RootDiskHeader h0;
+         h0.engine_version = "0.1.21";
+@@ -1113,7 +1111,7 @@ int main() {
+         h.numeric_flags = "other";
+         check(!h.compatible_with(h0), "numeric flags mismatch rejected");
+     }
+-    {   // E5: happy paths for every format - minimal L=1 (no MTP pair exists yet), int8 with
++    {   // happy paths for every format - minimal L=1 (no MTP pair exists yet), int8 with
+         // scales, q4 without, and a non-empty PLE history.
+         saved::SavedItem one = make_line(1, 5);
+         check(one.complete(), "L=1 fp16 item (empty MTP) is complete");
+@@ -1130,7 +1128,7 @@ int main() {
+         check(st4.find_best(req_at(0, 20), no_imgs, true) != nullptr, "q4 tip is addressable");
+         check(st8.find_best(req_at(0, 20), no_imgs, false) != nullptr, "int8 tip is addressable");
+     }
+-    {   // E5: incomplete/malformed payloads never become restorable - each mutated copy fails
++    {   // incomplete/malformed payloads never become restorable - each mutated copy fails
+         // complete() and is refused by insert_tip.
+         const saved::SavedItem good = make_line(12, 0);   // fp16: k/v 192 B, pooled 64 B, MTP 192 B
+         check(good.complete(), "fixture itself is complete");
+@@ -1206,7 +1204,7 @@ int main() {
+         rejects(q4, [](saved::SavedItem& m) { m.stages[0].kv[0].ks.push_back(1); }, "q4 with scales incomplete",
+                 "q4 with scales refused");
+     }
+-    {   // E3: codec roundtrip preserves every payload byte (canaries), the header, and the scalar
++    {   // codec roundtrip preserves every payload byte (canaries), the header, and the scalar
+         // MTP/boundary fields; the file key is stable across the roundtrip.
+         const saved::RootDiskHeader h = e3_header();
+         const saved::SavedItem it = e3_canary_line(12, 0);
+@@ -1237,7 +1235,7 @@ int main() {
+               "e3 boundary row survives");
+         check(saved::root_file_key(h, it) == saved::root_file_key(dh, di), "e3 file key stable");
+     }
+-    {   // E3: meta decode validates without allocating bulk; the meta is never complete (so it can
++    {   // meta decode validates without allocating bulk; the meta is never complete (so it can
+         // never become a restorable item) but still carries every index scalar.
+         const saved::RootDiskHeader h = e3_header();
+         const saved::SavedItem it = e3_canary_line(12, 0);
+@@ -1259,7 +1257,7 @@ int main() {
+         check(saved::root_file_key(h, it) == saved::root_file_key(mh, meta),
+               "e3 file key computable from meta");
+     }
+-    {   // E3: encode refuses incomplete payloads (a partial item is never written).
++    {   // encode refuses incomplete payloads (a partial item is never written).
+         const saved::RootDiskHeader h = e3_header();
+         saved::SavedItem bad = e3_canary_line(12, 0);
+         bad.stages[0].rec.gdn.clear();
+@@ -1267,7 +1265,7 @@ int main() {
+         std::string why;
+         check(!saved::root_encode(h, bad, buf, why), "e3 encode refuses incomplete payload");
+     }
+-    {   // E3: corruption fails safely with no large allocation: bad magic/version, truncation (short
++    {   // corruption fails safely with no large allocation: bad magic/version, truncation (short
+         // file, dropped tail byte), an ids length over the 4M cap (claims no 16MB: the cap precedes
+         // the allocation), ids longer than the buffer, a flipped id byte (hash bind), trailing bytes.
+         const saved::RootDiskHeader h = e3_header();
+@@ -1321,7 +1319,7 @@ int main() {
+         check(!saved::root_decode(huge.data(), huge.size(), dh, di, true, why),
+               "e3 over-cap ids length rejected in meta mode too");
+     }
+-    {   // E3: filename gates: only exactly owned names are ever created, touched or deleted.
++    {   // filename gates: only exactly owned names are ever created, touched or deleted.
+         // Positive regression on a REAL key: `root-` (5) + 16 hex + `.hstr` (5) = 26 bytes total.
+         const saved::SavedItem it = e3_canary_line(12, 0);
+         const std::string key = saved::root_file_key(e3_header(), it);
+@@ -1342,7 +1340,7 @@ int main() {
+         check(!saved::root_temp_name_ok("root-0123456789abcdef.tmp."), "e3 empty temp suffix rejected");
+         check(!saved::root_temp_name_ok("root-xyz.tmp.1"), "e3 non-hex temp rejected");
+     }
+-    {   // E3: streaming scan (root_scan_meta) indexes metadata while seek-skipping bulk: the meta has
++    {   // streaming scan (root_scan_meta) indexes metadata while seek-skipping bulk: the meta has
+         // full ids and no bulk; truncation and trailing bytes fail.
+         const std::string sub = "rootdisk-e3-tmp/scan";
+         std::error_code ec;
+@@ -1383,7 +1381,7 @@ int main() {
+         check(!saved::root_scan_meta(tpath, trail.size(), sh, sm, why),
+               "e3 scan rejects trailing bytes");
+     }
+-    {   // E3: store scan ignores incompatible/corrupt/foreign/renamed files; matching is full-ids
++    {   // store scan ignores incompatible/corrupt/foreign/renamed files; matching is full-ids
+         // (never hash-only) with exact image/cvec identity and strict lo < len < hi bounds.
+         const std::string sub = "rootdisk-e3-tmp/index";
+         std::error_code ec;
+@@ -1443,7 +1441,7 @@ int main() {
+               "e3 skip set exhausts the candidate");
+         st.shutdown();
+     }
+-    {   // E3: background writer lifecycle: enqueue -> file appears -> dedupe -> mark_used -> join.
++    {   // background writer lifecycle: enqueue -> file appears -> dedupe -> mark_used -> join.
+         const std::string sub = "rootdisk-e3-tmp/bg";
+         std::error_code ec;
+         fs::create_directories(sub, ec);
+@@ -1486,7 +1484,7 @@ int main() {
+         st.shutdown();   // idempotent
+         check(!st.enabled(), "e3 shutdown disables");
+     }
+-    {   // E3: cap trim deletes oldest-mtime recognized cache files past the cap plus stale recognized
++    {   // cap trim deletes oldest-mtime recognized cache files past the cap plus stale recognized
+         // temps, and never touches anything else.
+         const std::string sub = "rootdisk-e3-tmp/cap";
+         std::error_code ec;
+@@ -1539,7 +1537,7 @@ int main() {
+         check(!ec && total <= cap, "e3 dir within cap after trim");
+         st.shutdown();
+     }
+-    {   // E3: shutdown drains (enqueue then immediate shutdown loses nothing); a restart sees the
++    {   // shutdown drains (enqueue then immediate shutdown loses nothing); a restart sees the
+         // written file with no further writes (the writer published before the join returned).
+         const std::string sub = "rootdisk-e3-tmp/drain";
+         std::error_code ec;
+@@ -1571,7 +1569,7 @@ int main() {
+             st.shutdown();
+         }
+     }
+-    {   // E3: the startup scan enforces the cap itself (no writes needed): three files on disk, cap
++    {   // the startup scan enforces the cap itself (no writes needed): three files on disk, cap
+         // for the two newest - start() alone trims the oldest and the index drops it.
+         const std::string sub = "rootdisk-e3-tmp/startcap";
+         std::error_code ec;
+@@ -1605,7 +1603,7 @@ int main() {
+               "e3 startup-trimmed root no longer matches");
+         st.shutdown();
+     }
+-    {   // E3: strict GiB parsing (shared helper): malformed/inf/nan/negative/exact-boundary
++    {   // strict GiB parsing (shared helper): malformed/inf/nan/negative/exact-boundary
+         // reject, sane values accept. The exact boundary is 2^34 GiB ((double)UINT64_MAX rounds up
+         // to 2^64): it must reject with >=, since == already converts to 2^64 bytes (undefined).
+         double gib = -1.0;
+@@ -1631,7 +1629,7 @@ int main() {
+         check(saved::parse_gib_flag("17179869183", gib, err) && gib == 17179869183.0,
+               "e3 gib just below boundary accepts");
+     }
+-    {   // E3: a corrupt same-key file is atomically replaced by the recaptured root (startup scan
++    {   // a corrupt same-key file is atomically replaced by the recaptured root (startup scan
+         // ignores it, so enqueue proceeds; the rewrite overwrites it in place, old bytes never
+         // trusted). No temp leftovers, payload loads complete.
+         const std::string sub = "rootdisk-e3-tmp/replace";
+@@ -1662,7 +1660,7 @@ int main() {
+         check(!ec && !tmp_left, "e3 no temp leftovers after replace");
+         st.shutdown();
+     }
+-    {   // E3: replacing an existing GOOD file is safe (valid before and after, mtime refreshed),
++    {   // replacing an existing GOOD file is safe (valid before and after, mtime refreshed),
+         // and drop_path repairs a bad index entry so the same key can be recaptured and queued.
+         const std::string sub = "rootdisk-e3-tmp/repair";
+         std::error_code ec;
+@@ -1698,7 +1696,7 @@ int main() {
+         check(!ec && t_new > t_old, "e3 replace refreshed the good file");
+         st.shutdown();
+     }
+-    {   // E3: a never-started store is a safe no-op everywhere (true-cold shape without the engine).
++    {   // a never-started store is a safe no-op everywhere (true-cold shape without the engine).
+         saved::RootDiskStore d;
+         std::string why;
+         check(!d.enabled(), "e3 disabled store reports off");
+@@ -1752,7 +1750,7 @@ int main() {
+         saved::RootDiskStore off;
+         check(off.disk_inventory().empty(), "s2 disabled store reports no disk rows");
+     }
+-    {   // E3 filesystem lifecycle stays inside ./rootdisk-e3-tmp (workspace build tree): the real
++    {   // Filesystem lifecycle stays inside ./rootdisk-e3-tmp (workspace build tree): the real
+         // default root dir is never touched by any test above.
+         const std::string probe = saved::kDefaultRootDir;
+         check(probe == "H:\\qwen38-v100\\strata-cache\\roots", "e3 default root dir unchanged");
+@@ -1760,7 +1758,7 @@ int main() {
+         fs::remove_all("rootdisk-e3-tmp", ec);
+         check(!ec && !fs::exists("rootdisk-e3-tmp"), "e3 tmp cleaned");
+     }
+-    {   // Sol review: startup mode gate truth table (pure policy). Defaults run SavedState; an
++    {   // Startup mode gate truth table (pure policy). Defaults run SavedState; an
+         // opted-in upstream cache (mib>0 && slots>0 && prompt_cache>0) or any layer split turns it off.
+         using saved::saved_startup_mode_on;
+         check(saved_startup_mode_on(0, 4, 6, false), "mode defaults on (no conv cache, no split)");
+@@ -1770,7 +1768,7 @@ int main() {
+         check(!saved_startup_mode_on(0, 4, 6, true), "mode off on layer split (no carve tags)");
+         check(!saved_startup_mode_on(512, 4, 6, true), "mode off on split+conv");
+     }
+-    {   // Sol review: resolved rope identity is exact-bits (lossless) and fail-closed.
++    {   // Resolved rope identity is exact-bits (lossless) and fail-closed.
+         using strata::kernels::RopeScaling;
+         using strata::kernels::RopeScalingType;
+         RopeScaling a;   // resolved none: trained rotation, base only
+-- 
+2.54.0.windows.1
+
