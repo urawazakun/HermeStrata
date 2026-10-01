@@ -1,0 +1,735 @@
+From dd8e588075ea0ea2acac0751eef683d92a5f999c Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 19:23:17 +0900
+Subject: [PATCH] Prefix keeper diagnostics: ISO timestamps; for an unrepaired
+ history mutation, the first differing offset, a cause hint
+ (memory/notification/image/tool-call/system) and short excerpts in the JSONL;
+ 20 MB rotation
+
+---
+ serve/server.py      | 265 ++++++++++++++++++++++++++++++++++-------
+ serve/test_server.py | 278 ++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 499 insertions(+), 44 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 4d7853a..737fcfd 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -25,6 +25,7 @@ from __future__ import annotations
+ import argparse
+ import collections
+ import copy
++import datetime
+ import difflib
+ import base64
+ import hashlib
+@@ -34,6 +35,7 @@ import ctypes
+ import json
+ import os
+ import queue
++import re
+ import signal
+ import subprocess
+ import sys
+@@ -792,10 +794,12 @@ def _keeper_anthropic_request(req: dict) -> tuple:
+ #     template and tokenizer, still fits max_context - 8192 tokens, else Hermes' version goes unchanged.
+ # Anything else (reordered/changed messages or calls, changed tools) forwards unchanged and atomic (then even
+ # the system is left alone), with a mutation logged. Every repair and detected non-append mutation logs one
+-# stderr line (`strata serve: keeper <kind> msg=<i> ...`, CR/LF escaped) plus one JSON row in
+-# `prefix-keeper.jsonl` next to the engine log (request id, kind, index, UTF-8 bytes before/after, bounded short
+-# diff - never full prompts); both sinks serialize on one lock, and engines without a log file (mock) log to
+-# stderr only. Repairs reuse stored-message bytes verbatim and never mutate the requester's objects, so the
++# stderr line (`strata serve: keeper <kind> ts=<iso> msg=<i> ...`, CR/LF escaped) plus one JSON row in
++# `prefix-keeper.jsonl` next to the engine log (timestamp, request id, kind, index, UTF-8 bytes before/after,
++# bounded short diff - never full prompts; mutation-unrepaired rows also carry the first differing character
++# offset, a classification hint and <=300-char old/new excerpts); both sinks serialize on one lock, the JSONL
++# rotates before a write that would pass 20 MB (active plus one `.1` backup), and engines without a log file
++# (mock) log to stderr only. Repairs reuse stored-message bytes verbatim and never mutate the requester's objects, so the
+ # forwarded prefix is exactly what the engine cached - including stale `[context update]` blocks mid-history,
+ # which is what lets the NEXT turn align (Hermes never sees our blocks; each injected block carries
+ # `_keeper_injected` provenance with its raw text, matched explicitly - client text resembling the tag is never
+@@ -807,6 +811,136 @@ KEEPER_MAX_SYS_LINES = 8        # a system message may differ by this many chang
+ KEEPER_MAX_SYS_FRAC = 0.05      # ... and by this fraction of its stored lines at most
+ KEEPER_TAG = "\n\n[context update]\n"
+ KEEPER_DIFF_CHARS = 600         # bound on the diff text in both log sinks
++KEEPER_JSONL_MAX_BYTES = 20 * 1024 * 1024   # prefix-keeper.jsonl rotates past this size (BRIEF-IMAGE-KEEP item 4)
++KEEPER_EXCERPT_CHARS = 300      # bound on each old/new excerpt in mutation-unrepaired JSONL rows
++KEEPER_HINT_PATTERNS = (        # (hint, regex): first match on text around the divergence wins
++    ("memory-context/Honcho/Holographic",
++     r"(?i)memory.context|honcho|holograph|memory|prefetch|api_content"),
++    ("async-delegation/internal-notification/watch",
++     r"(?i)async.?delegation|internal.?notification|notification|watch"),
++    ("screenshot-removed/image",
++     r"(?i)screenshot removed|image|vision|picture|screenshot"),
++    ("tool-call-json",
++     r"tool_call|tool-use|tool_use|\"arguments\"|'arguments'|\"name\"\s*:\s*\""),
++    ("system-prompt",
++     r"(?i)system prompt|instructions|workspace|git snapshot|status:"),
++)
++
++
++def _keeper_now_iso() -> str:
++    """UTC ISO-8601 timestamp for every keeper log line and JSONL row (item 4)."""
++    return datetime.datetime.now(datetime.timezone.utc).isoformat()
++
++
++def _keeper_msg_text(m) -> str | None:
++    """A message's comparable text: str content plus canonical tool calls when present (so a changed
++    tool-call JSON moves the offset), otherwise canonical JSON (None when absent)."""
++    if not isinstance(m, dict):
++        return None
++    c = m.get("content")
++    tcs = m.get("tool_calls")
++    if isinstance(c, str):
++        if tcs is not None:
++            try:
++                return c + "\n" + json.dumps(tcs, ensure_ascii=False, sort_keys=True)
++            except (TypeError, ValueError):
++                return c
++        return c
++    if c is None and tcs is not None:
++        try:
++            return json.dumps(tcs, ensure_ascii=False, sort_keys=True)
++        except (TypeError, ValueError):
++            return None
++    if c is None:
++        return None
++    try:
++        return json.dumps(c, ensure_ascii=False, sort_keys=True)
++    except (TypeError, ValueError):
++        return str(c)
++
++
++def _keeper_first_diff(a: str, b: str) -> int:
++    """First differing character offset between two texts (min length when one extends the other)."""
++    n = min(len(a), len(b))
++    for i in range(n):
++        if a[i] != b[i]:
++            return i
++    return n
++
++
++def _keeper_excerpt(text: str, offset: int, limit: int = KEEPER_EXCERPT_CHARS) -> str:
++    """<=limit chars of text around offset (a window, not the full prompt; JSONL only)."""
++    if not text:
++        return ""
++    start = max(0, min(offset - limit // 3, len(text) - limit) if len(text) > limit else 0)
++    return text[start:start + limit]
++
++
++def _keeper_classify(old: str, new: str, s=None, n=None, note: str = "") -> str:
++    """Classification hint for a mutation-unrepaired divergence (regex on text around the offset).
++
++    Checks the old/new window first, then falls back to structural signals (tool calls,
++    system role, the aligner's note) so config-only mutations still get a useful hint."""
++    window = f"{old or ''}\n{new or ''}"
++    for hint, pat in KEEPER_HINT_PATTERNS:
++        if re.search(pat, window):
++            return hint
++    for m in (s, n):
++        if isinstance(m, dict) and m.get("tool_calls"):
++            return "tool-call-json"
++    if isinstance(s, dict) and isinstance(n, dict):
++        if (s.get("tool_calls") or []) != (n.get("tool_calls") or []):
++            return "tool-call-json"
++        if s.get("role") == "system" or n.get("role") == "system":
++            return "system-prompt"
++    if re.search(r"(?i)system|tool_call|tools|options", note or ""):
++        if re.search(r"(?i)tool", note or ""):
++            return "tool-call-json"
++        if re.search(r"(?i)system", note or ""):
++            return "system-prompt"
++    return "content-changed"
++
++
++def _keeper_mutation_detail(old_msg, new_msg, note: str = "") -> dict:
++    """JSONL-only detail for mutation-unrepaired: offset, hint and <=300-char excerpts.
++
++    The offset is None when there is no message pair or no textual difference (e.g. a
++    tool_call_id-only change: identical text, changed metadata); the hint still carries
++    the structural signal in that case."""
++    old_text = _keeper_msg_text(old_msg) if old_msg is not None else None
++    new_text = _keeper_msg_text(new_msg) if new_msg is not None else None
++    if old_text is None and new_text is None:
++        return {"offset": None, "hint": _keeper_classify("", "", old_msg, new_msg, note),
++                "old_excerpt": "", "new_excerpt": ""}
++    old_text = old_text if old_text is not None else ""
++    new_text = new_text if new_text is not None else ""
++    offset = None if old_text == new_text else _keeper_first_diff(old_text, new_text)
++    window = 600
++    lo = max(0, (offset or 0) - window // 2)
++    hint = _keeper_classify(old_text[lo:lo + window], new_text[lo:lo + window],
++                            old_msg, new_msg, note)
++    return {"offset": offset, "hint": hint,
++            "old_excerpt": _keeper_excerpt(old_text, offset or 0),
++            "new_excerpt": _keeper_excerpt(new_text, offset or 0)}
++
++
++def _keeper_divergence_pair(stored: list, received: list, plan: dict):
++    """(stored, received) message pair for a mutation plan's divergence point.
++
++    The received side is plan["at"]; the stored side is plan["sat"], the aligner's stored
++    cursor at the first divergence (past any restored messages), not the received index.
++    System rewrites compare the system pair; config-only mutations (tools/options, budget)
++    have no message pair -> (None, None)."""
++    note = plan.get("note") or ""
++    at = plan.get("at", 0) or 0
++    if note.startswith("system rewritten") and stored and received:
++        if stored[0].get("role") == "system" and received[0].get("role") == "system":
++            return stored[0], received[0]
++    if not isinstance(at, int) or at < 0 or at >= len(received):
++        return None, None
++    sat = plan.get("sat", at)
++    old_msg = stored[sat] if isinstance(sat, int) and 0 <= sat < len(stored) else None
++    return old_msg, received[at]
+ 
+ 
+ def _keeper_nometa(m: dict) -> dict:
+@@ -938,11 +1072,12 @@ def _keeper_related(S: list, N: list) -> bool:
+ 
+ 
+ def _keeper_align(S: list, N: list) -> tuple:
+-    """Align stored history S with new history N (system already handled). -> (status, ops, j, note, at) where
+-    ops is match/shorten/restore/append with stored/new indices, j the consumed new count, `at` the N index to
+-    log. "ok" means N is stored minus removals/shortenings plus appends; "mutation" means a change, reorder
+-    (including a stored message re-sent in the appended tail), ambiguity or identity-linked divergence after j
+-    aligned pairs; "unrelated" means zero alignment and zero identity evidence (a fresh conversation)."""
++    """Align stored history S with new history N (system already handled). -> (status, ops, j, note, at, si)
++    where ops is match/shorten/restore/append with stored/new indices, j the consumed new count, `at` the N
++    index to log, and `si` the stored cursor at the first divergence (past any restored messages, for
++    diagnostics only). "ok" means N is stored minus removals/shortenings plus appends; "mutation" means a
++    change, reorder (including a stored message re-sent in the appended tail), ambiguity or identity-linked
++    divergence after j aligned pairs; "unrelated" means zero alignment and zero identity evidence."""
+     ops, i, j = [], 0, 0
+     while i < len(S) and j < len(N):
+         s, n = S[i], N[j]
+@@ -963,23 +1098,25 @@ def _keeper_align(S: list, N: list) -> tuple:
+         tail = [("append", a) for a in range(j, len(N))]   # divergence keeps the new tail (never dropped)
+         if len(ks) > 1:
+             # the same stored content twice: an ambiguous move, never a removal
+-            return ("mutation", ops + tail, j, "ambiguous alignment", j)
++            return ("mutation", ops + tail, j, "ambiguous alignment", j, i)
+         if any(_keeper_same(S[i], m) or _keeper_same_base(S[i], m) for m in N[j + 1:]):
+-            return ("mutation", ops + tail, j, "insertion/reorder", j)
++            return ("mutation", ops + tail, j, "insertion/reorder", j, i)
+         if j or _keeper_related(S, N):          # first-divergence with identity evidence is a change, not fresh
+-            return ("mutation", ops + tail, j, _keeper_describe(s, n), j)
+-        return ("unrelated", ops + tail, j, "", j)
++            return ("mutation", ops + tail, j, _keeper_describe(s, n), j, i)
++        return ("unrelated", ops + tail, j, "", j, i)
+     for r in range(i, len(S)):
+         ops.append(("restore", r))              # a truncated tail is restored too
+     for a in range(j, len(N)):
+         ops.append(("append", a))
+     if not sum(1 for o in ops if o[0] in ("match", "shorten")):
+-        return ("mutation" if _keeper_related(S, N) else "unrelated", ops, j, "", j)
++        return ("mutation" if _keeper_related(S, N) else "unrelated", ops, j, "", j, i)
+     used = {o[1] for o in ops if o[0] in ("match", "shorten", "restore")}
+     for o in ops:
+-        if o[0] == "append" and any(_keeper_same_base(S[k], N[o[1]]) for k in used):
+-            return ("mutation", ops, j, "moved/reordered message", o[1])   # a stored message re-sent later
+-    return ("ok", ops, j, "", j)
++        if o[0] == "append":
++            hit = next((k for k in used if _keeper_same_base(S[k], N[o[1]])), None)
++            if hit is not None:
++                return ("mutation", ops, j, "moved/reordered message", o[1], hit)
++    return ("ok", ops, j, "", j, i)
+ 
+ 
+ def _keeper_exact_repeat(e: dict, plan: dict, messages: list) -> bool:
+@@ -1016,20 +1153,21 @@ def _keeper_plan(S: list, N: list) -> dict:
+                 sys_rewrite = changed     # decided below: mutation when the history is related, else silent
+     off = 1 if s_sys is not None else 0
+     S_hist, N_hist = S[off:], N[off:]
+-    status, ops, j, note, at = _keeper_align(S_hist, N_hist)
++    status, ops, j, note, at, si = _keeper_align(S_hist, N_hist)
+     if sys_rewrite is not None:           # a big system rewrite is a non-append mutation, not a new world...
+         if status in ("ok", "mutation"):  # ...when the same history relates; unrelated sessions stay silent
+             return {"verdict": "mutation", "deltas": [], "ops": ops, "j": j,
+-                    "note": f"system rewritten ({sys_rewrite} changed lines)", "at": 0, "sys": True}
++                    "note": f"system rewritten ({sys_rewrite} changed lines)", "at": 0, "sat": 0, "sys": True}
+         return {"verdict": "nomatch"}
+     if status == "ok":                    # a plain first-message shortening alone proves nothing: it needs an
+         for o in ops:                     # unchanged anchor elsewhere or a shared tool id, else it may be fresh
+             if o[0] == "shorten" and _keeper_identity(S_hist[o[1]]) is None and \
+                     not any(p[0] == "match" for p in ops) and not _keeper_related(S_hist, N_hist):
+                 return {"verdict": "mutation", "deltas": [], "ops": ops, "j": j,
+-                        "note": "unanchored shortened message", "at": off + o[2], "sys": s_sys is not None}
++                        "note": "unanchored shortened message", "at": off + o[2], "sat": off + o[1],
++                        "sys": s_sys is not None}
+     return {"verdict": status, "deltas": deltas, "ops": ops, "j": j, "note": note, "at": off + at,
+-            "sys": s_sys is not None}
++            "sat": off + si, "sys": s_sys is not None}
+ 
+ class PrefixKeeper:
+     """Bounded in-memory LRU of forwarded chat requests with append-only repair (see the section comment). All
+@@ -1089,11 +1227,14 @@ class PrefixKeeper:
+                     what = "/".join(x for x, same in (("tools", e["tools"] == tools),
+                                                       ("options", e["kw"] == kw)) if not same)
+                     self._log(svc, "mutation-unrepaired", req_id, plan["at"],
+-                              before, before, f"{what} changed")
++                              before, before, f"{what} changed",
++                              _keeper_mutation_detail(None, None, f"{what} changed"))
+                     return messages, tools
+                 if plan["verdict"] == "mutation":
++                    old_msg, new_msg = _keeper_divergence_pair(e["messages"], messages, plan)
+                     self._log(svc, "mutation-unrepaired", req_id, plan["at"],
+-                              before, before, plan["note"])
++                              before, before, plan["note"],
++                              _keeper_mutation_detail(old_msg, new_msg, plan["note"]))
+                     return messages, tools
+                 hist = e["messages"][off:]
+                 if not plan["deltas"] and all(o[0] in ("match", "append") for o in plan["ops"]) and \
+@@ -1104,8 +1245,11 @@ class PrefixKeeper:
+                     return messages, tools
+                 if plan["deltas"] and not any(o[0] == "append" for o in plan["ops"]) and \
+                         not _keeper_exact_repeat(e, plan, messages):
+-                    self._log(svc, "mutation-unrepaired", req_id, 0, before, before,
+-                              "system delta unrepairable without touching the stored prefix")
++                    note = "system delta unrepairable without touching the stored prefix"
++                    old_msg = e["messages"][0] if e["messages"] else None
++                    new_msg = messages[0] if messages else None
++                    self._log(svc, "mutation-unrepaired", req_id, 0, before, before, note,
++                              _keeper_mutation_detail(old_msg, new_msg, note))
+                     return messages, tools
+                 repaired, first = self._build(e, plan, messages)
+                 if not repaired:
+@@ -1129,8 +1273,11 @@ class PrefixKeeper:
+                 _, e, plan = sys_only
+                 if plan["deltas"] and not any(o[0] == "append" for o in plan["ops"]) and \
+                         not _keeper_exact_repeat(e, plan, messages):
+-                    self._log(svc, "mutation-unrepaired", req_id, 0, before, before,
+-                              "system delta unrepairable without touching the stored prefix")
++                    note = "system delta unrepairable without touching the stored prefix"
++                    old_msg = e["messages"][0] if e["messages"] else None
++                    new_msg = messages[0] if messages else None
++                    self._log(svc, "mutation-unrepaired", req_id, 0, before, before, note,
++                              _keeper_mutation_detail(old_msg, new_msg, note))
+                     return messages, tools
+                 repaired, _ = self._build(e, plan, messages)
+                 if not repaired:
+@@ -1142,8 +1289,8 @@ class PrefixKeeper:
+                 return repaired, tools
+             return messages, tools
+         except Exception as e2:                  # the keeper never breaks a request
+-            print(f"strata serve: keeper error req={req_id} ({e2}); forwarding unchanged", file=sys.stderr,
+-                  flush=True)
++            print(f"strata serve: keeper error ts={_keeper_now_iso()} req={req_id} ({e2}); forwarding unchanged",
++                  file=sys.stderr, flush=True)
+             return messages, tools
+ 
+     @staticmethod
+@@ -1191,8 +1338,9 @@ class PrefixKeeper:
+         try:
+             n = len(svc.tok.encode(svc.template.render(repaired, tools=tools, **kw), parse_special=True))
+         except Exception as e:
+-            self._log(svc, "mutation-unrepaired", req_id, 0, before, after,
+-                      f"budget estimate failed ({str(e)[:120]})")
++            note = f"budget estimate failed ({str(e)[:120]})"
++            self._log(svc, "mutation-unrepaired", req_id, 0, before, after, note,
++                      _keeper_mutation_detail(None, None, note))
+             return False
+         if n > svc.engine.max_context - KEEPER_RESERVE:
+             self._log(svc, "skip-budget", req_id, 0, before, after,
+@@ -1228,12 +1376,18 @@ class PrefixKeeper:
+         except Exception:
+             return None
+ 
+-    def _log(self, svc, kind: str, req_id: str, index: int, before: int, after: int, diff: str) -> None:
++    def _log(self, svc, kind: str, req_id: str, index: int, before: int, after: int, diff: str,
++             detail: dict | None = None) -> None:
+         """One stderr line plus one JSONL row per event (index: system-delta 0, history-restore first restored
+-        forwarded index, mutation-unrepaired divergence index in the received request, skip-budget 0). The diff
+-        is bounded; CR/LF are escaped so one event is always one stderr line."""
++        forwarded index, mutation-unrepaired divergence index in the received request, skip-budget 0). Both
++        sinks carry an ISO-8601 UTC timestamp; mutation-unrepaired JSONL rows additionally carry the first
++        differing character offset (None when only metadata changed), a classification hint and <=300-char
++        old/new excerpts (JSONL only, never the console). The diff is bounded; CR/LF are escaped so one event
++        is always one stderr line. The JSONL rotates before a write that would pass 20 MB (active plus one
++        `.1` backup stay bounded)."""
+         diff = (diff or "")[:KEEPER_DIFF_CHARS]
+-        line = (f"strata serve: keeper {kind} msg={index} req={req_id} bytes={before}->{after} {diff}"
++        ts = _keeper_now_iso()
++        line = (f"strata serve: keeper {kind} ts={ts} msg={index} req={req_id} bytes={before}->{after} {diff}"
+                 .replace("\r", "\\r").replace("\n", "\\n"))
+         with self.log_lock:
+             print(line, file=sys.stderr, flush=True)
+@@ -1241,11 +1395,40 @@ class PrefixKeeper:
+             if path is None:
+                 return
+             try:
+-                with open(path, "a", encoding="utf-8") as f:
+-                    f.write(json.dumps({"req": req_id, "kind": kind, "index": index, "before_bytes": before,
+-                                        "after_bytes": after, "diff": diff}, ensure_ascii=False) + "\n")
++                row = {"ts": ts, "req": req_id, "kind": kind, "index": index,
++                       "before_bytes": before, "after_bytes": after, "diff": diff}
++                if kind == "mutation-unrepaired":
++                    d = detail if isinstance(detail, dict) else \
++                        _keeper_mutation_detail(None, None, diff)
++                    row["offset"] = d.get("offset")
++                    row["hint"] = d.get("hint")
++                    row["old_excerpt"] = (d.get("old_excerpt") or "")[:KEEPER_EXCERPT_CHARS]
++                    row["new_excerpt"] = (d.get("new_excerpt") or "")[:KEEPER_EXCERPT_CHARS]
++                encoded = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
++                self._maybe_rotate(path, len(encoded))
++                with open(path, "ab") as f:
++                    f.write(encoded)
+             except OSError as e:
+-                print(f"strata serve: keeper log unavailable ({e})", file=sys.stderr, flush=True)
++                print(f"strata serve: keeper ts={_keeper_now_iso()} log unavailable ({e})",
++                      file=sys.stderr, flush=True)
++
++    @staticmethod
++    def _maybe_rotate(path, pending_len: int) -> None:
++        """Rotate BEFORE the write whose bytes would push the JSONL past 20 MB: the active file moves to
++        `<path>.1` (a stale backup is replaced), then the write lands in a fresh active file. Byte
++        accounting, so multibyte rows count fully; active plus one backup stay bounded."""
++        try:
++            if not os.path.exists(path):
++                return
++            if os.path.getsize(path) + pending_len <= KEEPER_JSONL_MAX_BYTES:
++                return
++            backup = f"{path}.1"
++            if os.path.exists(backup):
++                os.remove(backup)
++            os.replace(path, backup)
++        except OSError as e:
++            print(f"strata serve: keeper ts={_keeper_now_iso()} log rotate unavailable ({e})",
++                  file=sys.stderr, flush=True)
+ 
+ 
+ class Service:
+@@ -2749,8 +2932,8 @@ def main() -> int:
+               file=sys.stderr)
+         return 2
+     if a.prefix_keeper:
+-        print(f"[strata] prefix keeper on: last {a.prefix_keeper_capacity} forwarded requests, append-only repairs",
+-              flush=True)
++        print(f"[strata] prefix keeper on ts={_keeper_now_iso()}: last {a.prefix_keeper_capacity} "
++              "forwarded requests, append-only repairs", flush=True)
+     svc.api_key = a.api_key or cfg.get("api_key", "")
+     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
+diff --git a/serve/test_server.py b/serve/test_server.py
+index aa489a6..35eccac 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -6,9 +6,11 @@ from __future__ import annotations
+ 
+ import contextlib
+ import copy
++import datetime
+ import io
+ import json
+ import os
++import re
+ import sys
+ import tempfile
+ import threading
+@@ -2578,7 +2580,8 @@ class PrefixKeeper(unittest.TestCase):
+         rows = self.jsonl(log)
+         self.assertEqual(len(rows), 2)
+         for row in rows:
+-            self.assertEqual(set(row), {"req", "kind", "index", "before_bytes", "after_bytes", "diff"}, row)
++            self.assertEqual(set(row), {"ts", "req", "kind", "index", "before_bytes",
++                                        "after_bytes", "diff"}, row)
+             self.assertLessEqual(len(row["diff"]), 600)                    # the diff is bounded ...
+         blob = err + Path(log).read_text(encoding="utf-8")
+         self.assertNotIn("u" * 100, blob)                                  # ... and carries no full prompt
+@@ -2612,7 +2615,8 @@ class PrefixKeeper(unittest.TestCase):
+         rows = self.jsonl(log)
+         self.assertEqual(len([r for r in rows if r["kind"] == "system-delta"]), 20)  # every repair logged ...
+         for row in rows:                                                              # ... as a parseable row
+-            self.assertEqual(set(row), {"req", "kind", "index", "before_bytes", "after_bytes", "diff"})
++            self.assertEqual(set(row), {"ts", "req", "kind", "index", "before_bytes",
++                                        "after_bytes", "diff"})
+         self.assertNotIn("keeper error", err)
+ 
+         def remember_work(n):
+@@ -2626,7 +2630,8 @@ class PrefixKeeper(unittest.TestCase):
+         self.assertEqual(errors, [])
+         self.assertLessEqual(len(svc.keeper.entries), 8)      # distinct remembers stay bounded
+         for row in self.jsonl(log):
+-            self.assertEqual(set(row), {"req", "kind", "index", "before_bytes", "after_bytes", "diff"})
++            self.assertEqual(set(row), {"ts", "req", "kind", "index", "before_bytes",
++                                        "after_bytes", "diff"})
+ 
+     def test_estimate_failure_forwards_original_unchanged(self):
+         svc, _ = self.bare()
+@@ -2656,6 +2661,273 @@ class PrefixKeeper(unittest.TestCase):
+         svc.keeper_remember(messages, None, {})
+         self.assertEqual(len(svc.keeper.entries), before)   # ... and never remembered
+ 
++    # -- item 4 diagnostics: timestamps, mutation detail, rotation ------------------
++    @staticmethod
++    def _ts_of_console(line):
++        m = re.search(r"\bts=(\S+)", line)
++        self_msg = "keeper console line carries ts="
++        assert m, self_msg + ": " + line
++        return m.group(1)
++
++    def test_keeper_lines_and_rows_carry_iso_timestamp(self):
++        svc, log = self.bare()
++        seed = [{"role": "system", "content": self.system()},
++                {"role": "user", "content": "U1-ts"}]
++        svc.keeper_remember(seed, None, {})
++        new = [{"role": "system", "content": self.system(volatile="77 untracked")},
++               {"role": "user", "content": "U1-ts"}, {"role": "user", "content": "U2-ts"}]
++        _, err = self.capture(lambda: svc.keeper_repair(new, None, {}))
++        lines = err.splitlines()
++        self.assertEqual(len(lines), 1)
++        console_ts = self._ts_of_console(lines[0])
++        datetime.datetime.fromisoformat(console_ts)          # parses as ISO-8601 ...
++        self.assertIn("keeper system-delta", lines[0])       # ... without changing the kind marker
++        rows = self.jsonl(log)
++        self.assertEqual(len(rows), 1)
++        datetime.datetime.fromisoformat(rows[0]["ts"])
++        # a mutation row carries one too
++        svc2, log2 = self.bare()
++        svc2.keeper_remember([{"role": "user", "content": "U1-ts"},
++                              {"role": "assistant", "content": "A-ts"},
++                              {"role": "user", "content": "U2-ts"}], None, {})
++        mutated = [{"role": "user", "content": "U1-ts"},
++                   {"role": "assistant", "content": "A-CHANGED-ts"},
++                   {"role": "user", "content": "U2-ts"},
++                   {"role": "user", "content": "U3-ts"}]
++        _, err2 = self.capture(lambda: svc2.keeper_repair(mutated, None, {}))
++        self.assertIn("keeper mutation-unrepaired", err2)
++        datetime.datetime.fromisoformat(self._ts_of_console(err2.splitlines()[0]))
++        rows2 = [r for r in self.jsonl(log2) if r["kind"] == "mutation-unrepaired"]
++        self.assertTrue(rows2)
++        datetime.datetime.fromisoformat(rows2[0]["ts"])
++
++    def test_mutation_detail_jsonl_only_with_offset_and_excerpts(self):
++        from serve.server import _keeper_first_diff, _keeper_mutation_detail
++        self.assertEqual(_keeper_first_diff("abcdef", "abcXef"), 3)
++        self.assertEqual(_keeper_first_diff("abc", "abcdef"), 3)
++        self.assertEqual(_keeper_first_diff("same", "same"), 4)
++        svc, log = self.bare()
++        old_text = "result-alpha-" * 30
++        seed = [{"role": "user", "content": "Q-shot"}, self.oai_call(cid="call_S"),
++                self.oai_result(old_text, cid="call_S"),
++                {"role": "assistant", "content": "done"}]
++        svc.keeper_remember(seed, self.OAI_TOOLS, {})
++        probe = [{"role": "user", "content": "Q-shot"}, self.oai_call(cid="call_S"),
++                 self.oai_result("[screenshot removed to save context]", cid="call_OTHER"),
++                 {"role": "assistant", "content": "done"},
++                 {"role": "user", "content": "U-fresh"}]
++        _, err = self.capture(lambda: svc.keeper_repair(probe, self.OAI_TOOLS, {}))
++        self.assertIn("keeper mutation-unrepaired", err)
++        rows = [r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"]
++        self.assertTrue(rows, self.jsonl(log))
++        row = rows[-1]
++        for key in ("offset", "hint", "old_excerpt", "new_excerpt"):
++            self.assertIn(key, row, row)
++        self.assertIsInstance(row["offset"], int)
++        self.assertGreaterEqual(row["offset"], 0)
++        self.assertLessEqual(len(row["old_excerpt"]), 300)
++        self.assertLessEqual(len(row["new_excerpt"]), 300)
++        self.assertIn(row["hint"], {"memory-context/Honcho/Holographic",
++                                    "async-delegation/internal-notification/watch",
++                                    "screenshot-removed/image", "tool-call-json",
++                                    "system-prompt", "content-changed"})
++        # excerpts live in the JSONL only: the console line carries none of their text
++        for excerpt in (row["old_excerpt"], row["new_excerpt"]):
++            if len(excerpt) >= 20:
++                self.assertNotIn(excerpt, err)
++        # the stored/new pair really differs at the recorded offset
++        d = _keeper_mutation_detail({"role": "tool", "tool_call_id": "x", "content": old_text},
++                                    {"role": "tool", "tool_call_id": "y",
++                                     "content": "[screenshot removed to save context]"}, "")
++        self.assertEqual(d["hint"], "screenshot-removed/image")
++        self.assertLessEqual(len(d["old_excerpt"]), 300)
++
++    def test_mutation_hint_classification(self):
++        from serve.server import _keeper_classify
++        self.assertEqual(_keeper_classify("a Honcho memory snapshot", "b", None, None, ""),
++                         "memory-context/Honcho/Holographic")
++        self.assertEqual(_keeper_classify("a", "ASYNC DELEGATION due to watch", None, None, ""),
++                         "async-delegation/internal-notification/watch")
++        self.assertEqual(_keeper_classify("old image bytes", "new image bytes", None, None, ""),
++                         "screenshot-removed/image")
++        self.assertEqual(_keeper_classify("working", "working",
++                                          {"role": "assistant", "content": "working",
++                                           "tool_calls": [{"id": "1"}]},
++                                          {"role": "assistant", "content": "working",
++                                           "tool_calls": [{"id": "2"}]}, "content changed"),
++                         "tool-call-json")
++        self.assertEqual(_keeper_classify("line one", "line two",
++                                          {"role": "system", "content": "line one"},
++                                          {"role": "system", "content": "line two"},
++                                          "system rewritten (9 changed lines)"),
++                         "system-prompt")
++        # end to end: a changed tool-call JSON argument hints tool-call-json ...
++        svc, log = self.bare()
++        seed = [{"role": "user", "content": "Q-phi"}, self.oai_call(args={"q": "QQ1"}),
++                self.oai_result("R-ok"), {"role": "assistant", "content": "done"}]
++        svc.keeper_remember(seed, self.OAI_TOOLS, {})
++        probe = [{"role": "user", "content": "Q-phi"}, self.oai_call(args={"q": "QQ2"}),
++                 self.oai_result("R-ok"), {"role": "assistant", "content": "done"},
++                 {"role": "user", "content": "U-fresh"}]
++        _, err = self.capture(lambda: svc.keeper_repair(probe, self.OAI_TOOLS, {}))
++        self.assertIn("keeper mutation-unrepaired", err)
++        rows = [r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"]
++        self.assertTrue(rows)
++        self.assertEqual(rows[-1]["hint"], "tool-call-json")
++        # ... and a big system rewrite hints system-prompt
++        svc3, log3 = self.bare()
++        old, new = self.system(), self.system()
++        lines = new.splitlines()
++        for i in range(9):
++            lines[i] = f"CHANGED-{i} brand new content"
++        new = "\n".join(lines)
++        svc3.keeper_remember([{"role": "system", "content": old},
++                              {"role": "user", "content": "U1-k"},
++                              {"role": "assistant", "content": "A1-k"}], None, {})
++        mutated_sys = [{"role": "system", "content": new},
++                       {"role": "user", "content": "U1-k"},
++                       {"role": "assistant", "content": "A1-k"},
++                       {"role": "user", "content": "U2-k"}]
++        _, err3 = self.capture(lambda: svc3.keeper_repair(mutated_sys, None, {}))
++        self.assertIn("keeper mutation-unrepaired", err3)
++        rows3 = [r for r in self.jsonl(log3) if r["kind"] == "mutation-unrepaired"]
++        self.assertTrue(rows3)
++        self.assertEqual(rows3[-1]["hint"], "system-prompt")
++
++    def test_mutation_excerpts_bounded_around_offset(self):
++        from serve.server import _keeper_excerpt, _keeper_mutation_detail
++        old = "A" * 500 + "OLD-MARKER-" + "B" * 500
++        new = "A" * 500 + "NEW-MARKER-" + "B" * 500
++        d = _keeper_mutation_detail({"role": "user", "content": old},
++                                    {"role": "user", "content": new}, "content changed")
++        self.assertEqual(d["offset"], 500)
++        self.assertLessEqual(len(d["old_excerpt"]), 300)
++        self.assertLessEqual(len(d["new_excerpt"]), 300)
++        self.assertIn("OLD-MARKER-", d["old_excerpt"])
++        self.assertIn("NEW-MARKER-", d["new_excerpt"])
++        self.assertLessEqual(len(_keeper_excerpt("x" * 100, 50)), 300)
++
++    def test_mutation_after_restore_uses_aligned_stored_message(self):
++        # stored [U, A-removed, B, C-old, D], incoming [U, B, C-new, D, fresh]: the aligner restores
++        # A-removed, then diverges at stored C-old vs received C-new. The diagnostic pair must be
++        # C-old/C-new (aligned stored cursor), not stored[received-index] (B after the restore).
++        for with_system in (False, True):
++            with self.subTest(with_system=with_system):
++                svc, log = self.bare()
++                c_old = "r\u00e9sultat-\u03b1\u03b2\u03b3-OLD-UNIQUE-7f3a"
++                c_new = "r\u00e9sultat-\u03b1\u03b2\u03b3-NEW-UNIQUE-7f3a"
++                hist = [{"role": "user", "content": "U-anchor-1"},
++                        {"role": "assistant", "content": "A-removed-2"},
++                        {"role": "user", "content": "B-anchor-3"},
++                        {"role": "assistant", "content": c_old},
++                        {"role": "user", "content": "D-anchor-5"}]
++                seed = ([{"role": "system", "content": self.system()}] if with_system else []) + hist
++                svc.keeper_remember(seed, None, {})
++                new_hist = [{"role": "user", "content": "U-anchor-1"},
++                            {"role": "user", "content": "B-anchor-3"},
++                            {"role": "assistant", "content": c_new},
++                            {"role": "user", "content": "D-anchor-5"},
++                            {"role": "user", "content": "U-fresh-6"}]
++                incoming = ([{"role": "system", "content": self.system()}] \
++                    if with_system else []) + new_hist
++                _, err = self.capture(lambda: svc.keeper_repair(incoming, None, {}))
++                self.assertIn("keeper mutation-unrepaired", err)
++                rows = [r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"]
++                self.assertTrue(rows, self.jsonl(log))
++                row = rows[-1]
++                self.assertIn(c_old, row["old_excerpt"])
++                self.assertIn(c_new, row["new_excerpt"])
++                self.assertNotIn("B-anchor-3", row["old_excerpt"])
++                # shared "r\u00e9sultat-\u03b1\u03b2\u03b3-" prefix is 13 Unicode characters, then OLD vs NEW
++                self.assertEqual(row["offset"], 13)
++                self.assertEqual(c_old[:13], c_new[:13])
++                self.assertNotEqual(c_old[13], c_new[13])
++                # the received index still points at the new message (system shifts it by one)
++                self.assertEqual(row["index"], (1 if with_system else 0) + 2)
++
++    def test_mutation_offset_null_when_only_metadata_changed(self):
++        from serve.server import _keeper_mutation_detail
++        d = _keeper_mutation_detail(
++            {"role": "tool", "tool_call_id": "call_A", "content": "same-text"},
++            {"role": "tool", "tool_call_id": "call_B", "content": "same-text"},
++            "tool_call_id changed 'call_A'!='call_B'")
++        self.assertIsNone(d["offset"])          # identical text: no differing character ...
++        self.assertEqual(d["hint"], "tool-call-json")   # ... but the structural hint is kept
++        svc, log = self.bare()
++        seed = [{"role": "user", "content": "Q-id"},
++                self.oai_call(cid="call_A"), self.oai_result("R-ok", cid="call_A"),
++                {"role": "assistant", "content": "done"}]
++        svc.keeper_remember(seed, self.OAI_TOOLS, {})
++        probe = [{"role": "user", "content": "Q-id"},
++                 self.oai_call(cid="call_A"), self.oai_result("R-ok", cid="call_OTHER"),
++                 {"role": "assistant", "content": "done"},
++                 {"role": "user", "content": "U-fresh"}]
++        _, err = self.capture(lambda: svc.keeper_repair(probe, self.OAI_TOOLS, {}))
++        self.assertIn("keeper mutation-unrepaired", err)
++        rows = [r for r in self.jsonl(log) if r["kind"] == "mutation-unrepaired"]
++        self.assertTrue(rows)
++        self.assertIsNone(rows[-1]["offset"])
++        self.assertIn(rows[-1]["hint"], ("tool-call-json", "screenshot-removed/image",
++                                         "content-changed", "system-prompt",
++                                         "memory-context/Honcho/Holographic",
++                                         "async-delegation/internal-notification/watch"))
++
++    def test_jsonl_rotates_before_write_and_stays_bounded(self):
++        import serve.server as srv
++        svc, log = self.bare()
++        old_limit = srv.KEEPER_JSONL_MAX_BYTES
++        srv.KEEPER_JSONL_MAX_BYTES = 700      # small rows (~250 B): several rotations over 10 rows
++        try:
++            seed = [{"role": "system", "content": self.system()},
++                    {"role": "user", "content": "U1-rot"}]
++            svc.keeper_remember(seed, None, {})
++
++            def rotate_work():
++                for i in range(10):
++                    svc.keeper_repair(
++                        [{"role": "system", "content": self.system(volatile=f"77 untracked r{i}")},
++                         {"role": "user", "content": "U1-rot"},
++                         {"role": "user", "content": f"U-rot-{i}"}], None, {})
++
++            self.capture(rotate_work)
++            backup = log + ".1"
++            self.assertTrue(os.path.exists(backup), os.listdir(os.path.dirname(log)))
++            # rotate-BEFORE-write: neither file ever passes the bound ...
++            self.assertLessEqual(os.path.getsize(log), 700)
++            self.assertLessEqual(os.path.getsize(backup), 700)
++            with open(backup, encoding="utf-8") as f:
++                backup_rows = [json.loads(line) for line in f if line.strip()]
++            rows = self.jsonl(log)
++            self.assertTrue(rows)                                # ... the active file keeps new rows ...
++            self.assertLess(len(rows) + len(backup_rows), 10)    # ... while repeated rotation bounds both
++            for row in rows + backup_rows:
++                datetime.datetime.fromisoformat(row["ts"])
++        finally:
++            srv.KEEPER_JSONL_MAX_BYTES = old_limit
++
++    def test_jsonl_rotation_counts_utf8_bytes(self):
++        import serve.server as srv
++        svc, log = self.bare()
++        old_limit = srv.KEEPER_JSONL_MAX_BYTES
++        srv.KEEPER_JSONL_MAX_BYTES = 2000
++        try:
++            diff = "\u00e9" * 200                # 200 chars, 400 UTF-8 bytes
++            probe = {"ts": "0" * 32, "req": "r", "kind": "system-delta", "index": 0,
++                     "before_bytes": 1, "after_bytes": 2, "diff": diff}
++            char_len = len(json.dumps(probe, ensure_ascii=False) + "\n")
++            fill = 2000 - char_len - 100
++            Path(log).write_bytes(b"x" * fill)
++            # char accounting would fit (fill + chars < bound) but byte accounting must rotate
++            self.assertLess(fill + char_len, 2000)
++            _, err = self.capture(
++                lambda: svc.keeper._log(svc, "system-delta", "r", 0, 1, 2, diff))
++            self.assertTrue(os.path.exists(log + ".1"), err)    # rotated on UTF-8 bytes ...
++            rows = self.jsonl(log)
++            self.assertEqual(len(rows), 1)                       # ... and the row still landed
++            self.assertEqual(rows[0]["diff"], diff)
++        finally:
++            srv.KEEPER_JSONL_MAX_BYTES = old_limit
++
+ 
+ 
+ 
+-- 
+2.54.0.windows.1
+

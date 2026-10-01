@@ -1,0 +1,420 @@
+From 6ab5a50d36675b5a935fd57ff2d41e13e8a85ed7 Mon Sep 17 00:00:00 2001
+From: urawazakun <30615262+urawazakun@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 17:55:54 +0900
+Subject: [PATCH] Send path: HERMES_KEEP_TOOL_IMAGES=int|all (default 3); 'all'
+ keeps older screenshot tool results byte-stable so a local engine's cache
+ survives, images retire only at compression
+
+---
+ agent/anthropic_message_convert.py            |  14 +-
+ agent/context_compressor.py                   |  53 +++-
+ tests/agent/test_outbound_keep_tool_images.py | 263 ++++++++++++++++++
+ 3 files changed, 322 insertions(+), 8 deletions(-)
+ create mode 100644 tests/agent/test_outbound_keep_tool_images.py
+
+diff --git a/agent/anthropic_message_convert.py b/agent/anthropic_message_convert.py
+index 5309ba7f..2c37fe7a 100644
+--- a/agent/anthropic_message_convert.py
++++ b/agent/anthropic_message_convert.py
+@@ -591,9 +591,15 @@ def _manage_thinking_signatures(result: List[Dict[str, Any]], base_url: str | No
+         m.pop("_thinking_signature_invalidated", None)  # internal flag, never on the wire
+ 
+ 
+-def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
+-    """Keep only the 3 most recent computer-use screenshots (~1,465 tokens each); older images
+-    become a placeholder text block. Mutates ``result`` in place."""
++def _evict_old_screenshots(result: List[Dict[str, Any]], keep_newest: int | None = None) -> None:
++    """Keep only the newest computer-use screenshots (~1,465 tokens each); older images
++    become a placeholder text block. Mutates ``result`` in place. ``None`` resolves the
++    shared send-path keep window (default 3); "all" keeps every image."""
++    if keep_newest is None:
++        from agent.context_compressor import resolve_outbound_keep_tool_images
++        keep_newest = resolve_outbound_keep_tool_images()
++    if keep_newest is None:
++        return
+     image_count = 0
+     for msg in reversed(result):
+         content = msg.get("content")
+@@ -602,7 +608,7 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
+             if not isinstance(inner, list) or not _has_block_type(inner, {"image"}):
+                 continue
+             image_count += 1
+-            if image_count > 3:
++            if image_count > max(keep_newest, 0):
+                 placeholder = _text_block("[screenshot removed to save context]")
+                 block["content"] = [placeholder if b.get("type") == "image" else b for b in inner]
+ 
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 15d3543e..ad802d6f 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -7,6 +7,7 @@ import copy
+ import hashlib
+ import json
+ import logging
++import os
+ import sqlite3
+ import re
+ import time
+@@ -983,6 +984,40 @@ _PRESSURE_KEEP_RECENT_MESSAGES = 3
+ # pass 2, so they ride every later request until anti-thrash disables compression (#92699).
+ _MAX_KEEP_TOOL_IMAGES = 3
+ 
++# Send-path retirement knob: HERMES_KEEP_TOOL_IMAGES=int|all, default 3.
++# "all" keeps every image on the per-call API copy; images are then retired
++# only by compression.
++_KEEP_TOOL_IMAGES_ENV_VAR = "HERMES_KEEP_TOOL_IMAGES"
++
++
++def _parse_keep_tool_images(raw: Any) -> int | None:
++    """Parse the HERMES_KEEP_TOOL_IMAGES value: nonnegative int keeps N, "all" keeps all (None)."""
++    if raw is None:
++        return _MAX_KEEP_TOOL_IMAGES
++    text = str(raw).strip()
++    if not text:
++        return _MAX_KEEP_TOOL_IMAGES
++    if text.lower() == "all":
++        return None
++    try:
++        value = int(text, 10)
++    except (TypeError, ValueError):
++        return _MAX_KEEP_TOOL_IMAGES
++    if value < 0:
++        return _MAX_KEEP_TOOL_IMAGES
++    return value
++
++
++def resolve_outbound_keep_tool_images(raw: Any = None) -> int | None:
++    """Send-path keep window: explicit ``raw`` wins, else HERMES_KEEP_TOOL_IMAGES, else 3.
++
++    Returns None for "keep all" (no send-path retirement). Compression never
++    calls this — it always passes ``_MAX_KEEP_TOOL_IMAGES`` explicitly.
++    """
++    if raw is not None:
++        return _parse_keep_tool_images(raw)
++    return _parse_keep_tool_images(os.getenv(_KEEP_TOOL_IMAGES_ENV_VAR, ""))
++
+ # Below this window the threshold is floored (raise-only): at 50% the incompressible
+ # floor eats the reclaimed headroom and compaction re-fires every 1-2 turns.
+ _SMALL_CTX_WINDOW_LIMIT = 512_000
+@@ -1227,10 +1262,12 @@ def _rewritten(msg: Dict[str, Any], content: Any) -> Dict[str, Any]:
+     return new_msg
+ 
+ 
+-def _retire_stale_tool_result_images(result: List[Dict[str, Any]], keep_newest: int = _MAX_KEEP_TOOL_IMAGES) -> int:
++def _retire_stale_tool_result_images(result: List[Dict[str, Any]], keep_newest: int | None = _MAX_KEEP_TOOL_IMAGES) -> int:
+     """Replace image payloads on older tool results with text placeholders.
+     Keeps the newest ``keep_newest`` image-bearing tool messages; user uploads untouched. Mutates
+-    ``result`` in place; returns the number of messages rewritten."""
++    ``result`` in place; returns the number of messages rewritten. ``keep_newest=None`` keeps all."""
++    if keep_newest is None:
++        return 0
+     seen = pruned = 0
+     for i in range(len(result) - 1, -1, -1):
+         msg = result[i]
+@@ -1248,7 +1285,7 @@ def _retire_stale_tool_result_images(result: List[Dict[str, Any]], keep_newest:
+ 
+ def evict_stale_outbound_tool_images(
+     api_messages: List[Dict[str, Any]],
+-    keep_newest: int = _MAX_KEEP_TOOL_IMAGES,
++    keep_newest: int | None = None,
+ ) -> int:
+     """Drop stale screenshot/vision payloads from the per-call API copy.
+ 
+@@ -1259,7 +1296,14 @@ def evict_stale_outbound_tool_images(
+     strip (#89286). Call this on the cloned ``api_messages`` list after
+     sanitization so older frames never leave the box (#89296). Do not pass
+     persisted history — the rewrite is send-path only.
++
++    ``keep_newest=None`` (default) resolves ``HERMES_KEEP_TOOL_IMAGES``
++    (default 3); ``"all"`` keeps every image so request N+1 is a
++    byte-prefix-extension of request N. Compression still retires via the explicit
++    ``_MAX_KEEP_TOOL_IMAGES`` call in ``_prune_old_tool_results``.
+     """
++    if keep_newest is None:
++        keep_newest = resolve_outbound_keep_tool_images()
+     return _retire_stale_tool_result_images(api_messages, keep_newest=keep_newest)
+ 
+ 
+@@ -2761,7 +2805,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
+         # Pass 3.5: retire image payloads inside the protected tail; re-sent embeds otherwise make
+         # compression look ineffective and trip anti-thrash. Newest frames stay live.
+         # Newest frames stay live for follow-up QA; older ones become placeholders. See #92699.
+-        pruned += _retire_stale_tool_result_images(result)
++        # Sanctioned history rewrite: always the fixed window, never HERMES_KEEP_TOOL_IMAGES.
++        pruned += _retire_stale_tool_result_images(result, keep_newest=_MAX_KEEP_TOOL_IMAGES)
+         if protect_tail_tokens is not None and protect_tail_tokens > 0 and result:
+             pruned += self._pressure_demote_tail(
+                 result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars,
+diff --git a/tests/agent/test_outbound_keep_tool_images.py b/tests/agent/test_outbound_keep_tool_images.py
+new file mode 100644
+index 00000000..6a2a30d7
+--- /dev/null
++++ b/tests/agent/test_outbound_keep_tool_images.py
+@@ -0,0 +1,263 @@
++"""HERMES_KEEP_TOOL_IMAGES=all keeps the send-path prefix stable.
++
++With ``all`` the per-call eviction never rewrites older image tool results, so
++request N+1's API message list extends request N's rows. Compression still
++retires to the fixed window. Default (env unset) keeps the newest 3.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++import logging
++import types
++
++from agent.agent_runtime_helpers import (
++    drop_thinking_only_and_merge_users,
++    sanitize_api_messages,
++)
++from agent.auxiliary_wire import prepare_chat_messages
++from agent.context_compressor import (
++    _MAX_KEEP_TOOL_IMAGES,
++    _tool_content_has_images,
++    evict_stale_outbound_tool_images,
++    resolve_outbound_keep_tool_images,
++)
++from agent.turn_request_assembly import assemble_api_request
++
++
++def _image_tool(i: int, *, blob: str = "A" * 80) -> list[dict]:
++    return [
++        {
++            "role": "assistant",
++            "content": None,
++            "tool_calls": [
++                {
++                    "id": f"call_{i}",
++                    "type": "function",
++                    "function": {
++                        "name": "vision_analyze",
++                        "arguments": f'{{"image_url":"shot{i}.png"}}',
++                    },
++                }
++            ],
++        },
++        {
++            "role": "tool",
++            "tool_call_id": f"call_{i}",
++            "content": [
++                {"type": "text", "text": f"Image attached natively shot {i}"},
++                {
++                    "type": "image_url",
++                    "image_url": {"url": f"data:image/png;base64,{blob}{i}"},
++                },
++            ],
++        },
++    ]
++
++
++def _history_with_screenshots(n: int) -> list[dict]:
++    msgs: list[dict] = [{"role": "user", "content": "look at these"}]
++    for i in range(n):
++        msgs.extend(_image_tool(i))
++    return msgs
++
++
++def _make_assemble_agent() -> types.SimpleNamespace:
++    """Fake agent covering what assemble_api_request touches (caching off)."""
++    return types.SimpleNamespace(
++        prefill_messages=[],
++        tools=[],
++        _use_prompt_caching=False,
++        provider="openrouter",
++        model="test/model",
++        base_url="https://openrouter.ai/api/v1",
++        api_mode="chat_completions",
++        ephemeral_system_prompt="",
++        _usage_anchor=None,
++        context_compressor=types.SimpleNamespace(
++            last_real_prompt_tokens=0,
++            awaiting_real_usage_after_compression=False,
++        ),
++        _sanitize_api_messages=sanitize_api_messages,
++        _drop_thinking_only_and_merge_users=drop_thinking_only_and_merge_users,
++        _copy_reasoning_content_for_api=lambda _src, _dst: None,
++        _should_sanitize_tool_calls=lambda: False,
++        _emit_warning=lambda *a, **k: None,
++    )
++
++
++def _assembled(history: list[dict]) -> list[dict]:
++    """Real request assembly for one API call (history must stay untouched)."""
++    agent = _make_assemble_agent()
++    return assemble_api_request(
++        agent,
++        messages=history,
++        current_turn_user_idx=0,
++        _ext_prefetch_cache="",
++        _plugin_user_context="",
++        moa_config=None,
++        active_system_prompt="SYSTEM",
++        original_user_message="look at these",
++        pending_moa_prepared_request=None,
++        request_logger=logging.getLogger("test"),
++    ).api_messages
++
++
++def _prepared(api_messages: list[dict]):
++    """Real transport hygiene after assembly (never retires images)."""
++    from openai import OpenAI
++
++    client = OpenAI(api_key="sk-test")
++    return prepare_chat_messages(client, {"model": "test/model", "messages": api_messages})["messages"]
++
++
++def _image_bearing_tool_ids(messages: list[dict]) -> list[str]:
++    return [
++        m["tool_call_id"]
++        for m in messages
++        if m.get("role") == "tool" and _tool_content_has_images(m.get("content"))
++    ]
++
++
++def _wire_bytes(messages: list[dict]) -> bytes:
++    return json.dumps(
++        messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
++    ).encode("utf-8")
++
++
++class TestKeepToolImagesKnob:
++    def test_default_keeps_newest_window(self, monkeypatch):
++        monkeypatch.delenv("HERMES_KEEP_TOOL_IMAGES", raising=False)
++        assert resolve_outbound_keep_tool_images() == _MAX_KEEP_TOOL_IMAGES
++        outbound = _assembled(_history_with_screenshots(5))
++        assert _image_bearing_tool_ids(outbound) == [
++            f"call_{i}" for i in range(5 - _MAX_KEEP_TOOL_IMAGES, 5)
++        ]
++
++    def test_all_keeps_every_image(self, monkeypatch):
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "all")
++        assert resolve_outbound_keep_tool_images() is None
++        outbound = _assembled(_history_with_screenshots(5))
++        assert _image_bearing_tool_ids(outbound) == [f"call_{i}" for i in range(5)]
++
++    def test_int_and_invalid_values(self, monkeypatch):
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "1")
++        assert resolve_outbound_keep_tool_images() == 1
++        assert _image_bearing_tool_ids(_assembled(_history_with_screenshots(5))) == ["call_4"]
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "0")
++        assert _image_bearing_tool_ids(_assembled(_history_with_screenshots(5))) == []
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "bogus")
++        assert resolve_outbound_keep_tool_images() == _MAX_KEEP_TOOL_IMAGES
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "-2")
++        assert resolve_outbound_keep_tool_images() == _MAX_KEEP_TOOL_IMAGES
++
++
++class TestPrefixStability:
++    def test_all_is_message_prefix_extension_across_six_images(self, monkeypatch):
++        """Request N+1 extends request N: first len(N) rows byte-identical."""
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "all")
++        prior: list[dict] | None = None
++        for n in range(1, 7):
++            history = _history_with_screenshots(n)
++            snapshot = copy.deepcopy(history)
++            outbound = _prepared(_assembled(history))
++            assert history == snapshot
++            assert _image_bearing_tool_ids(outbound) == [f"call_{i}" for i in range(n)]
++            if prior is not None:
++                assert outbound[: len(prior)] == prior
++                assert _wire_bytes(outbound).startswith(_wire_bytes(prior)[:-1])
++            prior = outbound
++
++    def test_default_rewrites_history_on_fourth_image(self, monkeypatch):
++        """Default still retires: the 4th screenshot rewrites an older row."""
++        monkeypatch.delenv("HERMES_KEEP_TOOL_IMAGES", raising=False)
++        before = _assembled(_history_with_screenshots(3))
++        after = _assembled(_history_with_screenshots(4))
++        assert _image_bearing_tool_ids(before) == ["call_0", "call_1", "call_2"]
++        assert _image_bearing_tool_ids(after) == ["call_1", "call_2", "call_3"]
++        assert after[: len(before)] != before
++
++    def test_compression_still_retires_with_all(self, monkeypatch):
++        """Compression is the sanctioned rewrite: fixed window even with all."""
++        from agent.context_compressor import ContextCompressor
++
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "all")
++        c = ContextCompressor.__new__(ContextCompressor)
++        c.quiet_mode = True
++        out, _ = c._prune_old_tool_results(_history_with_screenshots(5), protect_tail_count=20)
++        kept = [
++            m["tool_call_id"]
++            for m in out
++            if m.get("role") == "tool" and _tool_content_has_images(m.get("content"))
++        ]
++        assert kept == [f"call_{i}" for i in range(5 - _MAX_KEEP_TOOL_IMAGES, 5)]
++
++
++def _anthropic_history(n: int) -> list[dict]:
++    """Anthropic-shape rows: user tool_result blocks each carrying one image."""
++    return [
++        {
++            "role": "user",
++            "content": [
++                {
++                    "type": "tool_result",
++                    "tool_use_id": f"t{i}",
++                    "content": [
++                        {"type": "text", "text": f"shot {i}"},
++                        {"type": "image", "source": {"type": "base64", "data": "AAAA"}},
++                    ],
++                }
++            ],
++        }
++        for i in range(n)
++    ]
++
++
++def _remaining_anthropic_images(messages: list[dict]) -> int:
++    return sum(
++        1
++        for m in messages
++        if isinstance(m.get("content"), list)
++        for block in m["content"]
++        if isinstance(block, dict) and block.get("type") == "tool_result"
++        for part in (block.get("content") or [])
++        if isinstance(part, dict) and part.get("type") == "image"
++    )
++
++
++class TestAnthropicScreenshotEviction:
++    def test_default_keeps_newest_three(self, monkeypatch):
++        from agent.anthropic_message_convert import _evict_old_screenshots
++
++        monkeypatch.delenv("HERMES_KEEP_TOOL_IMAGES", raising=False)
++        rows = _anthropic_history(5)
++        _evict_old_screenshots(rows)
++        assert _remaining_anthropic_images(rows) == 3
++
++    def test_all_keeps_every_image(self, monkeypatch):
++        from agent.anthropic_message_convert import _evict_old_screenshots
++
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "all")
++        rows = _anthropic_history(5)
++        _evict_old_screenshots(rows)
++        assert _remaining_anthropic_images(rows) == 5
++
++    def test_explicit_count(self):
++        from agent.anthropic_message_convert import _evict_old_screenshots
++
++        rows = _anthropic_history(5)
++        _evict_old_screenshots(rows, keep_newest=1)
++        assert _remaining_anthropic_images(rows) == 1
++
++
++class TestSendPathHelpers:
++    def test_evict_leaves_history_untouched(self, monkeypatch):
++        from agent.conversation_loop import _clone_message_for_send
++
++        monkeypatch.setenv("HERMES_KEEP_TOOL_IMAGES", "all")
++        history = _history_with_screenshots(5)
++        snapshot = copy.deepcopy(history)
++        outbound = [_clone_message_for_send(m) for m in history]
++        assert evict_stale_outbound_tool_images(outbound) == 0
++        assert history == snapshot
+-- 
+2.54.0.windows.1
+

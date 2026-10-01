@@ -38,11 +38,13 @@ one line is the right trade-off. With 128 GB host RAM and an agent harness, seve
 | Strata + server | **readability refactor** (behaviour-preserving, from a ChatGPT review): cache-protocol client class (`serve/cache_protocol.py`), restore candidate selection as a typed list/result, two-phase disk restore (validate without GPU mutation, then mount), `saved_state` split into RAM store / disk codec / disk store, fix-history labels moved to `docs/CACHE-HISTORY.md`. GPU-accepted and in production | `0010`-`0014` |
 | Strata server | fix a `KeyError` when two requests overlap (upstream 0.1.30 #212 pops the status tail at a request's end while another request is still writing it); found by running an agent and a second client at the same time | `0015` |
 | Strata | **tail resume**: a 40 KiB MTP boundary row on every conversation checkpoint and at each request's end, so a conversation resumes at its end. Live agent runs re-read 5-18K tokens per request before (once 149K after a mid-history edit); GPU acceptance: follow-up turns read only their 26 new tokens, a mutated middle message resumes from the newest checkpoint below it, an identical repeated 11.7K request 0.09 s (was 0.5 s) | `0016`-`0017` |
+| Strata server | prefix keeper diagnostics: timestamps, and for an unrepaired history mutation the first differing offset, a cause hint and short excerpts (JSONL only) | `0018` |
 | Hermes | fixed prefix discipline: git workspace snapshot moved to the volatile tail (`HERMES_WORKSPACE_LATE=1`), title generated after the turn (`HERMES_TITLE_AFTER_TURN=1`) | `patches/hermes-agent/0001` |
 | Hermes | `delegate_task` **fork mode**: a child starts from the parent's exact prompt (+ its tool call + a tool result carrying the task), so the engine resumes it from the parent's saved state; blocked tools and depth limit are refused at call time instead of being removed from `tools[]` | `patches/hermes-agent/0002` |
 | Hermes | **work deadline** tools (`set_work_deadline` / `finish_work`): "work until 18:00" keeps the agent going until the deadline; run budget stays the ceiling | `patches/hermes-agent/0003` (experimental) |
 | Hermes | fix a delegation **deadlock** (a finished child blocked in a process-wide telemetry flush while the parent waited for it); **`ask_document`** tool = cache-augmented reading: the document is a byte-stable system prefix, so the engine keeps it as a root on disk and the 2nd question on the same document skips re-reading it (live: 165 s -> 43 s end to end, 26K-token document) | `patches/hermes-agent/0004` |
 | Hermes | fork mode refactor: a `ForkContext` dataclass replaces the private attributes a fork child carried (behaviour-preserving; recorded first-request parity test); from a ChatGPT readability review | `patches/hermes-agent/0005` |
+| Hermes | `HERMES_KEEP_TOOL_IMAGES=int\|all` (default 3): Hermes rewrites all but the newest 3 screenshot tool results to a placeholder on every request, which changes old history bytes and breaks a local engine's cache (live: 149K tokens re-read after the 6th vision call). `all` keeps them byte-stable until compression; set in the flashnext launcher | `patches/hermes-agent/0006` |
 
 Design: [docs/DESIGN.md](docs/DESIGN.md). How the fixes were found: [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 Acceptance ledger: [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Live Hermes runs and what they exposed: [docs/LIVE-HERMES.md](docs/LIVE-HERMES.md).
@@ -79,7 +81,7 @@ Later the same day the readability refactor (`0010`-`0014`) passed the same GPU 
 ## Layout
 
 ```
-patches/strata/         17 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
+patches/strata/         18 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
 patches/strata-0.1.21/  the earlier 17-patch series on 0.1.21 (history)
 patches/hermes-agent/   git format-patch against the Hermes Agent snapshot used by this project
 docs/                   design, fix history, acceptance ledger
