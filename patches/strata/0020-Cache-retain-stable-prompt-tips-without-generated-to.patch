@@ -1,0 +1,1827 @@
+From dddbae016b744a891ce0e773bd3eae78326f4585 Mon Sep 17 00:00:00 2001
+From: Muse <30615262+urawazakun@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 14:54:57 +0900
+Subject: [PATCH 20/21] Cache: retain stable prompt tips without generated
+ tokens
+
+Public form of b0f5867. Origin user two-lines brief; implemented Muse-1, reviewed Sol. Stable prompt-only tips survive alternating conversation lines; CPU regressions and retention diagnostics included.
+---
+ include/strata/program/restore.hpp     |  34 ++
+ include/strata/program/saved_state.hpp | 109 +++++
+ src/program/generate.cpp               | 428 +++++++++++++++++-
+ src/program/restore.cpp                |  25 ++
+ src/program/restore_test.cpp           | 108 +++++
+ src/program/saved_state.cpp            | 277 ++++++++++++
+ src/program/saved_state_test.cpp       | 578 +++++++++++++++++++++++++
+ 7 files changed, 1547 insertions(+), 12 deletions(-)
+
+diff --git a/include/strata/program/restore.hpp b/include/strata/program/restore.hpp
+index 02e8ecf..304b758 100644
+--- a/include/strata/program/restore.hpp
++++ b/include/strata/program/restore.hpp
+@@ -202,6 +202,18 @@ std::vector<ChainCand> collect_chain_candidates(
+ /// under memory pressure the way a heap-owning wrapper would.
+ using RamEligibilityFn = bool (*)(const saved_state::SavedItem&, std::string&, void*);
+ 
++/// Per-request counters for the RAM walk (TWO-LINES observability): how many
++/// store points were considered, how many passed eligibility, how many were
++/// rejected, and how many sat at/past the request end. The engine reports one
++/// `tip-cache restore` summary line per request from these; the detailed
++/// rejection reasons stay on the existing per-candidate stderr lines.
++struct RamWalkCounters {
++    size_t considered = 0;
++    size_t eligible = 0;
++    size_t ineligible = 0;
++    size_t skipped_end = 0;
++};
++
+ /// The accumulating-skip-set RAM walk (moved from generate.cpp): longest-first via
+ /// find_best_except without revisit (always terminates), at/past-end skip, eligibility gate.
+ /// No store mutation between calls: returned pointers stay valid. Logs verbatim.
+@@ -210,6 +222,13 @@ std::vector<const saved_state::SavedItem*> collect_ram_candidates(
+     const std::vector<saved_state::ImgKey>& imgs, bool cvec, int64_t n,
+     RamEligibilityFn eligible, void* ctx);
+ 
++/// Counted form of the walk above (same order, same gates, same logs, same
++/// checks): fills `cnt` when non-null. The uncounted form delegates to this one.
++std::vector<const saved_state::SavedItem*> collect_ram_candidates_counted(
++    const saved_state::SavedStateStore& store, const std::vector<int32_t>& ids,
++    const std::vector<saved_state::ImgKey>& imgs, bool cvec, int64_t n,
++    RamEligibilityFn eligible, void* ctx, RamWalkCounters* cnt);
++
+ /// Adapter for any callable (capturing lambdas in tests, the engine's inline check): forwards
+ /// to the non-owning core borrowing the callable by reference for the synchronous call only.
+ /// No copy, no heap ownership at any point (const callables supported); the reference stays
+@@ -225,6 +244,21 @@ std::vector<const saved_state::SavedItem*> collect_ram_candidates(
+     return collect_ram_candidates(store, ids, imgs, cvec, n, trampoline, &eligible);
+ }
+ 
++/// Counted adapter (same non-owning borrowing contract as above, plus the
++/// nullable out-counters): lets the engine report one per-request summary
++/// without changing the selection itself.
++template <typename F>
++std::vector<const saved_state::SavedItem*> collect_ram_candidates_counted(
++    const saved_state::SavedStateStore& store, const std::vector<int32_t>& ids,
++    const std::vector<saved_state::ImgKey>& imgs, bool cvec, int64_t n, F&& eligible,
++    RamWalkCounters* cnt) {
++    using Plain = typename std::remove_reference<F>::type;
++    auto trampoline = [](const saved_state::SavedItem& it, std::string& why, void* ctx) -> bool {
++        return (*static_cast<Plain*>(ctx))(it, why);
++    };
++    return collect_ram_candidates_counted(store, ids, imgs, cvec, n, trampoline, &eligible, cnt);
++}
++
+ /// The per-iteration longest-first selection state machine. Owns the attempt variables that
+ /// used to live in main()'s loop head: the chain/RAM cursors, chain_dead, the disk skip set,
+ /// and the sk_disk/sk_ram/sk_saved/take_chain decision. The execution half calls next() to
+diff --git a/include/strata/program/saved_state.hpp b/include/strata/program/saved_state.hpp
+index bbb3a6b..38327f2 100644
+--- a/include/strata/program/saved_state.hpp
++++ b/include/strata/program/saved_state.hpp
+@@ -486,6 +486,98 @@ inline bool TipEntry::complete() const {
+     return prompt_for_shared_ok(prompt, gen);
+ }
+ 
++/// Standalone stable-prompt fallback (TWO-LINES narrow gap): a fresh F2b prompt
++/// point carries boundary-only recurrent/indexer/boundary/MTP-metadata payloads
++/// and NO main-KV copy (it was captured to share a generation backing). When no
++/// generation tip is retained (zero emitted tokens, failed snapshot, incoherent
++/// pair), the prompt point is still retained as an ordinary single-point
++/// complete SavedItem by attaching its OWN exact [0,k) main-KV and [0,k-1) MTP
++/// copies. Below-k rows are immutable through append-only decode, so post-DONE
++/// copies from the live backing are exact; recurrent/indexer/R come from the
++/// fresh prefill-boundary capture only - never later state relabeled as k.
++/// A standalone fallback is a SEPARATE single entry (insert_tip): the pair
++/// structural sharing checks are deliberately NOT extended to allow a
++/// duplicate owned-KV prompt inside a pair.
++struct StandaloneKvBacking {
++    /// Per stage (main + splits), one KvLayerPayload per QSA layer with exactly
++    /// cells == k. Empty until the engine fills it post-DONE from the
++    /// authoritative append-only backing (bounded [0,k) copies only).
++    std::vector<std::vector<KvLayerPayload>> stages_kv;
++    /// The MTP [0,k-1) pairs (exactly one entry, cells == k-1). Empty unless
++    /// has_mtp; k == 1 holds no pair, so has_mtp is false there.
++    KvLayerPayload mtp_kv;
++    bool has_mtp = false;
++};
++
++/// Mode gates for the standalone fallback, resolved by the engine at the
++/// post-DONE call site (all must hold; each maps to one production condition).
++struct StandaloneMode {
++    bool supported_kv = false;   ///< saved_state_kv_ok(): no K8V4, startup mode on
++    bool non_aux = false;        ///< main line (!req_aux): aux lines retain nothing
++    bool tip_budget_on = false;  ///< o.tip_cache_gib > 0
++    bool no_stop = false;        ///< !stop_req: a STOP invalidates the boundary
++    bool no_cancel = false;      ///< !cancelled: no mid-request cancel
++    bool boundary_ok = false;    ///< exact-boundary state (false after flush/device failure)
++    bool mtp_ok = false;         ///< coherent drafter state (false after catch-up failure)
++    /// No known failed post-DONE device copy/snapshot on this request (flush-row
++    /// copy, generation snapshot/sync/copy). A later successful sync cannot justify
++    /// the fallback once a copy error was consumed: fail closed. Structural or
++    /// coherence rejection after successful copies (and zero-generated requests,
++    /// where no copy ran) keeps this true.
++    bool copies_clean = false;
++};
++
++/// Pure eligibility for the standalone fallback (CPU-only, unit-tested): every
++/// payload/identity/window condition plus every mode gate. `live_*` is the
++/// CURRENT post-DONE session transcript (prompt + actually emitted tokens);
++/// `cur_mtp_valid_from` is the current drafter window bound. The fresh prompt
++/// must exactly prefix-match live with image/cvec/geometry/stage identity,
++/// carry a complete boundary row, boundary-only payloads (NO main-KV copy -
++/// relabeling later state as k is rejected), and exact MTP metadata for
++/// [0,k-1). Coverage (k > 1 only): the current backing/window bound must lie at
++/// or below the prompt's saved valid_from (current backing vf <= saved prompt
++/// vf); a negative or transcript-impossible current bound is rejected outright.
++/// Zero emitted tokens are fine: no newly emitted token is required.
++/// Geometry is validated division-first (nonzero/bounded scalars, row product
++/// within the allocation cap) BEFORE any product, division, or size math, so
++/// hostile payloads cannot divide by zero or overflow here or in complete().
++bool standalone_fallback_eligible(const SavedItem& prompt, const std::vector<int32_t>& live_ids,
++                                  const std::vector<ImgKey>& live_imgs, bool live_cvec,
++                                  const SnapshotGeom& live_geom, int live_n_stages,
++                                  int64_t cur_mtp_valid_from, const StandaloneMode& mode,
++                                  std::string& why);
++
++/// Attach caller-copied bounded backing to the fresh prompt's own boundary
++/// payloads and validate the assembled single point. All sizes are validated
++/// BEFORE any move, then the assembly commits TRANSACTIALLY: backing attaches to
++/// a temporary copy (one extra prompt-bulk transient, fallback-rare only - never
++/// on the normal pair path), complete() validates the copy, and only a fully
++/// complete assembly moves back. On false (or a copy throw) the prompt keeps its
++/// original recurrent/indexer/R/metadata untouched. True ⟺ the item passes the
++/// full complete() structural gate and may go to insert_tip.
++bool complete_standalone_prompt(SavedItem& prompt, StandaloneKvBacking backing, std::string& why);
++
++/// Per-request tip-lookup census (TWO-LINES telemetry): a CPU-only, nonmutating,
++/// no-allocation summary of the tip store against one request's key. Counts tip
++/// LINES (entries) and restorable POINTS (gen + prompt points), how many points
++/// pass the store key gates (stage/cvec/full-ids-prefix/images, in the same order
++/// as find_best_except), per-cause rejection counters, the longest matching
++/// point, and the longest common-prefix LENGTH among mismatching points (lengths
++/// only - never tokens, text, or hashes). Roots are excluded: no retained tip passed
++/// the key gates when matching=0 (entries=0 means no tips at all); the restore
++/// outcome separately identifies live/chain/root/disk alternatives.
++/// Filled by SavedStateStore::summarize_lookup (never mutates, never allocates).
++struct TipLookupSummary {
++    size_t entries = 0;
++    size_t points = 0;
++    size_t matching = 0;
++    size_t prefix_mismatch = 0;
++    size_t image_mismatch = 0;
++    size_t cvec_mismatch = 0;
++    size_t stage_mismatch = 0;
++    int64_t best_match_len = -1;
++    int64_t best_mismatch_lcp = -1;
++};
+ /// Per-request stats (defined here; filled per request): `resume from {chain|tip|root|root-disk} at k, suffix n,
+ /// restore ms, snapshot ms`.
+ struct ResumeStats {
+@@ -571,6 +663,23 @@ class SavedStateStore {
+     /// exactly this length. CPU-testable.
+     const SavedItem* find_exact(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool cvec,
+                                 int64_t k) const;
++    /// TIP-entry-specific survival queries (control data, not best-effort diagnostics).
++    /// has_retained_pair is true iff some tip ENTRY's gen key exactly matches (gen ids of
++    /// length gen_ids.size() with image/cvec identity) AND the SAME entry still holds its
++    /// paired prompt of length prompt_len (prefix-verified). Roots never count (a pinned
++    /// root matching the prompt length proves nothing about the pair), and gen-only
++    /// singles never count as paired. find_exact_tip is the tip-only exact-length lookup
++    /// (same match rule as find_exact, roots excluded). Neither allocates; both only walk
++    /// pointer/size comparisons. CPU-testable.
++    bool has_retained_pair(const std::vector<int32_t>& gen_ids, const std::vector<ImgKey>& gen_imgs,
++                           bool cvec, int64_t prompt_len) const;
++    const SavedItem* find_exact_tip(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
++                                    bool cvec, int64_t k) const;
++    /// No-allocation key-gate census for one request (see TipLookupSummary): tips-only,
++    /// never mutates, never allocates. live_n_stages is the session's stage count.
++    /// CPU-testable.
++    void summarize_lookup(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
++                          bool cvec, int live_n_stages, TipLookupSummary& out) const;
+     /// Mounts go through the point find_best() returned: advances its LINE's last_use to now (a mount of
+     /// either point of a pair refreshes the entry AND both points' own last_use, so the pair evicts coherently
+     /// and S2 rows stay fresh). False for null or foreign pointers (never fabricates freshness).
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index d356f5d..0997a9f 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1666,6 +1666,7 @@ struct F1RestoreCtx {
+     std::string disk_hit_path;
+     int64_t reread_to = -1;
+     restore::RestoreResult outcome;
++    restore::RamWalkCounters ram_counted;   // TWO-LINES: per-request RAM-walk counters for the summary
+ };
+ 
+ // The full reset after ANY attempted mount failed (upload, boundary repair, or an
+@@ -1831,6 +1832,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+     std::string& disk_hit_path = c.disk_hit_path;
+     int64_t& reread_to = c.reread_to;
+     restore::RestoreResult& f1_outcome = c.outcome;
++    restore::RamWalkCounters f1_ram_count;   // TWO-LINES: filled by the counted RAM walk, read after the catches
+     try {
+                 // The disk side's own skip set (paths, owned by the walk): a failed lazy load or
+         // validation tries the next shorter on-disk root, never the same file twice. The disk peek
+@@ -1876,17 +1878,19 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                                                             n, f1_repair));
+         // The RAM skip-set walk lives in restore::collect_ram_candidates (same order, same gates,
+         // same logs); eligibility is still the full saved_validate_for_restore, pre-mount,
+-        // longest-first.
++        // longest-first. TWO-LINES: the counted form additionally fills per-request
++        // counters for one summary line (selection itself unchanged).
+         // K8V4: no RAM offers - the walk stays empty (live/chain candidates above are unaffected).
+         if (saved_state_kv_ok()) {
+-            f1_walk.set_ram(restore::collect_ram_candidates(
++            f1_walk.set_ram(restore::collect_ram_candidates_counted(
+                 saved_states, ids32, req_simgs, cvec_cached, n,
+                 [&](const saved::SavedItem& cand, std::string& why) -> bool {
+                             // A prompt point validates against its generation owner's shared backing.
+                     const saved::SavedItem* owner = saved_states.tip_gen_for(&cand);
+                     return saved_validate_for_restore(cand, ids32, req_simgs, cvec_cached, n,
+                                                       g, ss, stages, mtp, why, owner);
+-                }));
++                },
++                &f1_ram_count));
+         }   // K8V4: walk skipped above
+         // Selection state (cursors, chain_dead, skip sets, sk_*/take_chain) lives in the walk;
+         // the attempt bodies below read the selected candidate and report back at the same points.
+@@ -2300,6 +2304,7 @@ static int f1_restore_run(F1RestoreCtx& c) {
+                 disk_hit = nullptr;
+                 f1_outcome = restore::RestoreResult::failure(restore::RestoreFail::Transient);
+             }
++    c.ram_counted = f1_ram_count;
+     return 0;
+ }
+ // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
+@@ -6377,6 +6382,53 @@ int main(int argc, char** argv) {
+             f1_outcome = f1.outcome;
+             saved_stats.restore_ms +=
+                 std::chrono::duration<double, std::milli>(Clock::now() - e4_restore_t0).count();
++            // TWO-LINES observability: one per-request restore summary (counters + choice).
++            // Key=value syntax under the tip-cache prefix: never matches the existing
++            // `resume from SOURCE at K, suffix N` or `prompt N tokens = ...` parsers.
++            // Best-effort: never alters selection or fails the request.
++            try {
++                const char* tc_choice = "none";
++                switch (f1_outcome.source) {
++                    case saved::ResumeSource::Chain: tc_choice = "chain"; break;
++                    case saved::ResumeSource::Tip: tc_choice = "tip"; break;
++                    case saved::ResumeSource::Root: tc_choice = "root"; break;
++                    case saved::ResumeSource::RootDisk: tc_choice = "root-disk"; break;
++                    default: break;
++                }
++                std::fprintf(stderr,
++                             "strata serve: tip-cache restore considered=%llu eligible=%llu "
++                             "ineligible=%llu skipped_end=%llu chosen=%s k=%lld\n",
++                             (unsigned long long) f1.ram_counted.considered,
++                             (unsigned long long) f1.ram_counted.eligible,
++                             (unsigned long long) f1.ram_counted.ineligible,
++                             (unsigned long long) f1.ram_counted.skipped_end,
++                             tc_choice, (long long) f1_outcome.k);
++            } catch (...) {
++            }
++            // TWO-LINES observability: one per-request tip-lookup census beside the counted
++            // eligibility stats above. Tips-only key-gate summary (entries/points/matching,
++            // per-cause mismatches, best lengths): entries=0 means no tips at all; matching=0
++            // means no retained tip passed the key gates, and the restore outcome separately
++            // identifies live/chain/root/disk alternatives.
++            // Nonmutating, no allocation; best-effort, never fails the request.
++            try {
++                saved::TipLookupSummary lk;
++                saved_states.summarize_lookup(ids32, req_simgs, cvec_cached,
++                                              (int) stages.size() + 1, lk);
++                std::fprintf(stderr,
++                             "strata serve: tip-cache lookup entries=%llu points=%llu matching=%llu "
++                             "prefix_mismatch=%llu image_mismatch=%llu cvec_mismatch=%llu "
++                             "stage_mismatch=%llu best_match=%lld best_mismatch_lcp=%lld\n",
++                             (unsigned long long) lk.entries, (unsigned long long) lk.points,
++                             (unsigned long long) lk.matching,
++                             (unsigned long long) lk.prefix_mismatch,
++                             (unsigned long long) lk.image_mismatch,
++                             (unsigned long long) lk.cvec_mismatch,
++                             (unsigned long long) lk.stage_mismatch,
++                             (long long) lk.best_match_len,
++                             (long long) lk.best_mismatch_lcp);
++            } catch (...) {
++            }
+             } // end else: SavedState walk (upstream_resume_mode takes the upstream path above)
+             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
+             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+@@ -7337,6 +7389,24 @@ int main(int argc, char** argv) {
+             // The full post-DONE cache preparation (catch-up, flush, residual copy, snapshot incl.
+             // failures) lands in snapshot_ms once, below the catches. No nested timers (no double count).
+             const auto e4_post_t0 = Clock::now();
++            // TWO-LINES capture outcome tracking (read after the catches for the
++            // always-runs summary/skip lines below): only TIP-entry-verified points
++            // count as retained - an insert may self-evict under budget yet return true.
++            bool d_pair_retained = false, d_gen_retained = false, d_standalone_retained = false;
++            bool f2_consumed = false;   // the fresh prompt value was moved into a pair attempt
++            // Post-DONE cache copy safety (TWO-LINES item 3): false after ANY known failed
++            // device copy/snapshot (flush-row copy, generation snapshot/sync/copy). A later
++            // successful sync cannot justify the fallback then: fail closed. No live
++            // invalidation rides on this flag - only the fallback skips.
++            bool d_copy_clean = true;
++            int64_t d_pair_len = -1;
++            int64_t d_f2_len = (f2_prompt_ok && !f2_prompt.ids.empty())
++                                   ? (int64_t) f2_prompt.ids.size()
++                                   : -1;
++            // Fixed-literal capture-skip reason (never allocates: diagnostic strings must
++            // not throw inside the post-DONE try, or the outer catch would invalidate live
++            // over a logging allocation).
++            const char* d_skip = nullptr;
+             try {
+                 if (stop_req.load()) { live_ok = false; boundary_ok = false; live_bdry_L = -1; }
+                 // (a) runs only when a tip, live-boundary retention or chain tail can come of it
+@@ -7402,6 +7472,9 @@ int main(int argc, char** argv) {
+                             std::fprintf(stderr, "strata serve: SavedState boundary residual copy failed: "
+                                                  "tip suppressed (live still advanced)\n");
+                             flush_R.clear();
++                            // Known failed device copy: a later successful sync cannot
++                            // justify the standalone fallback (fail closed, no live change).
++                            d_copy_clean = false;
+                         } else {
+                             // Retain the live boundary row even when no tip comes of it
+                             // (aux lines, budget off): the next chain/live mount at this L repairs its
+@@ -7431,40 +7504,342 @@ int main(int argc, char** argv) {
+                 // so a stop/cancel records nothing. Without a fresh boundary capture (L at or below the
+                 // restored resume, unavailable row, failure), a coherent exact saved point at f2_at already
+                 // in the store is reused when practical - else generation-only. K8V4: no tips either.
++                // TWO-LINES: tip.complete() is pre-gated before the pair move, so a structurally
++                // failed generation snapshot never consumes the fresh prompt value (the (d2)
++                // fallback below still owns it). d_note_inserted verifies surviving retention
++                // with TIP-entry-specific queries and logs the terminal capture/admitted-
++                // not-retained event. paired=true verifies BOTH the exact gen key AND the
++                // paired prompt in the SAME retained entry (a pinned root or an older point
++                // can never satisfy it); singles use the tip-only exact lookup (roots excluded).
++                // No allocation inside; contained (never throws out).
++                auto d_note_inserted = [&](const char* role, int64_t prompt_len,
++                                           int64_t verify_len, uint64_t bytes,
++                                           bool paired) -> bool {
++                    bool survived = false;
++                    try {
++                        if (paired)
++                            survived = saved_states.has_retained_pair(live, req_simgs, cvec_cached,
++                                                                      prompt_len);
++                        else
++                            survived = saved_states.find_exact_tip(live, req_simgs, cvec_cached,
++                                                                   verify_len) != nullptr;
++                    } catch (...) {
++                        survived = false;
++                    }
++                    if (survived) {
++                        std::fprintf(stderr,
++                                     "strata serve: tip-cache capture role=%s prompt=%lld gen=%lld "
++                                     "bytes=%llu budget=%llu used=%llu tips=%llu clock=%llu\n",
++                                     role, (long long) prompt_len, (long long) live.size(),
++                                     (unsigned long long) bytes,
++                                     (unsigned long long) saved_states.tip_budget_bytes(),
++                                     (unsigned long long) saved_states.tip_bytes(),
++                                     (unsigned long long) saved_states.tips(),
++                                     (unsigned long long) saved_states.clock());
++                        return true;
++                    }
++                    std::fprintf(stderr,
++                                 "strata serve: tip-cache admitted-not-retained role=%s prompt=%lld "
++                                 "gen=%lld\n",
++                                 role, (long long) prompt_len, (long long) live.size());
++                    return false;
++                };
+                 if (boundary_ok && mtp_ok && !flush_R.empty() && !req_aux && o.tip_cache_gib > 0.0 &&
+-                    !live.empty() && saved_state_kv_ok()) {
++                    !live.empty() && saved_state_kv_ok() && !stop_req.load()) {
+                     saved::SavedItem tip;
+                     if (saved_snapshot((int64_t) live.size(), live, live_imgs, cvec_cached, flush_R.data(),
+                                        g.hc, g.n_embd, tip)) {
+                         if (f2_prompt_ok && !f2_prompt.ids.empty() &&
+                             (int64_t) live.size() > (int64_t) f2_prompt.ids.size() &&
+-                            saved::prompt_for_shared_ok(f2_prompt, tip)) {
+-                            if (!saved_states.insert_tip_pair(std::move(f2_prompt), std::move(tip), false))
++                            tip.complete() && saved::prompt_for_shared_ok(f2_prompt, tip)) {
++                            d_pair_len = (int64_t) f2_prompt.ids.size();
++                            const uint64_t d_pair_bytes =
++                                tip.payload_bytes() + f2_prompt.payload_bytes();
++                            // STOP recheck after the snapshot copies: a STOP arriving during
++                            // post-DONE work publishes nothing (fail-closed, no legacy line).
++                            bool d_admitted = false;
++                            if (!stop_req.load()) {
++                                d_admitted = saved_states.insert_tip_pair(std::move(f2_prompt),
++                                                                          std::move(tip),
++                                                                          false);
++                                f2_consumed = true;
++                            } else {
++                                d_skip = "stop";
++                            }
++                            if (!d_admitted && d_skip == nullptr) {
++                                d_skip = "pair-rejected";
+                                 std::fprintf(stderr, "strata serve: SavedState paired tip at %lld+%lld tokens "
+                                                      "rejected\n",
+                                              (long long) f2_at, (long long) live.size());
++                            } else if (d_skip == nullptr &&
++                                       d_note_inserted("paired", d_pair_len, d_pair_len,
++                                                       d_pair_bytes, true)) {
++                                d_pair_retained = true;
++                            } else if (d_skip == nullptr) {
++                                d_skip = "pair-self-evicted";
++                            }
++                            // (STOP: d_skip stays "stop", nothing published.)
+                         } else if (f2_at > 0 && (int64_t) live.size() > f2_at) {
+                             const saved::SavedItem* re =
+                                 saved_states.find_exact(live, req_simgs, cvec_cached, f2_at);
+                             if (re != nullptr && saved::prompt_for_shared_ok(*re, tip)) {
+                                 saved::SavedItem rp = *re;   // host copy of the reusable point (no device
+                                                              // capture); the store re-gates coherence on insert
+-                                if (!saved_states.insert_tip_pair(std::move(rp), std::move(tip), false))
++                                d_pair_len = f2_at;
++                                const uint64_t d_pair_bytes =
++                                    tip.payload_bytes() + rp.payload_bytes();
++                                // STOP recheck after the host copy: publish nothing on STOP.
++                                bool d_admitted = false;
++                                if (!stop_req.load()) {
++                                    d_admitted = saved_states.insert_tip_pair(std::move(rp),
++                                                                              std::move(tip),
++                                                                              false);
++                                } else {
++                                    d_skip = "stop";
++                                }
++                                if (!d_admitted && d_skip == nullptr) {
++                                    d_skip = "pair-rejected";
+                                     std::fprintf(stderr, "strata serve: SavedState reused-boundary paired tip "
+                                                          "at %lld+%lld tokens rejected\n",
+                                                  (long long) f2_at, (long long) live.size());
+-                            } else if (!saved_states.insert_tip(std::move(tip), false)) {
+-                                std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
+-                                             (long long) live.size());
++                                } else if (d_skip == nullptr &&
++                                           d_note_inserted("paired", d_pair_len, d_pair_len,
++                                                           d_pair_bytes, true)) {
++                                    d_pair_retained = true;
++                                } else if (d_skip == nullptr) {
++                                    d_skip = "pair-self-evicted";
++                                }
++                                // (STOP: d_skip stays "stop", nothing published.)
++                            } else {
++                                const uint64_t d_gen_bytes = tip.payload_bytes();
++                                const int64_t d_gen_len = (int64_t) live.size();
++                                // STOP recheck: publish nothing on STOP.
++                                bool d_admitted = false;
++                                if (!stop_req.load()) {
++                                    d_admitted = saved_states.insert_tip(std::move(tip), false);
++                                } else {
++                                    d_skip = "stop";
++                                }
++                                if (!d_admitted && d_skip == nullptr) {
++                                    d_skip = "gen-rejected";
++                                    std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
++                                                 (long long) live.size());
++                                } else if (d_skip == nullptr &&
++                                           d_note_inserted("generation", -1, d_gen_len,
++                                                           d_gen_bytes, false)) {
++                                    d_gen_retained = true;
++                                } else if (d_skip == nullptr) {
++                                    d_skip = "gen-self-evicted";
++                                }
++                                // (STOP: d_skip stays "stop", nothing published.)
++                            }
++                        } else {
++                            const uint64_t d_gen_bytes = tip.payload_bytes();
++                            const int64_t d_gen_len = (int64_t) live.size();
++                            // STOP recheck: publish nothing on STOP.
++                            bool d_admitted = false;
++                            if (!stop_req.load()) {
++                                d_admitted = saved_states.insert_tip(std::move(tip), false);
++                            } else {
++                                d_skip = "stop";
+                             }
+-                        } else if (!saved_states.insert_tip(std::move(tip), false)) {
+-                            std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
++                            if (!d_admitted && d_skip == nullptr) {
++                                d_skip = "gen-rejected";
++                                std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
+                                      (long long) live.size());
++                            } else if (d_skip == nullptr &&
++                                       d_note_inserted("generation", -1, d_gen_len,
++                                                       d_gen_bytes, false)) {
++                                d_gen_retained = true;
++                            } else if (d_skip == nullptr) {
++                                d_skip = "gen-self-evicted";
++                            }
++                            // (STOP: d_skip stays "stop", nothing published.)
+                         }
+                     } else {
++                        d_skip = "snapshot-failed";
++                        // A false return may have consumed a CUDA sync/copy error: a later
++                        // successful sync cannot justify the fallback (fail closed, no live change).
++                        d_copy_clean = false;
+                         std::fprintf(stderr, "strata serve: SavedState tip snapshot at %lld tokens failed\n",
+                                      (long long) live.size());
+                     }
++                } else {
++                    d_skip = req_aux ? "aux"
++                             : !(o.tip_cache_gib > 0.0) ? "tip-budget-off"
++                             : !saved_state_kv_ok() ? "kv-unsupported"
++                             : stop_req.load() ? "stop"
++                             : cancelled ? "cancelled"
++                             : !boundary_ok ? "boundary"
++                             : !mtp_ok ? "mtp"
++                             : live.empty() ? "empty-live"
++                             : flush_R.empty() ? (produced_n == 0 ? "no-emitted-token"
++                                                                  : "flush-failed")
++                             : "gen-gate";
++                }
++                // (d2) TWO-LINES generation-independent stable-prompt fallback: the fresh
++                // f2_prompt is discarded by the block above when produced_n==0 (flush_R empty
++                // gates the whole generation-tip block), yet the exact stable prompt state
++                // exists from its prefill boundary. When no pair was retained and the fresh
++                // value was never moved, retain it as an ordinary single-point complete item
++                // with its OWN bounded [0,k)/[0,k-1) KV/MTP copies (no newly emitted token
++                // required; zero-generated fallback is the key regression). Recurrent/indexer/R
++                // stay the fresh capture - later state is never relabeled as k. A self-evicted
++                // pair is reported, never repaired by bypassing the budget. Optional and
++                // best-effort: any fault skips, never fails the served answer.
++                if (!d_pair_retained && !f2_consumed && f2_prompt_ok && !f2_prompt.ids.empty()) {
++                    const int64_t d_k = (int64_t) f2_prompt.ids.size();
++                    saved::StandaloneMode d_mode;
++                    d_mode.supported_kv = saved_state_kv_ok();
++                    d_mode.non_aux = !req_aux;
++                    d_mode.tip_budget_on = o.tip_cache_gib > 0.0;
++                    d_mode.no_stop = !stop_req.load();
++                    d_mode.no_cancel = !cancelled;
++                    d_mode.boundary_ok = boundary_ok;
++                    d_mode.mtp_ok = mtp_ok;
++                    d_mode.copies_clean = d_copy_clean;
++                    // Local containment: EVERYTHING below that can allocate (image list,
++                    // device-copy staging is already guarded, the transactional temp copy,
++                    // the store insert) runs inside this local try. A fallback allocation
++                    // failure skips the fallback WITHOUT invalidating live - unlike the
++                    // outer GPU-work catches. Terminal fallback lines print immediately
++                    // (fixed literals + fprintf, never allocating), so skip reasons stay
++                    // visible even when another point was retained.
++                    bool d2_emitted = false;
++                    try {
++                        std::string d2_why;
++                        std::vector<saved::ImgKey> d_live_simgs;
++                        d_live_simgs.reserve(live_imgs.size());
++                        for (const ImgKey& d_im : live_imgs)
++                            d_live_simgs.push_back({d_im.start, d_im.hash});
++                        const bool d_elig = saved::standalone_fallback_eligible(
++                            f2_prompt, live, d_live_simgs, cvec_cached, saved_live_geom(g),
++                            (int) stages.size() + 1, mtp.prefill_valid_from(), d_mode, d2_why);
++                        bool d_copies_ok = false;
++                        saved::StandaloneKvBacking d_backing;
++                        if (d_elig) {
++                            try {
++                                d_copies_ok = (cudaDeviceSynchronize() == cudaSuccess);
++                                if (d_copies_ok) {
++                                    const int d_ns = (int) stages.size() + 1;
++                                    d_backing.stages_kv.resize((size_t) d_ns);
++                                    for (int64_t d_li = 0;
++                                         d_copies_ok && d_li < g.n_qsa_layers(); ++d_li) {
++                                        saved::KvLayerPayload d_kv;
++                                        if (!saved_snapshot_kv(ss.qsa_states[(size_t) d_li], g,
++                                                               d_k, d_kv))
++                                            d_copies_ok = false;
++                                        else
++                                            d_backing.stages_kv[0].push_back(std::move(d_kv));
++                                    }
++                                    for (size_t d_si = 0; d_copies_ok && d_si < stages.size();
++                                         ++d_si) {
++                                        const strata::core::OnDevice d_on(stages[d_si]->dev);
++                                        if (cudaDeviceSynchronize() != cudaSuccess) {
++                                            d_copies_ok = false;
++                                            break;
++                                        }
++                                        for (int64_t d_li = 0; d_li < g.n_qsa_layers(); ++d_li) {
++                                            saved::KvLayerPayload d_kv;
++                                            if (!saved_snapshot_kv(
++                                                    stages[d_si]->ss.qsa_states[(size_t) d_li],
++                                                    g, d_k, d_kv)) {
++                                                d_copies_ok = false;
++                                                break;
++                                            }
++                                            d_backing.stages_kv[d_si + 1].push_back(
++                                                std::move(d_kv));
++                                        }
++                                    }
++                                    if (d_copies_ok && d_k > 1) {
++                                        const strata::core::OnDevice d_on_mtp(mtp.device());
++                                        if (cudaDeviceSynchronize() == cudaSuccess &&
++                                            saved_snapshot_kv(mtp.kv_state(), g, d_k - 1,
++                                                              d_backing.mtp_kv))
++                                            d_backing.has_mtp = true;
++                                        else
++                                            d_copies_ok = false;
++                                    }
++                                }
++                            } catch (...) {
++                                d_copies_ok = false;
++                            }
++                        }
++                        if (!d_elig) {
++                            std::fprintf(stderr,
++                                         "strata serve: tip-cache skip reason=fallback-%s "
++                                         "prompt=%lld gen=%lld f2=%lld budget=%llu used=%llu\n",
++                                         d2_why.c_str(), (long long) d_k,
++                                         (long long) live.size(), (long long) f2_at,
++                                         (unsigned long long) saved_states.tip_budget_bytes(),
++                                         (unsigned long long) saved_states.tip_bytes());
++                            d2_emitted = true;
++                        } else if (!d_copies_ok) {
++                            std::fprintf(stderr,
++                                         "strata serve: tip-cache skip reason=fallback-copies "
++                                         "prompt=%lld gen=%lld f2=%lld budget=%llu used=%llu\n",
++                                         (long long) d_k, (long long) live.size(),
++                                         (long long) f2_at,
++                                         (unsigned long long) saved_states.tip_budget_bytes(),
++                                         (unsigned long long) saved_states.tip_bytes());
++                            d2_emitted = true;
++                        } else {
++                            saved::SavedItem d_solo = std::move(f2_prompt);
++                            f2_consumed = true;
++                            if (!saved::complete_standalone_prompt(d_solo, std::move(d_backing),
++                                                                   d2_why)) {
++                                std::fprintf(stderr,
++                                             "strata serve: tip-cache skip "
++                                             "reason=fallback-materialize-%s prompt=%lld gen=%lld "
++                                             "f2=%lld budget=%llu used=%llu\n",
++                                             d2_why.c_str(), (long long) d_k,
++                                             (long long) live.size(), (long long) f2_at,
++                                             (unsigned long long) saved_states.tip_budget_bytes(),
++                                             (unsigned long long) saved_states.tip_bytes());
++                                d2_emitted = true;
++                            } else if (stop_req.load()) {
++                                // STOP recheck after the copy work: publish nothing (fail-closed
++                                // drop of the assembled point; the session stands as decoded).
++                                std::fprintf(stderr,
++                                             "strata serve: tip-cache skip reason=fallback-stop "
++                                             "prompt=%lld gen=%lld f2=%lld budget=%llu used=%llu\n",
++                                             (long long) d_k, (long long) live.size(),
++                                             (long long) f2_at,
++                                             (unsigned long long) saved_states.tip_budget_bytes(),
++                                             (unsigned long long) saved_states.tip_bytes());
++                                d2_emitted = true;
++                            } else {
++                                const uint64_t d_solo_bytes = d_solo.payload_bytes();
++                                if (!saved_states.insert_tip(std::move(d_solo), false)) {
++                                    std::fprintf(stderr,
++                                                 "strata serve: tip-cache skip "
++                                                 "reason=fallback-insert prompt=%lld gen=%lld "
++                                                 "f2=%lld budget=%llu used=%llu\n",
++                                                 (long long) d_k, (long long) live.size(),
++                                                 (long long) f2_at,
++                                                 (unsigned long long) saved_states.tip_budget_bytes(),
++                                                 (unsigned long long) saved_states.tip_bytes());
++                                    d2_emitted = true;
++                                } else if (d_note_inserted("standalone", d_k, d_k,
++                                                           d_solo_bytes, false)) {
++                                    d_standalone_retained = true;
++                                    d2_emitted = true;
++                                } else {
++                                    d2_emitted = true;   // admitted-not-retained line printed inside
++                                }
++                            }
++                        }
++                    } catch (...) {
++                        // Fallback allocation failure: skip WITHOUT invalidating live.
++                    }
++                    if (!d2_emitted) {
++                        std::fprintf(stderr,
++                                     "strata serve: tip-cache skip reason=fallback-alloc "
++                                     "prompt=%lld gen=%lld f2=%lld budget=%llu used=%llu\n",
++                                     (long long) d_k, (long long) live.size(), (long long) f2_at,
++                                     (unsigned long long) saved_states.tip_budget_bytes(),
++                                     (unsigned long long) saved_states.tip_bytes());
++                    }
+                 }
+                 // (e) TAIL-RESUME end-of-request chain checkpoint at live.size() (prompt + actually
+                 // emitted tokens): live ids/images (NOT cur, which is prompt only), recurrent/stage
+@@ -7565,6 +7940,35 @@ int main(int argc, char** argv) {
+             // One timing for all of the above, success and failure paths alike; adds to any root cost.
+             saved_stats.snapshot_ms +=
+                 std::chrono::duration<double, std::milli>(Clock::now() - e4_post_t0).count();
++            // TWO-LINES observability: one per-request capture summary (counters + surviving
++            // retention) plus the (d)-level skip reason whenever (d) retained nothing - even
++            // when the (d2) fallback later retained a point ((d2) terminals print their own
++            // lines, so e.g. no-emitted-token + standalone success stays visible). Always
++            // runs, success and failure paths alike; fixed literals + fprintf only
++            // (never allocating), best-effort and exception-safe, never fatal.
++            // Key=value syntax under the tip-cache prefix: existing parsers never match it.
++            try {
++                std::fprintf(stderr,
++                             "strata serve: tip-cache summary paired=%d standalone=%d generation=%d "
++                             "live=%lld tips=%llu points=%llu used=%llu budget=%llu clock=%llu\n",
++                             d_pair_retained ? 1 : 0, d_standalone_retained ? 1 : 0,
++                             d_gen_retained ? 1 : 0, (long long) live.size(),
++                             (unsigned long long) saved_states.tips(),
++                             (unsigned long long) saved_states.tip_points(),
++                             (unsigned long long) saved_states.tip_bytes(),
++                             (unsigned long long) saved_states.tip_budget_bytes(),
++                             (unsigned long long) saved_states.clock());
++                if (!d_pair_retained && !d_gen_retained && d_skip != nullptr) {
++                    std::fprintf(stderr,
++                                 "strata serve: tip-cache skip reason=%s prompt=%lld gen=%lld "
++                                 "f2=%lld budget=%llu used=%llu\n",
++                                 d_skip, (long long) d_f2_len, (long long) live.size(),
++                                 (long long) f2_at,
++                                 (unsigned long long) saved_states.tip_budget_bytes(),
++                                 (unsigned long long) saved_states.tip_bytes());
++                }
++            } catch (...) {
++            }
+             // One stats line per request, stderr only (stdout keeps the GEN protocol: RESUME/PP/T/DONE).
+             // After post-DONE work, so snapshot_ms holds root + full post-DONE cost and k/suffix are final.
+             {
+diff --git a/src/program/restore.cpp b/src/program/restore.cpp
+index dea5641..1b7fc92 100644
+--- a/src/program/restore.cpp
++++ b/src/program/restore.cpp
+@@ -274,6 +274,13 @@ std::vector<const saved_state::SavedItem*> collect_ram_candidates(
+     const saved_state::SavedStateStore& store, const std::vector<int32_t>& ids,
+     const std::vector<saved_state::ImgKey>& imgs, bool cvec, int64_t n,
+     RamEligibilityFn eligible, void* ctx) {
++    return collect_ram_candidates_counted(store, ids, imgs, cvec, n, eligible, ctx, nullptr);
++}
++
++std::vector<const saved_state::SavedItem*> collect_ram_candidates_counted(
++    const saved_state::SavedStateStore& store, const std::vector<int32_t>& ids,
++    const std::vector<saved_state::ImgKey>& imgs, bool cvec, int64_t n,
++    RamEligibilityFn eligible, void* ctx, RamWalkCounters* cnt) {
+     std::vector<const saved_state::SavedItem*> out;   // validated, longest-first
+     // Accumulating skip set: each rejected candidate joins, so the walk is
+     // longest-first without revisit and always terminates (cand==nullptr ends it).
+@@ -281,11 +288,13 @@ std::vector<const saved_state::SavedItem*> collect_ram_candidates(
+     for (;;) {
+         const saved_state::SavedItem* cand = store.find_best_except(ids, imgs, cvec, skip);
+         if (cand == nullptr) break;
++        if (cnt != nullptr) ++cnt->considered;
+         const int64_t sk = (int64_t) cand->ids.size();
+         if (sk >= n) {
+             std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens skipped "
+                                  "(at/past the request end)\n",
+                          (long long) sk);
++            if (cnt != nullptr) ++cnt->skipped_end;
+             skip.push_back(cand);
+             continue;
+         }
+@@ -297,12 +306,14 @@ std::vector<const saved_state::SavedItem*> collect_ram_candidates(
+             std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens validation "
+                                  "threw (%s): trying shorter\n",
+                          (long long) sk, ex.what());
++            if (cnt != nullptr) ++cnt->ineligible;
+             skip.push_back(cand);
+             continue;
+         } catch (...) {
+             std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens validation "
+                                  "threw: trying shorter\n",
+                          (long long) sk);
++            if (cnt != nullptr) ++cnt->ineligible;
+             skip.push_back(cand);
+             continue;
+         }
+@@ -310,9 +321,23 @@ std::vector<const saved_state::SavedItem*> collect_ram_candidates(
+             std::fprintf(stderr, "strata serve: SavedState candidate at %lld tokens ineligible "
+                                  "(%s): trying shorter\n",
+                          (long long) sk, why.c_str());
++            // TWO-LINES: brief tip-cache role line beside the legacy line above (which is
++            // kept verbatim): whether the rejected matching candidate is the stable prompt
++            // point or the generation point. Pointer/size reads only: cannot throw, and the
++            // engine calls this walk inside its guarded selection, so diagnostics stay
++            // best-effort here too.
++            const char* ram_role = "generation";
++            if (store.tip_gen_for(cand) != nullptr)
++                ram_role = "prompt";
++            else if (cand->kind == saved_state::Kind::Root)
++                ram_role = "root";
++            std::fprintf(stderr, "strata serve: tip-cache candidate role=%s len=%lld\n", ram_role,
++                         (long long) sk);
++            if (cnt != nullptr) ++cnt->ineligible;
+             skip.push_back(cand);
+             continue;
+         }
++        if (cnt != nullptr) ++cnt->eligible;
+         out.push_back(cand);
+         skip.push_back(cand);
+     }
+diff --git a/src/program/restore_test.cpp b/src/program/restore_test.cpp
+index 0dd8a12..5625cab 100644
+--- a/src/program/restore_test.cpp
++++ b/src/program/restore_test.cpp
+@@ -1014,6 +1014,114 @@ int main() {
+         for (const auto& k : chain) after += k.bytes();
+         check(after < before, "evicted checkpoint takes its row bytes");
+     }
++    {   // TWO-LINES counted RAM walk: same order/gates/logs as the uncounted walk plus
++        // per-request counters (considered/eligible/ineligible/skipped_end) for the one
++        // tip-cache restore summary line. Selection itself is unchanged.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_item(100, 0)), "counted root(100) stores");
++        check(st.insert_tip(make_item(200, 0), false), "counted tip(200) stores");
++        check(st.insert_tip(make_item(150, 0), false), "counted tip(150) stores");
++        const std::vector<int32_t> ids = req32(250);
++        auto accept = [](const saved::SavedItem&, std::string&) { return true; };
++        restore::RamWalkCounters cnt;
++        std::vector<const saved::SavedItem*> got = restore::collect_ram_candidates_counted(
++            st, ids, no_simgs, true, 250, accept, &cnt);
++        check(got.size() == 3 && got[0]->ids.size() == 200, "counted walk keeps longest-first");
++        check(cnt.considered == 3 && cnt.eligible == 3 && cnt.ineligible == 0 &&
++                  cnt.skipped_end == 0,
++              "counted walk reports 3 considered 3 eligible");
++        auto reject_big = [](const saved::SavedItem& it, std::string& why) {
++            if (it.ids.size() == 200 || it.ids.size() == 150) {
++                why = "fake-invalid";
++                return false;
++            }
++            return true;
++        };
++        restore::RamWalkCounters cnt2;
++        got = restore::collect_ram_candidates_counted(st, ids, no_simgs, true, 250, reject_big,
++                                                      &cnt2);
++        check(got.size() == 1 && got[0]->ids.size() == 100,
++              "counted walk falls through rejections to the root");
++        check(cnt2.considered == 3 && cnt2.eligible == 1 && cnt2.ineligible == 2 &&
++                  cnt2.skipped_end == 0,
++              "counted walk reports 2 ineligible");
++        restore::RamWalkCounters cnt3;
++        got = restore::collect_ram_candidates_counted(st, req32(150), no_simgs, true, 150,
++                                                      accept, &cnt3);
++        check(got.size() == 1 && got[0]->ids.size() == 100,
++              "counted walk skips the at-end candidate");
++        check(cnt3.considered == 2 && cnt3.eligible == 1 && cnt3.ineligible == 0 &&
++                  cnt3.skipped_end == 1,
++              "counted walk reports the at-end skip");
++        got = restore::collect_ram_candidates_counted(st, ids, no_simgs, true, 250, accept,
++                                                      nullptr);
++        check(got.size() == 3 && got[0]->ids.size() == 200,
++              "null counters match the uncounted walk");
++        got = restore::collect_ram_candidates(st, ids, no_simgs, true, 250, accept);
++        check(got.size() == 3 && got[0]->ids.size() == 200,
++              "uncounted walk unchanged beside the counted form");
++    }
++    {   // TWO-LINES alternating-lines selection regression (exercises the production
++        // RestoreWalk + counted RAM walk, not just store inserts): empty/pruned chain,
++        // two unrelated standalone stable tips (what the fallback stores: complete
++        // single points) plus an older root. A,B alternate; each request selects its
++        // own newest stable point despite the other line's transcript diverging right
++        // after the shared start; a mutation before the stable boundary falls back to
++        // the older root. Fake eligibility accepts key matches (the store already
++        // enforces the production key gates); full restore validation stays in the engine.
++        saved::SavedStateStore st;
++        check(st.insert_tip(make_item(60, 0), false), "alt line A stable(60) stores");
++        check(st.insert_tip(make_item(40, 5000), false), "alt line B stable(40) stores");
++        check(st.insert_root(make_item(30, 0)), "alt older root(30) stores");
++        auto accept = [](const saved::SavedItem&, std::string&) { return true; };
++        const std::vector<int32_t> a_next = req32(90);
++        std::vector<int32_t> b_next(70);
++        for (int i = 0; i < 70; ++i) b_next[(size_t) i] = (int32_t) (5000 + i);
++        // Line A after B ran (chain pruned: empty).
++        restore::RamWalkCounters ca;
++        std::vector<const saved::SavedItem*> wa = restore::collect_ram_candidates_counted(
++            st, a_next, no_simgs, true, 90, accept, &ca);
++        check(wa.size() == 2 && wa[0]->ids.size() == 60 && wa[1]->ids.size() == 30,
++              "alt A walk offers own stable(60) then root(30), never B");
++        check(ca.considered == 2 && ca.eligible == 2 && ca.ineligible == 0 &&
++                  ca.skipped_end == 0,
++              "alt A walk counters");
++        restore::RestoreWalk wka;
++        wka.set_chain({});
++        wka.set_ram(wa);
++        restore::RestoreCandidate canda = wka.next();
++        check(!canda.exhausted && !canda.take_chain && canda.ram != nullptr &&
++                  canda.ram->ids.size() == 60,
++              "alt A selects its own newest stable point");
++        // Line B after A ran.
++        restore::RamWalkCounters cb;
++        std::vector<const saved::SavedItem*> wb = restore::collect_ram_candidates_counted(
++            st, b_next, no_simgs, true, 70, accept, &cb);
++        check(wb.size() == 1 && wb[0]->ids.size() == 40, "alt B walk offers only B stable(40)");
++        restore::RestoreWalk wkb;
++        wkb.set_chain({});
++        wkb.set_ram(wb);
++        restore::RestoreCandidate candb = wkb.next();
++        check(!candb.exhausted && !candb.take_chain && candb.ram != nullptr &&
++                  candb.ram->ids.size() == 40,
++              "alt B selects its own newest stable point");
++        // Mutation before the stable boundary: the near-end point is not offered and
++        // the walk falls through to the older root.
++        std::vector<int32_t> mut = req32(90);
++        mut[50] = 999;
++        restore::RamWalkCounters cm;
++        std::vector<const saved::SavedItem*> wm = restore::collect_ram_candidates_counted(
++            st, mut, no_simgs, true, 90, accept, &cm);
++        check(wm.size() == 1 && wm[0]->ids.size() == 30,
++              "alt mutated A falls back to the older root");
++        restore::RestoreWalk wkm;
++        wkm.set_chain({});
++        wkm.set_ram(wm);
++        restore::RestoreCandidate candm = wkm.next();
++        check(!candm.exhausted && !candm.take_chain && candm.ram != nullptr &&
++                  candm.ram->ids.size() == 30,
++              "alt mutated A mounts the older root");
++    }
+     if (g_fail == 0)
+         std::printf("restore_test: all ok\n");
+     else
+diff --git a/src/program/saved_state.cpp b/src/program/saved_state.cpp
+index aa5194a..a2d8615 100644
+--- a/src/program/saved_state.cpp
++++ b/src/program/saved_state.cpp
+@@ -5,6 +5,8 @@
+ // (index/background writer/trim) in root_disk_store.cpp (CPU-only, no CUDA, no device code).
+ #include "strata/program/saved_state.hpp"
+ 
++#include "strata/core/conversation_cache.hpp"   // kCheckpointRowCapCells (row allocation cap)
++
+ #include <algorithm>
+ #include <atomic>
+ #include <cerrno>
+@@ -26,6 +28,62 @@
+ namespace strata::program::saved_state {
+ namespace fs = std::filesystem;
+ 
++namespace {
++// Division-first shape gate shared by both standalone entry points: validates every
++// scalar BEFORE any product or division below, so later size math cannot divide by zero,
++// overflow (signed or unsigned), or exceed the boundary-row allocation cap. Bounds reuse
++// the existing root/checkpoint limits consistently - never multiply before bounding.
++bool standalone_shape_ok(const SnapshotGeom& gm, int64_t k, int64_t hc, int64_t n_embd,
++                         size_t row_cells, std::string& why) {
++    if (gm.n_qsa_layers < 1 || gm.n_qsa_layers > kMaxRootLayers ||
++        gm.n_head_kv < 1 || gm.n_head_kv > kMaxRootHeads ||
++        gm.head_dim < 1 || gm.head_dim > kMaxRootDim ||
++        gm.idx_dim < 1 || gm.idx_dim > kMaxRootDim ||
++        gm.idx_block < 1 || gm.idx_block > kMaxRootBlock ||
++        gm.page_size < 1 || gm.page_size > kMaxRootBlock) {
++        why = "geometry";
++        return false;
++    }
++    if (k < 1 || k > (int64_t) kMaxRootIds) { why = "length"; return false; }
++    if (hc <= 0 || n_embd <= 0) { why = "row-shape"; return false; }
++    // Division FIRST: bound before multiplying (a product computed first could wrap to a
++    // small value and pass - the same wrap-to-small rule as the checkpoint row helpers).
++    if ((uint64_t) hc > strata::core::kCheckpointRowCapCells / (uint64_t) n_embd) {
++        why = "row-shape";
++        return false;
++    }
++    if ((uint64_t) hc * (uint64_t) n_embd != (uint64_t) row_cells) {
++        why = "row-shape";
++        return false;
++    }
++    return true;
++}
++
++// Common-prefix length of two id vectors (lengths only, no allocation).
++int64_t tip_lcp_len(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
++    const size_t m = a.size() < b.size() ? a.size() : b.size();
++    int64_t l = 0;
++    for (size_t i = 0; i < m; ++i) {
++        if (a[i] != b[i]) break;
++        ++l;
++    }
++    return l;
++}
++
++// Request images below k equal the point images, without allocating the filtered list
++// (equivalent to imgs_below(req, k) == pt, order-preserving).
++bool tip_imgs_match(const std::vector<ImgKey>& req, int64_t k, const std::vector<ImgKey>& pt) {
++    size_t j = 0;
++    for (size_t i = 0; i < req.size(); ++i) {
++        if (req[i].start >= k) continue;
++        if (j >= pt.size() || req[i].start != pt[j].start || req[i].hash != pt[j].hash)
++            return false;
++        ++j;
++    }
++    return j == pt.size();
++}
++}  // namespace
++
+ SavedStateStore::SavedStateStore() = default;
+ 
+ void SavedStateStore::set_stage_count(int n) {
+@@ -170,6 +228,83 @@ const SavedItem* SavedStateStore::find_exact(const std::vector<int32_t>& ids, co
+     return nullptr;
+ }
+ 
++bool SavedStateStore::has_retained_pair(const std::vector<int32_t>& gen_ids,
++                                        const std::vector<ImgKey>& gen_imgs, bool cvec,
++                                        int64_t prompt_len) const {
++    if (prompt_len < 1 || gen_ids.empty()) return false;
++    const int64_t g = (int64_t) gen_ids.size();
++    if (prompt_len >= g) return false;
++    // Tips only: a pinned root matching the prompt length proves nothing about the pair.
++    for (const TipEntry& t : tips_) {
++        if (!t.has_prompt) continue;
++        const SavedItem& gen = t.gen;
++        if ((int64_t) gen.ids.size() != g) continue;
++        if (gen.ids != gen_ids) continue;
++        if (gen.cvec != cvec) continue;
++        if (!tip_imgs_match(gen_imgs, g, gen.imgs)) continue;
++        if ((int64_t) t.prompt.ids.size() != prompt_len) continue;
++        if (!is_prefix(t.prompt.ids, gen_ids)) continue;
++        return true;
++    }
++    return false;
++}
++
++const SavedItem* SavedStateStore::find_exact_tip(const std::vector<int32_t>& ids,
++                                                 const std::vector<ImgKey>& imgs, bool cvec,
++                                                 int64_t k) const {
++    if (k < 1 || k > (int64_t) ids.size()) return nullptr;
++    auto matches = [&](const SavedItem& it) {
++        if ((int64_t) it.ids.size() != k) return false;
++        if ((int) it.stages.size() != n_stages_ || it.n_stages != n_stages_) return false;
++        if (it.cvec != cvec) return false;
++        if (!is_prefix(it.ids, ids)) return false;
++        return tip_imgs_match(imgs, k, it.imgs);
++    };
++    // Tips only (same match rule as find_exact, roots excluded).
++    for (const TipEntry& t : tips_) {
++        if (t.has_prompt && matches(t.prompt)) return &t.prompt;
++        if (matches(t.gen)) return &t.gen;
++    }
++    return nullptr;
++}
++
++void SavedStateStore::summarize_lookup(const std::vector<int32_t>& ids,
++                                       const std::vector<ImgKey>& imgs, bool cvec,
++                                       int live_n_stages, TipLookupSummary& out) const {
++    out = TipLookupSummary{};
++    out.entries = tips_.size();
++    // Key-gate order mirrors find_best_except (stage, cvec, full-ids prefix, images).
++    for (const TipEntry& t : tips_) {
++        const SavedItem* pts[2] = {&t.gen, t.has_prompt ? &t.prompt : nullptr};
++        for (int p = 0; p < 2; ++p) {
++            const SavedItem* it = pts[p];
++            if (it == nullptr) continue;
++            ++out.points;
++            const int64_t k = (int64_t) it->ids.size();
++            if ((int) it->stages.size() != live_n_stages || it->n_stages != live_n_stages) {
++                ++out.stage_mismatch;
++                continue;
++            }
++            if (it->cvec != cvec) {
++                ++out.cvec_mismatch;
++                continue;
++            }
++            if (!is_prefix(it->ids, ids)) {
++                ++out.prefix_mismatch;
++                const int64_t lcp = tip_lcp_len(it->ids, ids);
++                if (lcp > out.best_mismatch_lcp) out.best_mismatch_lcp = lcp;
++                continue;
++            }
++            if (!tip_imgs_match(imgs, k, it->imgs)) {
++                ++out.image_mismatch;
++                continue;
++            }
++            ++out.matching;
++            if (k > out.best_match_len) out.best_match_len = k;
++        }
++    }
++}
++
+ bool SavedStateStore::note_use(const SavedItem* it) {
+     if (it == nullptr) return false;
+     for (SavedItem& r : roots_)
+@@ -229,11 +364,153 @@ void SavedStateStore::evict_tips() {
+         size_t v = 0;   // LRU: least recently used tip leaves first
+         for (size_t i = 1; i < tips_.size(); ++i)
+             if (tips_[i].last_use < tips_[v].last_use) v = i;
++        // TWO-LINES observability: one stderr event per actual eviction (lengths,
++        // bytes, clocks, budget, reason). No tokens, text, images or secrets: only
++        // ids lengths. Best-effort: fprintf never throws; a failure here must not
++        // alter the eviction itself.
++        const TipEntry& gone = tips_[v];
++        std::fprintf(stderr,
++                     "strata serve: tip-cache evict gen=%lld prompt=%lld bytes=%llu used=%llu "
++                     "budget=%llu entries=%llu clock=%llu reason=over-budget\n",
++                     (long long) gone.gen.ids.size(),
++                     gone.has_prompt ? (long long) gone.prompt.ids.size() : -1ll,
++                     (unsigned long long) gone.bytes, (unsigned long long) tip_bytes_,
++                     (unsigned long long) tip_budget_, (unsigned long long) tips_.size(),
++                     (unsigned long long) clock_);
+         tip_bytes_ -= tips_[v].bytes;
+         tips_.erase(tips_.begin() + (std::ptrdiff_t)v);
+     }
+ }
+ 
++bool standalone_fallback_eligible(const SavedItem& prompt, const std::vector<int32_t>& live_ids,
++                                  const std::vector<ImgKey>& live_imgs, bool live_cvec,
++                                  const SnapshotGeom& live_geom, int live_n_stages,
++                                  int64_t cur_mtp_valid_from, const StandaloneMode& mode,
++                                  std::string& why) {
++    // Mode gates first (each maps to one production post-DONE condition).
++    if (!mode.supported_kv) { why = "kv-unsupported"; return false; }
++    if (!mode.non_aux) { why = "aux"; return false; }
++    if (!mode.tip_budget_on) { why = "tip-budget-off"; return false; }
++    if (!mode.no_stop) { why = "stop"; return false; }
++    if (!mode.no_cancel) { why = "cancelled"; return false; }
++    if (!mode.boundary_ok) { why = "boundary"; return false; }
++    if (!mode.mtp_ok) { why = "mtp"; return false; }
++    if (!mode.copies_clean) { why = "prior-copy-error"; return false; }
++    const int64_t k = (int64_t) prompt.ids.size();
++    // Division-first shape gate before any product, division, or size math below
++    // (including boundary.complete()'s signed row product).
++    if (!standalone_shape_ok(prompt.geom, k, prompt.boundary.hc, prompt.boundary.n_embd,
++                              prompt.boundary.row.size(), why))
++        return false;
++    if ((int64_t) live_ids.size() < k) { why = "prefix"; return false; }
++    // A negative current window bound, or one beyond the available pair count
++    // (live holds live.size() tokens, so pair rows stop at live.size()-1), is rejected.
++    if (cur_mtp_valid_from < 0 || cur_mtp_valid_from > (int64_t) live_ids.size() - 1) {
++        why = "mtp-window";
++        return false;
++    }
++    if (!is_prefix(prompt.ids, live_ids)) { why = "prefix"; return false; }
++    if (prompt.cvec != live_cvec) { why = "cvec"; return false; }
++    if (!tip_imgs_match(live_imgs, k, prompt.imgs)) { why = "images"; return false; }
++    if (prompt.geom != live_geom) { why = "geometry"; return false; }
++    if (prompt.n_stages != live_n_stages || (int) prompt.stages.size() != live_n_stages ||
++        live_n_stages < 1) {
++        why = "stages";
++        return false;
++    }
++    if (!prompt.boundary.complete()) { why = "row"; return false; }
++    const int64_t prow = k / prompt.geom.idx_block + 1;   // pooled rows covering [0, k)
++    for (const StagePayload& s : prompt.stages) {
++        if (s.rec.gdn.empty() || s.rec.tails.empty()) { why = "recurrent"; return false; }
++        if (!s.kv.empty()) { why = "duplicate-kv"; return false; }   // fresh prompt shares; never relabel
++        if ((int64_t) s.idx.size() != prompt.geom.n_qsa_layers) { why = "stages"; return false; }
++        if (s.rec.ple_prev[0] != (k >= 2 ? prompt.ids[(size_t) (k - 2)] : -1) ||
++            s.rec.ple_prev[1] != prompt.ids[(size_t) (k - 1)]) {
++            why = "ple-prev";
++            return false;
++        }
++        for (const IndexerPayload& x : s.idx) {
++            if (x.pooled_rows != prow) { why = "indexer-rows"; return false; }
++            if ((int64_t) x.pooled.size() != prow * prompt.geom.idx_dim * 4) {
++                why = "indexer-size";
++                return false;
++            }
++            if ((int64_t) x.dead_key.size() != prompt.geom.idx_dim * 4) {
++                why = "indexer-dead";
++                return false;
++            }
++            if (x.block_pos.size() != 1) { why = "indexer-cursor"; return false; }
++        }
++    }
++    // Exact MTP metadata for [0, k-1). k == 1 holds no pair (no coverage to check).
++    if (k == 1) {
++        if (!prompt.mtp.kv.empty() || prompt.mtp.cells != 0) { why = "mtp-pairs"; return false; }
++        return true;
++    }
++    if (!prompt.mtp.kv.empty()) { why = "duplicate-mtp"; return false; }   // filled at materialize, not before
++    if (prompt.mtp.cells != k - 1) { why = "mtp-pairs"; return false; }
++    if (prompt.mtp.valid_from < 0 || prompt.mtp.valid_from > prompt.mtp.cells) {
++        why = "mtp-valid-from";
++        return false;
++    }
++    if (cur_mtp_valid_from > prompt.mtp.valid_from) { why = "mtp-window"; return false; }
++    return true;
++}
++
++bool complete_standalone_prompt(SavedItem& prompt, StandaloneKvBacking backing, std::string& why) {
++    const int64_t k = (int64_t) prompt.ids.size();
++    // Division-first shape gate before any product, division, or size math below.
++    if (!standalone_shape_ok(prompt.geom, k, prompt.boundary.hc, prompt.boundary.n_embd,
++                              prompt.boundary.row.size(), why))
++        return false;
++    if (prompt.geom.n_qsa_layers < 1) { why = "geometry"; return false; }
++    const int n_stages = prompt.n_stages;
++    if (n_stages < 1 || (int) prompt.stages.size() != n_stages ||
++        (int) backing.stages_kv.size() != n_stages) {
++        why = "stages";
++        return false;
++    }
++    // Fresh prompt carries no KV of its own: a non-empty store means this is not
++    // the prefill-boundary capture (never overwrite generation state as k).
++    for (const StagePayload& s : prompt.stages)
++        if (!s.kv.empty()) { why = "duplicate-kv"; return false; }
++    if (!prompt.mtp.kv.empty()) { why = "duplicate-mtp"; return false; }
++    // The PLE window must be the boundary ids' last two (mirrors the pair gate).
++    for (const StagePayload& s : prompt.stages)
++        if (s.rec.ple_prev[0] != (k >= 2 ? prompt.ids[(size_t) (k - 2)] : -1) ||
++            s.rec.ple_prev[1] != prompt.ids[(size_t) (k - 1)]) {
++            why = "ple-prev";
++            return false;
++        }
++    // Validate every bounded copy BEFORE any move: the prompt is untouched on false.
++    for (int s = 0; s < n_stages; ++s) {
++        if ((int64_t) backing.stages_kv[(size_t) s].size() != prompt.geom.n_qsa_layers) {
++            why = "stages";
++            return false;
++        }
++        for (const KvLayerPayload& e : backing.stages_kv[(size_t) s])
++            if (!kv_blob_ok(e, k, prompt.geom)) { why = "kv-size"; return false; }
++    }
++    if (k == 1) {
++        if (backing.has_mtp) { why = "mtp-pairs"; return false; }
++    } else {
++        if (!backing.has_mtp) { why = "mtp-missing"; return false; }
++        if (!kv_blob_ok(backing.mtp_kv, k - 1, prompt.geom)) { why = "mtp-size"; return false; }
++        if (backing.mtp_kv.fmt != backing.stages_kv[0][0].fmt) { why = "mtp-format"; return false; }
++    }
++    // Transactional commit: attach to a temporary copy (one extra prompt-bulk transient,
++    // fallback-rare only), validate the copy fully, and move back only when complete.
++    // A complete() failure or a copy throw below leaves the prompt's original
++    // recurrent/indexer/R/metadata untouched.
++    SavedItem assembled = prompt;   // may throw: prompt untouched (only the copy allocates)
++    for (int s = 0; s < n_stages; ++s)
++        assembled.stages[(size_t) s].kv = std::move(backing.stages_kv[(size_t) s]);
++    if (k > 1) assembled.mtp.kv.push_back(std::move(backing.mtp_kv));
++    if (!assembled.complete()) { why = "assembled-incomplete"; return false; }
++    prompt = std::move(assembled);   // move-assign moves pointers only: no allocation
++    return true;
++}
++
+ bool parse_gib_flag(const char* text, double& gib, std::string& err) {
+     gib = 0.0;
+     if (text == nullptr || *text == '\0') {
+diff --git a/src/program/saved_state_test.cpp b/src/program/saved_state_test.cpp
+index b48fa0e..133148f 100644
+--- a/src/program/saved_state_test.cpp
++++ b/src/program/saved_state_test.cpp
+@@ -1855,6 +1855,584 @@ int main() {
+         hv2.version = 2;
+         check(!hv2.compatible_with(h), "v2 header incompatible with v3");
+     }
++    {   // TWO-LINES standalone fallback eligibility: the production predicate for retaining a
++        // fresh F2b prompt point with no generation tip (zero emitted tokens included).
++        // Engine-shaped fixture: shared-KV prompt (empty main KV, MTP metadata only).
++        auto mode_ok = []() {
++            saved::StandaloneMode m;
++            m.supported_kv = true;
++            m.non_aux = true;
++            m.tip_budget_on = true;
++            m.no_stop = true;
++            m.no_cancel = true;
++            m.boundary_ok = true;
++            m.mtp_ok = true;
++            m.copies_clean = true;
++            return m;
++        };
++        const saved::SavedItem fresh = make_shared_prompt_item(60, 0);
++        std::string why;
++        check(saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                  1, 0, mode_ok(), why),
++              "S2 fresh prompt over a longer live line is eligible");
++        check(saved::standalone_fallback_eligible(fresh, req_at(0, 60), no_imgs, true, geom_a(),
++                                                  1, 0, mode_ok(), why),
++              "S2 live exactly at the boundary is eligible (zero-generated shape)");
++        saved::StandaloneMode m = mode_ok();
++        m.supported_kv = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 K8V4/unsupported KV rejects the fallback");
++        m = mode_ok();
++        m.non_aux = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 aux rejects the fallback");
++        m = mode_ok();
++        m.tip_budget_on = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 tip-budget-off rejects the fallback");
++        m = mode_ok();
++        m.no_stop = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 stop rejects the fallback");
++        m = mode_ok();
++        m.no_cancel = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 cancel rejects the fallback");
++        m = mode_ok();
++        m.boundary_ok = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 failed boundary rejects the fallback");
++        m = mode_ok();
++        m.mtp_ok = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 failed MTP catch-up rejects the fallback");
++        m = mode_ok();
++        m.copies_clean = false;
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, m, why),
++              "S2 prior copy error rejects the fallback");
++        check(!saved::standalone_fallback_eligible(fresh, req_at(5000, 100), no_imgs, true,
++                                                   geom_a(), 1, 0, mode_ok(), why),
++              "S2 wrong-prefix live rejects the fallback");
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 59), no_imgs, true, geom_a(),
++                                                   1, 0, mode_ok(), why),
++              "S2 live shorter than k rejects the fallback");
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, false,
++                                                   geom_a(), 1, 0, mode_ok(), why),
++              "S2 cvec flip rejects the fallback");
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_b(),
++                                                   1, 0, mode_ok(), why),
++              "S2 geometry change rejects the fallback");
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   2, 0, mode_ok(), why),
++              "S2 stage count change rejects the fallback");
++        saved::SavedItem norow = make_shared_prompt_item(60, 0);
++        norow.boundary.row.clear();
++        check(!saved::standalone_fallback_eligible(norow, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, mode_ok(), why),
++              "S2 missing boundary row rejects the fallback");
++        saved::SavedItem norec = make_shared_prompt_item(60, 0);
++        norec.stages[0].rec.gdn.clear();
++        check(!saved::standalone_fallback_eligible(norec, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 0, mode_ok(), why),
++              "S2 missing recurrent state rejects the fallback");
++        check(!saved::standalone_fallback_eligible(make_line(60, 0), req_at(0, 100), no_imgs,
++                                                   true, geom_a(), 1, 0, mode_ok(), why),
++              "S2 owned-KV item rejected (never relabel later state as k)");
++        check(!saved::standalone_fallback_eligible(make_prompt_item(60, 0), req_at(0, 100),
++                                                   no_imgs, true, geom_a(), 1, 0, mode_ok(), why),
++              "S2 owned-MTP item rejected (backing attaches at materialize)");
++        saved::SavedItem badple = make_shared_prompt_item(60, 0);
++        badple.stages[0].rec.ple_prev[1] = 424242;
++        check(!saved::standalone_fallback_eligible(badple, req_at(0, 100), no_imgs, true,
++                                                   geom_a(), 1, 0, mode_ok(), why),
++              "S2 ple_prev split rejects the fallback");
++        saved::SavedItem badpairs = make_shared_prompt_item(60, 0);
++        badpairs.mtp.cells = 60;
++        check(!saved::standalone_fallback_eligible(badpairs, req_at(0, 100), no_imgs, true,
++                                                   geom_a(), 1, 0, mode_ok(), why),
++              "S2 wrong MTP pair count rejects the fallback");
++        saved::SavedItem badvf = make_shared_prompt_item(60, 0);
++        badvf.mtp.valid_from = 60;
++        check(!saved::standalone_fallback_eligible(badvf, req_at(0, 100), no_imgs, true,
++                                                   geom_a(), 1, 0, mode_ok(), why),
++              "S2 out-of-range MTP valid_from rejects the fallback");
++        saved::SavedItem slid = make_shared_prompt_item(60, 0);
++        slid.mtp.valid_from = 2;
++        check(!saved::standalone_fallback_eligible(slid, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 5, mode_ok(), why),
++              "S2 current window below the saved rows rejects the fallback");
++        check(saved::standalone_fallback_eligible(slid, req_at(0, 100), no_imgs, true, geom_a(),
++                                                  1, 2, mode_ok(), why),
++              "S2 current window at the saved bound passes");
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, -1, mode_ok(), why),
++              "S2 negative current window bound rejected");
++        check(!saved::standalone_fallback_eligible(fresh, req_at(0, 100), no_imgs, true, geom_a(),
++                                                   1, 101, mode_ok(), why),
++              "S2 transcript-impossible current window bound rejected");
++        saved::SavedItem with_img = make_shared_prompt_item(60, 0);
++        with_img.imgs.push_back({10, 0x1234});
++        check(!saved::standalone_fallback_eligible(with_img, req_at(0, 100), no_imgs, true,
++                                                   geom_a(), 1, 0, mode_ok(), why),
++              "S2 image below k missing from live rejects the fallback");
++        check(saved::standalone_fallback_eligible(with_img, req_at(0, 100),
++                                                  std::vector<saved::ImgKey>{{10, 0x1234}}, true,
++                                                  geom_a(), 1, 0, mode_ok(), why),
++              "S2 matching image passes");
++        const saved::SavedItem one = make_shared_prompt_item(1, 7);
++        check(saved::standalone_fallback_eligible(one, req_at(7, 1), no_imgs, true, geom_a(), 1,
++                                                  0, mode_ok(), why),
++              "S2 k==1 boundary (no MTP pair) is eligible");
++        check(!saved::standalone_fallback_eligible(one, req_at(7, 1), no_imgs, true, geom_a(), 1,
++                                                   1, mode_ok(), why),
++              "S2 k==1/live==1 with vf=1 rejected (beyond available pair count)");
++    }
++    {   // TWO-LINES geometry safety: zero/negative/huge/wrap-to-small scalars and row
++        // products are rejected by BOTH standalone entry points BEFORE any product,
++        // division, or size math (no divide-by-zero, no signed/unsigned overflow).
++        auto mode_ok = []() {
++            saved::StandaloneMode m;
++            m.supported_kv = true;
++            m.non_aux = true;
++            m.tip_budget_on = true;
++            m.no_stop = true;
++            m.no_cancel = true;
++            m.boundary_ok = true;
++            m.mtp_ok = true;
++            m.copies_clean = true;
++            return m;
++        };
++        auto bad_geom = [](saved::SavedItem it, const std::function<void(saved::SnapshotGeom&)>& mut) {
++            mut(it.geom);
++            return it;
++        };
++        std::string why;
++        auto elig_rejects = [&](saved::SavedItem p, const char* what) {
++            check(!saved::standalone_fallback_eligible(p, req_at(0, 100), no_imgs, true,
++                                                       geom_a(), 1, 0, mode_ok(), why),
++                  what);
++        };
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.idx_block = 0; }),
++                     "S2 zero idx_block rejected (no divide-by-zero)");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.page_size = 0; }),
++                     "S2 zero page_size rejected");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.head_dim = 0; }),
++                     "S2 zero head_dim rejected");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.head_dim = -5; }),
++                     "S2 negative head_dim rejected");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.n_qsa_layers = 0; }),
++                     "S2 zero layers rejected");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.n_qsa_layers = (int64_t) 1 << 40; }),
++                     "S2 huge layers rejected");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.n_head_kv = (int64_t) 1 << 40; }),
++                     "S2 huge head count rejected");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.head_dim = (int64_t) 1 << 60; }),
++                     "S2 huge head_dim rejected (no product overflow)");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.idx_dim = (int64_t) 1 << 60; }),
++                     "S2 huge idx_dim rejected");
++        elig_rejects(bad_geom(make_shared_prompt_item(60, 0),
++                              [](saved::SnapshotGeom& g) { g.page_size = (int64_t) 1 << 40; }),
++                     "S2 huge page_size rejected");
++        saved::SavedItem zerohc = make_shared_prompt_item(60, 0);
++        zerohc.boundary.hc = 0;
++        elig_rejects(zerohc, "S2 zero boundary hc rejected");
++        saved::SavedItem neghc = make_shared_prompt_item(60, 0);
++        neghc.boundary.hc = -3;
++        neghc.boundary.n_embd = 4;
++        elig_rejects(neghc, "S2 negative boundary hc rejected");
++        saved::SavedItem zeronb = make_shared_prompt_item(60, 0);
++        zeronb.boundary.n_embd = 0;
++        elig_rejects(zeronb, "S2 zero boundary n_embd rejected");
++        saved::SavedItem wrap = make_shared_prompt_item(60, 0);
++        wrap.boundary.hc = (int64_t) 1 << 33;
++        wrap.boundary.n_embd = (int64_t) 1 << 33;
++        elig_rejects(wrap, "S2 wrap-to-small row product rejected division-first");
++        saved::SavedItem shortrow = make_shared_prompt_item(60, 0);
++        shortrow.boundary.row.pop_back();
++        elig_rejects(shortrow, "S2 short boundary row rejected");
++        // Impossible length: beyond the ids cap (16MB transient, rejected before any payload math).
++        saved::SavedItem huge = make_shared_prompt_item(60, 0);
++        huge.ids.assign((size_t) saved::kMaxRootIds + 1, 1);
++        check(!saved::standalone_fallback_eligible(huge, huge.ids, no_imgs, true, geom_a(), 1,
++                                                   0, mode_ok(), why),
++              "S2 over-cap length rejected");
++        // Materializer: the same hostile shapes fail with the prompt untouched (no KV attached).
++        auto mat_rejects_untouched = [&](saved::SavedItem p, const char* what) {
++            saved::StandaloneKvBacking b;   // empty backing: shape must fail first regardless
++            check(!saved::complete_standalone_prompt(p, std::move(b), why), what);
++            bool bare = true;
++            for (const saved::StagePayload& s : p.stages) bare = bare && s.kv.empty();
++            check(bare && p.mtp.kv.empty(), "S2 hostile shape leaves the prompt KV-free");
++        };
++        mat_rejects_untouched(bad_geom(make_shared_prompt_item(60, 0),
++                                       [](saved::SnapshotGeom& g) { g.idx_block = 0; }),
++                              "S2 materialize rejects zero idx_block");
++        mat_rejects_untouched(bad_geom(make_shared_prompt_item(60, 0),
++                                       [](saved::SnapshotGeom& g) { g.head_dim = (int64_t) 1 << 60; }),
++                              "S2 materialize rejects huge head_dim");
++        mat_rejects_untouched(wrap, "S2 materialize rejects wrap-to-small row product");
++        mat_rejects_untouched(shortrow, "S2 materialize rejects short boundary row");
++        mat_rejects_untouched(huge, "S2 materialize rejects over-cap length");
++    }
++    {   // TWO-LINES standalone materialize: bounded [0,k)/[0,k-1) backing attaches to the
++        // fresh boundary payloads into a complete single point; every structural mismatch
++        // fails BEFORE any move (the prompt is untouched on false).
++        auto backing_for = [](int k, int fmt) {
++            saved::StandaloneKvBacking b;
++            saved::KvLayerPayload kv;
++            kv.fmt = fmt;
++            kv.cells = k;
++            kv.k.assign((size_t) saved::kv_pool_bytes(fmt, k, 1, 8, 4, false), 0xC1);
++            kv.v.assign((size_t) saved::kv_pool_bytes(fmt, k, 1, 8, 4, false), 0xC2);
++            b.stages_kv.push_back(std::vector<saved::KvLayerPayload>{kv});
++            if (k > 1) {
++                saved::KvLayerPayload mtp;
++                mtp.fmt = fmt;
++                mtp.cells = k - 1;
++                mtp.k.assign((size_t) saved::kv_pool_bytes(fmt, k - 1, 1, 8, 4, false), 0xC3);
++                mtp.v.assign((size_t) saved::kv_pool_bytes(fmt, k - 1, 1, 8, 4, false), 0xC4);
++                b.mtp_kv = std::move(mtp);
++                b.has_mtp = true;
++            }
++            return b;
++        };
++        std::string why;
++        saved::SavedItem good = make_shared_prompt_item(60, 0);
++        check(saved::complete_standalone_prompt(good, backing_for(60, saved::kKvF16), why),
++              "S2 exact bounded backing materializes");
++        check(good.complete(), "S2 materialized point is complete");
++        check(good.stages[0].kv[0].k[0] == (uint8_t) 0xC1 && good.mtp.kv[0].k[0] == (uint8_t) 0xC3,
++              "S2 exact [0,k)/[0,k-1) bytes attach");
++        check(good.stages[0].rec.gdn[0] == 0xA1 && good.boundary.row[0] == 1.5f,
++              "S2 boundary recurrent/row payloads untouched by the attach");
++        saved::SavedItem over = make_shared_prompt_item(60, 0);
++        check(!saved::complete_standalone_prompt(over, backing_for(61, saved::kKvF16), why),
++              "S2 over-long KV copy rejected");
++        check(over.stages[0].kv.empty(), "S2 rejected prompt keeps no KV (untouched)");
++        saved::SavedItem cut = make_shared_prompt_item(60, 0);
++        saved::StandaloneKvBacking cutb = backing_for(60, saved::kKvF16);
++        cutb.stages_kv[0][0].k.pop_back();
++        check(!saved::complete_standalone_prompt(cut, std::move(cutb), why),
++              "S2 truncated KV copy rejected");
++        check(cut.stages[0].kv.empty(), "S2 truncated copy leaves the prompt untouched");
++        saved::SavedItem badfmt = make_shared_prompt_item(60, 0);
++        check(!saved::complete_standalone_prompt(badfmt, backing_for(60, 7), why),
++              "S2 unknown KV format rejected");
++        saved::SavedItem badmp = make_shared_prompt_item(60, 0);
++        saved::StandaloneKvBacking badmpb = backing_for(60, saved::kKvF16);
++        badmpb.mtp_kv.cells = 60;
++        check(!saved::complete_standalone_prompt(badmp, std::move(badmpb), why),
++              "S2 wrong MTP pair count rejected");
++        saved::SavedItem split = make_shared_prompt_item(60, 0);
++        saved::StandaloneKvBacking splitb = backing_for(60, saved::kKvF16);
++        // Exact-size int8 MTP rows (head_dim 8 carries no int8 scales, so the sizes are
++        // exact): the rejection is purely the MTP/main format split.
++        splitb.mtp_kv = backing_for(60, saved::kKvInt8).mtp_kv;
++        check(!saved::complete_standalone_prompt(split, std::move(splitb), why),
++              "S2 MTP/main format split rejected");
++        saved::SavedItem nomtp = make_shared_prompt_item(60, 0);
++        saved::StandaloneKvBacking nomtpb = backing_for(60, saved::kKvF16);
++        nomtpb.has_mtp = false;
++        nomtpb.mtp_kv = saved::KvLayerPayload{};
++        check(!saved::complete_standalone_prompt(nomtp, std::move(nomtpb), why),
++              "S2 missing MTP rows rejected");
++        saved::SavedItem dup = make_line(60, 0);
++        check(!saved::complete_standalone_prompt(dup, backing_for(60, saved::kKvF16), why),
++              "S2 owned-KV prompt rejected at materialize");
++        check(dup.complete(), "S2 rejected prompt keeps its own complete state");
++        saved::SavedItem nostage = make_shared_prompt_item(60, 0);
++        check(!saved::complete_standalone_prompt(nostage, saved::StandaloneKvBacking{}, why),
++              "S2 empty backing rejected");
++        saved::SavedItem one = make_shared_prompt_item(1, 7);
++        check(saved::complete_standalone_prompt(one, backing_for(1, saved::kKvF16), why) &&
++                  one.complete(),
++              "S2 k==1 materializes with no MTP pair");
++        saved::SavedItem onebad = make_shared_prompt_item(1, 7);
++        saved::StandaloneKvBacking onebadb = backing_for(60, saved::kKvF16);
++        check(!saved::complete_standalone_prompt(onebad, std::move(onebadb), why),
++              "S2 k==1 with MTP rows rejected");
++    }
++    {   // TWO-LINES transactional materialize: corruptions that pass the pre-move size
++        // checks but fail complete() on the assembled copy (rec, indexer, images, MTP
++        // window) leave the ORIGINAL prompt's recurrent/indexer/R/metadata untouched -
++        // the commit only moves back a fully complete assembly. PLE-window corruption
++        // fails fast pre-move, likewise untouched.
++        auto backing_for = [](int k) {
++            saved::StandaloneKvBacking b;
++            saved::KvLayerPayload kv;
++            kv.fmt = saved::kKvF16;
++            kv.cells = k;
++            kv.k.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k, 1, 8, 4, false), 0xC1);
++            kv.v.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k, 1, 8, 4, false), 0xC2);
++            b.stages_kv.push_back(std::vector<saved::KvLayerPayload>{kv});
++            saved::KvLayerPayload mtp;
++            mtp.fmt = saved::kKvF16;
++            mtp.cells = k - 1;
++            mtp.k.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k - 1, 1, 8, 4, false),
++                         0xC3);
++            mtp.v.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k - 1, 1, 8, 4, false),
++                         0xC4);
++            b.mtp_kv = std::move(mtp);
++            b.has_mtp = true;
++            return b;
++        };
++        auto unchanged = [](const saved::SavedItem& before, const saved::SavedItem& after,
++                            const char* what) {
++            check(after.ids == before.ids &&
++                      after.stages[0].rec.gdn == before.stages[0].rec.gdn &&
++                      after.stages[0].rec.ple == before.stages[0].rec.ple &&
++                      after.stages[0].rec.tails == before.stages[0].rec.tails &&
++                      after.stages[0].idx[0].pooled == before.stages[0].idx[0].pooled &&
++                      after.stages[0].idx[0].dead_key == before.stages[0].idx[0].dead_key &&
++                      after.stages[0].idx[0].block_pos == before.stages[0].idx[0].block_pos &&
++                      after.boundary.row == before.boundary.row &&
++                      after.mtp.cells == before.mtp.cells &&
++                      after.mtp.valid_from == before.mtp.valid_from &&
++                      after.stages[0].kv.empty() && after.mtp.kv.empty(),
++                  what);
++        };
++        std::string why;
++        auto fails_untouched = [&](saved::SavedItem p, const char* what, const char* what_un) {
++            const saved::SavedItem before = p;   // snapshot the corrupted original
++            check(!saved::complete_standalone_prompt(p, backing_for(60), why), what);
++            unchanged(before, p, what_un);
++        };
++        saved::SavedItem norecg = make_shared_prompt_item(60, 0);
++        norecg.stages[0].rec.gdn.clear();
++        fails_untouched(norecg, "S2 empty GDN fails materialize",
++                        "S2 empty-GDN prompt unchanged");
++        saved::SavedItem norect = make_shared_prompt_item(60, 0);
++        norect.stages[0].rec.tails.clear();
++        fails_untouched(norect, "S2 empty tails fails materialize",
++                        "S2 empty-tails prompt unchanged");
++        saved::SavedItem cutpool = make_shared_prompt_item(60, 0);
++        cutpool.stages[0].idx[0].pooled.pop_back();
++        fails_untouched(cutpool, "S2 truncated pooled keys fail materialize",
++                        "S2 truncated-pool prompt unchanged");
++        saved::SavedItem cutdead = make_shared_prompt_item(60, 0);
++        cutdead.stages[0].idx[0].dead_key.pop_back();
++        fails_untouched(cutdead, "S2 truncated dead key fails materialize",
++                        "S2 truncated-dead prompt unchanged");
++        saved::SavedItem dblcur = make_shared_prompt_item(60, 0);
++        dblcur.stages[0].idx[0].block_pos.push_back(1);
++        fails_untouched(dblcur, "S2 doubled block cursor fails materialize",
++                        "S2 doubled-cursor prompt unchanged");
++        saved::SavedItem badimg = make_shared_prompt_item(60, 0);
++        badimg.imgs.push_back({60, 7});
++        fails_untouched(badimg, "S2 image at >= k fails materialize",
++                        "S2 bad-image prompt unchanged");
++        saved::SavedItem badvf = make_shared_prompt_item(60, 0);
++        badvf.mtp.valid_from = 60;
++        fails_untouched(badvf, "S2 out-of-range valid_from fails materialize",
++                        "S2 bad-vf prompt unchanged");
++        saved::SavedItem badple = make_shared_prompt_item(60, 0);
++        badple.stages[0].rec.ple_prev[1] = 424242;
++        fails_untouched(badple, "S2 PLE-window split fails materialize fast",
++                        "S2 bad-PLE prompt unchanged");
++    }
++    {   // TWO-LINES zero-generated alternating retention (store-level regression for the
++        // produced_n==0 gap): single-point stable prompt tips - what the fallback stores -
++        // for two unrelated lines coexist and each line resumes at its own stable end after
++        // the other line ran. The store is never pruned by traffic, unlike the chain.
++        auto materialize = [](saved::SavedItem prompt, int k) {
++            saved::StandaloneKvBacking b;
++            saved::KvLayerPayload kv;
++            kv.fmt = saved::kKvF16;
++            kv.cells = k;
++            kv.k.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k, 1, 8, 4, false), 0xC1);
++            kv.v.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k, 1, 8, 4, false), 0xC2);
++            b.stages_kv.push_back(std::vector<saved::KvLayerPayload>{kv});
++            if (k > 1) {
++                saved::KvLayerPayload mtp;
++                mtp.fmt = saved::kKvF16;
++                mtp.cells = k - 1;
++                mtp.k.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k - 1, 1, 8, 4, false),
++                             0xC3);
++                mtp.v.assign((size_t) saved::kv_pool_bytes(saved::kKvF16, k - 1, 1, 8, 4, false),
++                             0xC4);
++                b.mtp_kv = std::move(mtp);
++                b.has_mtp = true;
++            }
++            std::string why;
++            if (!saved::complete_standalone_prompt(prompt, std::move(b), why)) return prompt;
++            return prompt;
++        };
++        saved::SavedStateStore st;
++        saved::SavedItem pa = materialize(make_shared_prompt_item(60, 0), 60);
++        check(pa.complete(), "S2 fallback point for line A assembles complete");
++        check(st.insert_tip(std::move(pa), false), "S2 line A stable point stores");
++        saved::SavedItem pb = materialize(make_shared_prompt_item(40, 5000), 40);
++        check(pb.complete(), "S2 fallback point for line B assembles complete");
++        check(st.insert_tip(std::move(pb), false), "S2 line B stable point stores");
++        check(st.tips() == 2 && st.tip_points() == 2, "S2 two lines hold two stable points");
++        const saved::SavedItem* ha = st.find_best(req_at(0, 90), no_imgs, true);
++        check(ha != nullptr && (int) ha->ids.size() == 60,
++              "S2 line A resumes at its own stable end after B ran");
++        const saved::SavedItem* hb = st.find_best(req_at(5000, 70), no_imgs, true);
++        check(hb != nullptr && (int) hb->ids.size() == 40,
++              "S2 line B resumes at its own stable end after A ran");
++        check(st.find_exact(req_at(0, 90), no_imgs, true, 60) == ha,
++              "S2 engine survival query sees line A stable point");
++        check(st.find_best_except(req_at(0, 90), no_imgs, true, {ha}) == nullptr,
++              "S2 no second point leaks across lines for A");
++        // fork parent pair coexists with a diverged child single; both resolve longest-first.
++        check(st.insert_tip_pair(make_prompt_item(60, 10000), make_line(100, 10000), false),
++              "S2 unrelated parent pair stores");
++        saved::SavedItem child = make_line(110, 10000);
++        for (int i = 100; i < 110; ++i) child.ids[(size_t) i] = (int32_t) (70000 + i);
++        for (saved::StagePayload& s : child.stages) {
++            s.rec.ple_prev[0] = child.ids[(size_t) 108];
++            s.rec.ple_prev[1] = child.ids[(size_t) 109];
++        }
++        check(child.complete(), "S2 diverged child fixture is complete");
++        check(st.insert_tip(std::move(child), false), "S2 diverged child stores");
++        std::vector<int32_t> child_req = req_at(10000, 100);
++        for (int i = 0; i < 10; ++i) child_req.push_back((int32_t) (70000 + 100 + i));
++        const saved::SavedItem* hc = st.find_best(child_req, no_imgs, true);
++        check(hc != nullptr && (int) hc->ids.size() == 110,
++              "S2 diverged child resumes from its own tip");
++        std::vector<int32_t> parent_next = req_at(10000, 100);
++        for (int i = 0; i < 10; ++i) parent_next.push_back((int32_t) (81000 + i));
++        const saved::SavedItem* hp2 = st.find_best(parent_next, no_imgs, true);
++        check(hp2 != nullptr && (int) hp2->ids.size() == 100,
++              "S2 parent extension ignores the diverged child");
++        const saved::SavedItem* hp = st.find_best(req_at(10000, 150), no_imgs, true);
++        check(hp != nullptr && (int) hp->ids.size() == 100,
++              "S2 parent line still resumes at its own end");
++    }
++    {   // TWO-LINES admission != retention, tiny-budget model of the 8GiB concept: an insert
++        // may self-evict under budget yet return true (the engine verifies with find_exact).
++        // Budget pressure evicts whole older lines; the survivor stays addressable.
++        saved::SavedStateStore st;
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false),
++              "S2 pair admits");
++        const uint64_t full = st.tip_bytes();
++        check(st.find_exact(req_at(0, 100), no_imgs, true, 60) != nullptr,
++              "S2 prompt point verifiably retained");
++        st.set_tip_budget_bytes(full);   // exactly full with line A
++        check(st.insert_tip_pair(make_prompt_item(40, 5000), make_line(80, 5000), false),
++              "S2 line B admits");
++        check(st.tips() == 1, "S2 pressure evicts the whole older line");
++        check(st.find_best(req_at(0, 100), no_imgs, true) == nullptr, "S2 evicted line A is gone");
++        check(st.find_best(req_at(5000, 80), no_imgs, true) != nullptr, "S2 line B survives");
++        saved::SavedStateStore st2;
++        st2.set_tip_budget_bytes(1);   // below one entry: self-eviction on insert
++        check(st2.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false),
++              "S2 over-budget pair insert still returns true");
++        check(st2.tips() == 0 && st2.find_best(req_at(0, 100), no_imgs, true) == nullptr &&
++                  st2.find_exact(req_at(0, 100), no_imgs, true, 60) == nullptr,
++              "S2 self-evicted pair retains nothing (admission != retention)");
++    }
++    {   // TWO-LINES TIP-entry-specific survival (control data): has_retained_pair needs BOTH
++        // the exact gen key AND the paired prompt in the SAME retained entry. A pinned root
++        // matching the prompt length, or a gen-only single (downgrade), must NOT report paired.
++        saved::SavedStateStore st;
++        check(st.insert_root(make_line(60, 0)), "S2 root matching the prompt length stores");
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false),
++              "S2 pair stores");
++        check(st.has_retained_pair(req_at(0, 100), no_imgs, true, 60),
++              "S2 stored pair verifies gen key + prompt in one entry");
++        check(!st.has_retained_pair(req_at(0, 100), no_imgs, true, 61),
++              "S2 wrong prompt length is not paired");
++        check(!st.has_retained_pair(req_at(0, 100), no_imgs, false, 60),
++              "S2 cvec flip is not paired");
++        check(!st.has_retained_pair(req_at(5000, 100), no_imgs, true, 60),
++              "S2 wrong gen ids are not paired");
++        // Evict the pair under budget pressure: the pinned root survives, the pair does not.
++        st.set_tip_budget_bytes(1);
++        check(st.tips() == 0, "S2 pressure evicts the pair, root pinned");
++        check(!st.has_retained_pair(req_at(0, 100), no_imgs, true, 60),
++              "S2 evicted pair is not reported paired");
++        check(st.find_exact(req_at(0, 100), no_imgs, true, 60) != nullptr,
++              "S2 legacy find_exact still sees the pinned root (why it cannot verify pairs)");
++        // Gen-only downgrade over the same key is not a pair either.
++        saved::SavedStateStore st3;
++        check(st3.insert_tip(make_line(100, 0), false), "S2 gen-only single stores");
++        check(!st3.has_retained_pair(req_at(0, 100), no_imgs, true, 60),
++              "S2 gen-only single is not a pair");
++        check(st3.find_exact_tip(req_at(0, 100), no_imgs, true, 100) != nullptr,
++              "S2 tip-only exact lookup sees the generation point");
++        check(st3.find_exact_tip(req_at(0, 100), no_imgs, true, 60) == nullptr,
++              "S2 tip-only exact lookup misses the absent prompt point");
++        check(st.find_exact_tip(req_at(0, 100), no_imgs, true, 60) == nullptr,
++              "S2 tip-only lookup excludes the pinned root");
++        check(!st3.has_retained_pair(req_at(0, 100), no_imgs, true, 100),
++              "S2 prompt length == gen length is not paired");
++    }
++    {   // TWO-LINES tip-lookup census: tips-only key-gate summary per request (no allocation).
++        // entries=0 means no tips at all; matching=0 with prefix_mismatch>0 means only a
++        // pinned root could match; lengths only, never tokens.
++        saved::SavedStateStore st;
++        saved::TipLookupSummary empty;
++        st.summarize_lookup(req_at(0, 120), no_imgs, true, 1, empty);
++        check(empty.entries == 0 && empty.points == 0 && empty.matching == 0 &&
++                  empty.best_match_len == -1 && empty.best_mismatch_lcp == -1,
++              "S2 empty store census is zero");
++        check(st.insert_tip_pair(make_prompt_item(60, 0), make_line(100, 0), false),
++              "S2 line A pair stores");
++        check(st.insert_tip(make_line(40, 5000), false), "S2 line B single stores");
++        check(st.insert_root(make_line(30, 0)), "S2 older root stores (excluded from census)");
++        saved::TipLookupSummary a;
++        st.summarize_lookup(req_at(0, 120), no_imgs, true, 1, a);
++        check(a.entries == 2 && a.points == 3, "S2 census counts tip lines and points, not roots");
++        check(a.matching == 2 && a.prefix_mismatch == 1 && a.image_mismatch == 0 &&
++                  a.cvec_mismatch == 0 && a.stage_mismatch == 0,
++              "S2 line A request: pair matches, line B mismatches prefix");
++        check(a.best_match_len == 100 && a.best_mismatch_lcp == 0,
++              "S2 best lengths for the A request");
++        saved::TipLookupSummary b;
++        st.summarize_lookup(req_at(5000, 70), no_imgs, true, 1, b);
++        check(b.matching == 1 && b.prefix_mismatch == 2 && b.best_match_len == 40 &&
++                  b.best_mismatch_lcp == 0,
++              "S2 line B request: only its own point matches");
++        saved::TipLookupSummary cf;
++        st.summarize_lookup(req_at(0, 120), no_imgs, false, 1, cf);
++        check(cf.matching == 0 && cf.cvec_mismatch == 3 && cf.prefix_mismatch == 0,
++              "S2 cvec flip mismatches every point on cvec");
++        saved::TipLookupSummary sg;
++        st.summarize_lookup(req_at(0, 120), no_imgs, true, 2, sg);
++        check(sg.matching == 0 && sg.stage_mismatch == 3, "S2 stage mismatch counted");
++        // Partial prefix overlap records the safe LCP length.
++        saved::SavedStateStore st4;
++        saved::SavedItem near = make_line(80, 0);
++        for (int i = 70; i < 80; ++i) near.ids[(size_t) i] = (int32_t) (9000 + i);
++        check(near.complete(), "S2 near-miss fixture is complete");
++        check(st4.insert_tip(std::move(near), false), "S2 near-miss tip stores");
++        saved::TipLookupSummary nm;
++        st4.summarize_lookup(req_at(0, 120), no_imgs, true, 1, nm);
++        check(nm.matching == 0 && nm.prefix_mismatch == 1 && nm.best_mismatch_lcp == 70,
++              "S2 near-miss records LCP 70");
++        // Image identity is its own mismatch category.
++        saved::SavedStateStore st5;
++        saved::SavedItem with_img = make_line(50, 0);
++        with_img.imgs.push_back({5, 9});
++        check(with_img.complete(), "S2 image fixture is complete");
++        check(st5.insert_tip(std::move(with_img), false), "S2 image tip stores");
++        saved::TipLookupSummary im;
++        st5.summarize_lookup(req_at(0, 120), no_imgs, true, 1, im);
++        check(im.matching == 0 && im.image_mismatch == 1 && im.prefix_mismatch == 0,
++              "S2 missing image mismatches on images, not prefix");
++        saved::TipLookupSummary im2;
++        st5.summarize_lookup(req_at(0, 120), std::vector<saved::ImgKey>{{5, 9}}, true, 1, im2);
++        check(im2.matching == 1 && im2.image_mismatch == 0, "S2 matching image hits");
++    }
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }
+-- 
+2.54.0.windows.1
+

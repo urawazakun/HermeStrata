@@ -1,6 +1,6 @@
 # HermeStrata
 
-A local agent stack for **one user, one GPU, one engine slot**:
+A local agent stack for **one user, one GPU, one serialized engine slot with multiple cached conversation lines**:
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) (planner/implementer agents, `delegate_task`) driving
 [Strata](https://github.com/Niko1221/Strata) (hybrid-attention MoE inference engine) serving Qwen3.8-Flash-Next
 IQ3_S at 262K context on a single **Tesla V100 16 GB** (Windows, CUDA 11.8, sm_70).
@@ -39,12 +39,16 @@ one line is the right trade-off. With 128 GB host RAM and an agent harness, seve
 | Strata server | fix a `KeyError` when two requests overlap (upstream 0.1.30 #212 pops the status tail at a request's end while another request is still writing it); found by running an agent and a second client at the same time | `0015` |
 | Strata | **tail resume**: a 40 KiB MTP boundary row on every conversation checkpoint and at each request's end, so a conversation resumes at its end. Live agent runs re-read 5-18K tokens per request before (once 149K after a mid-history edit); GPU acceptance: follow-up turns read only their 26 new tokens, a mutated middle message resumes from the newest checkpoint below it, an identical repeated 11.7K request 0.09 s (was 0.5 s) | `0016`-`0017` |
 | Strata server | prefix keeper diagnostics: timestamps, and for an unrepaired history mutation the first differing offset, a cause hint and short excerpts (JSONL only) | `0018` |
+| Strata server | vision embedding cache defaults to 400 files, configurable with `STRATA_VISION_CACHE`; prevents a many-image request from deleting embeddings it still needs | `0019` |
+| Strata | retain stable prompt-only tips alongside generation tips for alternating conversations; retention diagnostics and CPU regressions | `0020` |
+| Strata tests | alternating two-line GPU acceptance with an independent tokenizer/template oracle and a suffix + 256-token read bound | `0021` |
 | Hermes | fixed prefix discipline: git workspace snapshot moved to the volatile tail (`HERMES_WORKSPACE_LATE=1`), title generated after the turn (`HERMES_TITLE_AFTER_TURN=1`) | `patches/hermes-agent/0001` |
 | Hermes | `delegate_task` **fork mode**: a child starts from the parent's exact prompt (+ its tool call + a tool result carrying the task), so the engine resumes it from the parent's saved state; blocked tools and depth limit are refused at call time instead of being removed from `tools[]` | `patches/hermes-agent/0002` |
 | Hermes | **work deadline** tools (`set_work_deadline` / `finish_work`): "work until 18:00" keeps the agent going until the deadline; run budget stays the ceiling | `patches/hermes-agent/0003` (experimental) |
 | Hermes | fix a delegation **deadlock** (a finished child blocked in a process-wide telemetry flush while the parent waited for it); **`ask_document`** tool = cache-augmented reading: the document is a byte-stable system prefix, so the engine keeps it as a root on disk and the 2nd question on the same document skips re-reading it (live: 165 s -> 43 s end to end, 26K-token document) | `patches/hermes-agent/0004` |
 | Hermes | fork mode refactor: a `ForkContext` dataclass replaces the private attributes a fork child carried (behaviour-preserving; recorded first-request parity test); from a ChatGPT readability review | `patches/hermes-agent/0005` |
 | Hermes | `HERMES_KEEP_TOOL_IMAGES=int\|all` (default 3): Hermes rewrites all but the newest 3 screenshot tool results to a placeholder on every request, which changes old history bytes and breaks a local engine's cache (live: 149K tokens re-read after the 6th vision call). `all` keeps them byte-stable until compression; set in the flashnext launcher | `patches/hermes-agent/0006` |
+| Hermes | opt-in `HERMES_THINK_MODE=adaptive`: loopback custom/local Chat Completions requests think OFF by default; `think_harder` enables 1–5 subsequent calls with configured effort. `HERMES_MAX_OUTPUT_TOKENS` bounds output (default 16384); lower explicit caps survive, invalid/nonpositive competing caps are bounded | `patches/hermes-agent/0007` |
 
 Design: [docs/DESIGN.md](docs/DESIGN.md). How the fixes were found: [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 Acceptance ledger: [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Live Hermes runs and what they exposed: [docs/LIVE-HERMES.md](docs/LIVE-HERMES.md).
@@ -81,7 +85,7 @@ Later the same day the readability refactor (`0010`-`0014`) passed the same GPU 
 ## Layout
 
 ```
-patches/strata/         18 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
+patches/strata/         21 patches on Niko1221/Strata v0.1.30 (30ec18ec...), one per concern
 patches/strata-0.1.21/  the earlier 17-patch series on 0.1.21 (history)
 patches/hermes-agent/   git format-patch against the Hermes Agent snapshot used by this project
 docs/                   design, fix history, acceptance ledger
@@ -102,9 +106,20 @@ the patches were generated from.
 The Strata series is pinned to upstream tag v0.1.30 (`30ec18ec7094550fcc594fd948220d511d80464e`); scripts/materialize.ps1 rebuilds exactly the tree production runs (tree hash checked). Do not assume the series applies
 cleanly to current Strata `main`; upstream has moved since this snapshot.
 
-The Hermes patches likewise carry their exact preimage blob IDs in the format-patch headers, but this repository
-does not currently record a single upstream commit SHA for that snapshot. Treat a rebase onto current Hermes Agent
-as a separate compatibility task rather than silently applying with rejects.
+The Hermes series is pinned to `d5aaaa4a`, as recorded in `scripts/materialize.ps1`. Both reconstructed source
+trees are checked against the reviewed source commits. Treat a rebase onto current Hermes Agent as a separate
+compatibility task rather than silently applying with rejects.
+
+## 2026-10-02 maintenance
+
+The combined vision-cache and two-lines candidate passed one isolated GPU acceptance repetition: 12/12 measured
+requests, ten warm follow-ups within the same-line suffix + 256-token bound. It is deployed locally. This measures
+cache retention, not general answer quality or token parity. CPU: 14 C++ tests passed, one AVX-512-only test skipped;
+51 frontend tail tests passed. See [the acceptance ledger](docs/ACCEPTANCE.md) for the lifecycle failure and recovery.
+
+Adaptive thinking passed 86 policy/integration tests plus 74 prompt/provider/tool-cache regressions, all offline.
+It is opt-in source functionality; no profile or launcher switch was changed. GPU performance for this mode is
+unmeasured. Patch preparation stops before pushing.
 
 ## Credits
 

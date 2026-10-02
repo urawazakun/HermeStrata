@@ -63,3 +63,69 @@ resumes from the newest checkpoint below the change (read 51) instead of the roo
 passing: root/aux (root-disk after restart, then root 18-20 tokens read), parent/isolated/fork with planted-fact
 recall 3/3, Japanese, needle in 39K 3/3. Bench: identical repeated 11.7K request 0.09 s prompt time (was 0.48-0.56 s),
 8K-doc decode 28.5 tok/s. Deployed to local production.
+
+## 2026-10-02 vision-cache and alternating two-lines (0019–0021)
+
+Combined source `70a8dde47633daeb59bd9e442e43fb9ed712f09f` includes vision-cache `bc4f905` and two-lines
+`b0f5867`/`1022d45`. Tree `7a1709cffd3f2f5fbe012a5aee6ab945a2e90b13`; accepted exe SHA256
+`b4ee50f098f06febf2395c4269c426c9550a3262087d679ba3d8d5e9685dc26`. Settings as above; isolated port 18101,
+`--tip-cache-gib 8 --no-root-disk --conversation-cache-mib 0`. One cached repetition, 12/12 measured requests PASS.
+The oracle renders the actual request through the pack tokenizer/template and compares each follow-up against
+the previous prompt on the same line. Every warm read must be <= same-line suffix + 256 tokens; metric identities
+and role shapes must agree. Token parity is excluded. A synthetic assistant/tool continuation is used on line A
+when necessary; this tests retention rather than a live agent's quality.
+
+| Cycle | A prompt | A read | A suffix bound before +256 | B prompt | B read | B suffix bound before +256 |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 (cold) | 29083 | 29083 | — | 14772 | 14772 | — |
+| 1 | 30920 | 1773 | 1837 | 14871 | 35 | 99 |
+| 2 | 33014 | 2030 | 2094 | 14969 | 34 | 98 |
+| 3 | 35342 | 2264 | 2328 | 15032 | 97 | 63 |
+| 4 | 37918 | 2512 | 2576 | 15085 | 150 | 53 |
+| 5 | 40739 | 2757 | 2821 | 15120 | 185 | 35 |
+
+All ten warm requests resumed from tips. B's later reads exceed its newest suffix but stay within the fixed
+tolerance; these results do not claim exact-tail reuse on every return. Sanitized metrics:
+[twolines-20261002.json](evidence/twolines-20261002.json).
+
+CPU: 14 C++ tests passed, one AVX-512-only test skipped on this host; frontend tail suite 51 passed. Other
+vector-only paths were not exercised. Vision-cache changes are a bounded file-retention correction; no new
+many-image live acceptance or broader vision redesign is claimed.
+
+Initial lifecycle FAIL: unchecked `taskkill` returned unsuccessfully while the harness discarded its PID marker.
+The test engine stayed resident; production reload failed to allocate its arena. A scratch native child probe
+confirmed `taskkill` is denied in the coordinator environment. Sol unloaded the test engine via
+its supported API, stopped the exact owned dev server, and restored prior production before promotion. The driver
+now unloads the engine and terminates its own server through the retained process handle. Stale-marker taskkill
+and process-query failures are checked; markers survive uncertain cleanup, and cleanup failures fail acceptance.
+Twelve cleanup tests passed offline, including an actual scratch native child with mocked HTTP and no GPU.
+Numerical
+12/12 results remain valid. The accepted candidate replaced production, with the prior exe renamed aside and a
+VERSION note. Serving Python/templates were identical to prior production, so supported unload/load restarted
+the engine using the existing standard command; the canonical launcher health check passed. No launcher,
+projection, profile, driver or GPU settings changed.
+
+Attribution: origin owner / maintenance plan Sol / integration Muse-2 / GPU, recovery, deployment and review Sol.
+Original two-lines implementation Muse-1 and acceptance Muse-2; original vision fix Muse with Claude planning.
+
+## 2026-10-02 adaptive thinking (Hermes 0007, offline)
+
+86 adaptive policy/request-builder/tool tests and 74 prompt/provider/tool-cache regressions passed via the
+canonical isolated test runner (160 total). A new competing-cap regression failed on the old clamp and passed
+after correction: negative/invalid completion limits can no longer bypass the adaptive ceiling while a lower
+explicit `max_tokens` is preserved. Stored overrides and stable system prompts remain unchanged across thinking
+transitions. Default mode, remote endpoints and other providers remain outside the adaptive request policy.
+No live model quality, throughput improvement or runtime profile activation is claimed.
+
+Reviewed source commit `9e67b7d90f197ba6f9062558daf2ff87ea39e49a`, tree
+`a5fad0f21b12427250d558bbb23ffec6fda6f6ae`, prepared in an independent workspace clone because the original
+development worktree's Git metadata is outside the coordinator's writable roots. Original branch import is an
+owner-session handoff; public patch content is the validated source, not a claim that that branch was advanced.
+Origin owner / initial plan Claude / initial implementation Muse-1 / maintenance cap correction and review Sol.
+
+Patch reconstruction: `scripts/materialize.ps1` applied all 21 Strata patches on `30ec18ec` and all seven Hermes
+patches on `d5aaaa4a`, producing the two exact tree hashes above. Archived patch context lines produce whitespace
+warnings during application; content and resulting trees match. The runtime driver includes the previously
+unpublished tail oracle plus two-lines and checked cleanup. Its numerical functions match the reviewed local
+driver; public defaults use a portable root and production 0.1.30. Running acceptance still requires the local
+model pack, runtime config and the existing request fixture under `<root>/briefs/dumps-growing-lcp/bisect-body.json`.

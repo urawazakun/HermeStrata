@@ -1,0 +1,603 @@
+From a79c7e1901d94e99e70c4aa05e1aa3e858311a2f Mon Sep 17 00:00:00 2001
+From: Muse <30615262+urawazakun@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 14:54:58 +0900
+Subject: [PATCH 21/21] Test: archive alternating two-line acceptance case
+
+Public form of 1022d45. Origin user two-lines brief; acceptance implemented Muse-2, reviewed Sol. Numerical GPU acceptance 12/12 passed on the combined candidate; runtime driver cleanup correction is documented separately.
+---
+ serve/twolines_accept_cache.patch | 583 ++++++++++++++++++++++++++++++
+ 1 file changed, 583 insertions(+)
+ create mode 100644 serve/twolines_accept_cache.patch
+
+diff --git a/serve/twolines_accept_cache.patch b/serve/twolines_accept_cache.patch
+new file mode 100644
+index 0000000..7a2d4ba
+--- /dev/null
++++ b/serve/twolines_accept_cache.patch
+@@ -0,0 +1,583 @@
++diff --git a/scripts/accept_cache.py b/scripts/accept_cache.py
++index e361964..b8cc130 100644
++--- a/scripts/accept_cache.py
+++++ b/scripts/accept_cache.py
++@@ -849,9 +849,556 @@ def case_tail(eng, rep):
++     return out
++ 
++ 
+++# --- twolines acceptance (Muse-2; ADDITIONS only, existing cases untouched) ---
+++# Two alternating conversations (agent line A + chat line B) on one engine. Brief:
+++# briefs/BRIEF-TWO-LINES.md. GPU run: --variant cached only, isolated dev engine on
+++# 18101 (never strata-prod*, deploy-strata, or port 18100).
+++# Runner overrides for the two-lines engine worktree (Muse-1 branch `two-lines`):
+++#   ACCEPT_EXE=<worktree>\build-strata-030\strata.exe ACCEPT_SRC=<worktree>\strata-030
+++# (the code below only reads the existing ACCEPT_EXE/ACCEPT_SRC selection; nothing hardcoded.)
+++#
+++# Oracle (independent, faithful-local, CPU): every actually-sent body is re-rendered
+++# with the same openai_to_messages + pack template + pack tokenizer the server uses
+++# (tail_render_ids/tail_load_faithful; no GPU/server). Per line, the suffix is
+++# measured ONLY against the previous SAME-line prompt: exp_L = LCP(prev,cur) with
+++# the previous stable last-im_start boundary required at or below it
+++# (tail_expected_reuse, reused unchanged); exp_suffix = len(cur)-exp_L. Pass needs
+++# read <= exp_suffix+TWOLINES_TOL (fixed 256: a 28K re-read can never hide in it)
+++# plus shared metric validation (prompt==len(ids), reused==k, read==prompt-k,
+++# suffix==read, non-bool non-negative ints, 0<=k<prompt, explicit known source).
+++# No k<=L upper bound: a verified longer generation tip (past the previous raw
+++# prompt length) legitimately reads LESS. Any resume source (tip/chain/root) is
+++# accepted inside the read bound (tips expected after alternation); missing/wrong
+++# records fail, never silent-pass. Follow-up expectations are computed BEFORE the
+++# request from the actually-to-be-sent body; an inconsistent same-line
+++# boundary/LCP fails setup before eng.req.
+++# Histories use only text-level transcripts: the actual returned assistant message
+++# (content + tool_calls + reasoning_content preserved) plus deterministic tool
+++# results; raw generated token ids are never manufactured as history. When the
+++# engine emits no tool_calls on line A, the actual response is kept and ONE explicit
+++# synthetic assistant tool_call + matching tool result is appended (flagged
+++# synth_toolcall) so every A prompt stays agent-shaped and ends with a tool result,
+++# like the Hermes line in production.
+++TWOLINES_TOL = 256
+++TWOLINES_CYCLES = 6
+++TWOLINES_MAX_TOKENS = 64
+++TWOLINES_A_LO, TWOLINES_A_HI = 28000, 32000        # A first prompt band (~30K)
+++TWOLINES_B_LO, TWOLINES_B_HI = 14000, 16000        # B first prompt band (~15K)
+++# Isolation, appended LAST so its options win. Tips ON (8 GiB LRU) because the fix
+++# under test is tip capture/restore across lines; root disk OFF (no cross-run
+++# roots); chain 16 / root-threshold 1024 / periodic 4096; prefill chunk 2048 +
+++# short-read 64 (same as tail so window behaviour is comparable). The upstream
+++# conversation parking cache is OPT-IN (generate.cpp: conversation_cache_mib
+++# default 0 = off, documented in usage; mutually exclusive with SavedState
+++# capture/restore) and is passed as --conversation-cache-mib 0 explicitly so an
+++# inherited/opted-in parking configuration can never mask this case.
+++TWOLINES_ISOLATION = ["--tip-cache-gib", "8", "--no-root-disk", "--prompt-cache", "16",
+++                      "--prompt-cache-root", "1024", "--prompt-cache-every", "4096",
+++                      "--prefill", "2048", "--short-read", "64",
+++                      "--conversation-cache-mib", "0"]
+++TWOLINES_SEED_N = 8             # synthetic tool exchanges seeding A before cycle 0
+++TWOLINES_TOOL = "read_file"     # must exist in BODY tools (proven in setup)
+++TWOLINES_B_SYS = "You are a helpful assistant answering briefly."
+++TWOLINES_B_FOLLOW = ["Noted. And the oldest pending bin?",
+++                     "Understood. Flag any overdue inspections.",
+++                     "Got it. Summarize the totals in one line.",
+++                     "Clear. Which bin needs attention first?",
+++                     "Thanks. Close with the final counts."]
+++_TWOLINES_PREV = {}             # rep -> {"A": ids, "B": ids} cross-rep guard (CPU-only)
+++
+++
+++def twolines_filler(n_sec, seed):
+++    import random as _rnd
+++    rnd = _rnd.Random(seed)
+++    return "\n".join(
+++        f"Ledger entry {i}: bin {rnd.randint(1, 999)} holds {rnd.randint(1, 99)} crates, inspected day {rnd.randint(1, 28)}."
+++        for i in range(n_sec))
+++
+++
+++def twolines_b_body(messages, max_tokens=TWOLINES_MAX_TOKENS):
+++    """B-only body: plain chat (no tools), reasoning low like tail_body_with."""
+++    b = body_with(messages, max_tokens, system=TWOLINES_B_SYS, tools=False)
+++    b["reasoning_effort"] = "low"
+++    eb = b.get("extra_body")
+++    if isinstance(eb, dict):
+++        ctk = eb.get("chat_template_kwargs")
+++        if isinstance(ctk, dict):
+++            ctk["reasoning_effort"] = "low"
+++    return b
+++
+++
+++def twolines_assistant_of(msg):
+++    """History append: the ACTUAL returned message (never manufactured token ids)."""
+++    a = {"role": "assistant", "content": msg.get("content") or ""}
+++    if msg.get("reasoning_content"):
+++        a["reasoning_content"] = msg["reasoning_content"]
+++    if msg.get("tool_calls"):
+++        a["tool_calls"] = msg["tool_calls"]
+++    return a
+++
+++
+++def twolines_seed_messages(rep, marker, per_result):
+++    msgs = []
+++    for i in range(TWOLINES_SEED_N):
+++        cid = f"call_A_seed_r{rep}_{i}"
+++        msgs.append({"role": "assistant", "content": "", "tool_calls": [
+++            {"id": cid, "type": "function", "function": {"name": TWOLINES_TOOL,
+++             "arguments": json.dumps({"path": f"seed-{rep}-{i}.log"})}}]})
+++        head = f"[TWOLINES r{rep} lineA seed {marker}.] " if i == 0 else ""
+++        msgs.append({"role": "tool", "tool_call_id": cid,
+++                     "content": head + twolines_filler(per_result, 9000 + rep * 1000 + 10 + i)})
+++    return msgs
+++
+++
+++def twolines_a0_msgs(rep, marker, per_result):
+++    msgs = [{"role": "user", "content": f"(TWOLINES r{rep} lineA cyc0 {marker}.) Begin the warehouse audit: list the first pending crate briefly."}]
+++    msgs += twolines_seed_messages(rep, marker, per_result)
+++    return msgs
+++
+++
+++def twolines_a0_body(rep, marker, per_result):
+++    return tail_body_with(twolines_a0_msgs(rep, marker, per_result), TWOLINES_MAX_TOKENS)
+++
+++
+++def twolines_b0_msgs(rep, marker, n_sec):
+++    u = f"(TWOLINES r{rep} lineB {marker}.) Summarize this ledger in two lines.\n" + twolines_filler(n_sec, 9000 + rep * 1000 + 30)
+++    return [{"role": "user", "content": u}]
+++
+++
+++def twolines_b0_body(rep, marker, n_sec):
+++    return twolines_b_body(twolines_b0_msgs(rep, marker, n_sec), TWOLINES_MAX_TOKENS)
+++
+++
+++def twolines_a_next(prev_msgs, m, rep, marker, cyc):
+++    """Advance line A: actual assistant message + tool result(s); prompt ends role tool.
+++
+++    The next audit instruction rides inside the first tool result (never a trailing
+++    user message), so every sent A body ends with role tool like the Hermes line."""
+++    nxt = list(prev_msgs) + [twolines_assistant_of(m)]
+++    calls = (m.get("tool_calls") or [])
+++    synth = False
+++    if not calls:
+++        synth = True
+++        cid = f"call_A_synth_r{rep}_{cyc}"
+++        nxt.append({"role": "assistant", "content": "", "tool_calls": [
+++            {"id": cid, "type": "function", "function": {"name": TWOLINES_TOOL,
+++             "arguments": json.dumps({"path": f"synth-{rep}-{cyc}.log"})}}]})
+++        calls = [{"id": cid}]
+++    instr = f"(TWOLINES r{rep} lineA cyc{cyc + 1}.) Next audit step: confirm briefly.\n"
+++    for j, c in enumerate(calls):
+++        cid = c.get("id") or f"call_A_r{rep}_{cyc}_{j}"
+++        nsec = 70 + 10 * cyc if j == 0 else 0  # growth budget on the first result only
+++        content = instr + twolines_filler(nsec, 9000 + rep * 1000 + 20 + cyc) if j == 0 else "ok"
+++        nxt.append({"role": "tool", "tool_call_id": cid, "content": content})
+++    return nxt, synth, len(calls)
+++
+++
+++def twolines_b_next(prev_msgs, m, rep, cyc):
+++    nxt = list(prev_msgs) + [twolines_assistant_of(m)]
+++    nxt.append({"role": "user", "content": f"(TWOLINES r{rep} lineB cyc{cyc + 1}.) {TWOLINES_B_FOLLOW[cyc]}"})
+++    return nxt
+++
+++
+++# Engine resume sources this case accepts: the exact generate.cpp enum strings
+++# (none = cold start, e.g. `resume from none at 0`; chain/tip/root; root-disk is an
+++# admitted metric though this case's isolation disables disk). Anything else fails.
+++TWOLINES_SOURCES = ("none", "chain", "tip", "root", "root-disk")
+++TWOLINES_A_END_LO, TWOLINES_A_END_HI = 38000, 44000  # synthetic full-growth A band (~40K)
+++
+++
+++def twolines_check_shape(msgs, line):
+++    """Transcript-shape gate, enforced before EVERY sent body (both lines, both
+++    tool-call branches): A ends role tool with every tool_call_id matching an
+++    assistant call; B holds only plain user/assistant roles."""
+++    if not msgs:
+++        return False, "empty history"
+++    if line == "A":
+++        if msgs[-1].get("role") != "tool":
+++            return False, f"A must end role tool, ends {msgs[-1].get('role')!r}"
+++        call_ids = set()
+++        for x in msgs:
+++            for t in (x.get("tool_calls") or []):
+++                i = t.get("id")
+++                if i:
+++                    call_ids.add(i)
+++        for x in msgs:
+++            if x.get("role") == "tool" and x.get("tool_call_id") not in call_ids:
+++                return False, f"tool result {x.get('tool_call_id')!r} matches no assistant call"
+++        return True, "A ends tool, call ids match"
+++    for x in msgs:
+++        if x.get("role") not in ("user", "assistant"):
+++            return False, f"B has non-plain role {x.get('role')!r}"
+++        if x.get("tool_calls") or x.get("role") == "tool":
+++            return False, "B must stay plain user/assistant"
+++    return True, "B plain user/assistant"
+++
+++
+++def twolines_synth_final_a(rep, marker, a_per):
+++    """Synthetic full-growth A body (placeholder assistant tool turns, no engine
+++    needed) so preflight proves the ~40K final by rendering, not by guessing."""
+++    msgs = twolines_a0_msgs(rep, marker, a_per)
+++    for cyc in range(TWOLINES_CYCLES - 1):
+++        m = {"content": "ok", "reasoning_content": "ok",
+++             "tool_calls": [{"id": f"call_A_grow_r{rep}_{cyc}", "type": "function",
+++                             "function": {"name": TWOLINES_TOOL, "arguments": json.dumps({"path": f"grow-{rep}-{cyc}.log"})}}]}
+++        msgs, _, _ = twolines_a_next(msgs, m, rep, marker, cyc)
+++    return tail_body_with(msgs, TWOLINES_MAX_TOKENS)
+++
+++
+++def twolines_check_metrics(rec, ids_len):
+++    """Defensive engine-metric validation shared by initial + follow-up checks:
+++    every metric present, non-bool non-negative ints, tail counts, suffix==read,
+++    0<=k<prompt, explicit known source. Never silent-pass."""
+++    for k in ("prompt", "reused", "read", "k", "suffix"):
+++        if rec.get(k) is None:
+++            return False, f"missing metric: {k}"
+++    for k in ("prompt", "reused", "read", "k", "suffix"):
+++        if not tail_is_int(rec[k]) or rec[k] < 0:
+++            return False, f"bad metric {k}={rec[k]!r} (need non-negative int)"
+++    ok, why = tail_check_counts(rec, ids_len)
+++    if not ok:
+++        return False, why
+++    if rec["suffix"] != rec["read"]:
+++        return False, f"suffix={rec['suffix']} != read={rec['read']}"
+++    if not (0 <= rec["k"] < rec["prompt"]):
+++        return False, f"k={rec['k']} outside 0<=k<prompt={rec['prompt']}"
+++    src = rec.get("resume")
+++    if not src or src not in TWOLINES_SOURCES:
+++        return False, f"missing/unknown source resume={src!r} (need one of {TWOLINES_SOURCES})"
+++    return True, f"metrics consistent (source {src})"
+++
+++
+++def twolines_check_follow(rec, exp_L, exp_suffix, ids_len, exp_boundary=None, tol=TWOLINES_TOL):
+++    """Follow-up gate: shared metrics + validated same-line expectation +
+++    read<=suffix+tol. Any resume source is accepted inside the read bound. No
+++    k<=L upper bound: a verified longer generation tip (past the previous raw
+++    prompt length) legitimately reads LESS. Missing/bad metrics fail.
+++    (resume_lines presence is not required: tip diagnostics may bound it away.)"""
+++    ok, why = twolines_check_metrics(rec, ids_len)
+++    if not ok:
+++        return False, why
+++    for name, v in (("exp_L", exp_L), ("exp_suffix", exp_suffix)):
+++        if not tail_is_int(v) or v < 0:
+++            return False, f"bad expectation {name}={v!r}"
+++    if exp_suffix != ids_len - exp_L:
+++        return False, f"exp_suffix={exp_suffix} != ids_len-exp_L={ids_len - exp_L}"
+++    if exp_boundary is None or not tail_is_int(exp_boundary) or exp_boundary < 0:
+++        return False, f"missing/invalid stable boundary {exp_boundary!r}"
+++    if not (exp_boundary <= exp_L):
+++        return False, f"inconsistent expectation: boundary={exp_boundary} > LCP L={exp_L}"
+++    if rec["read"] > exp_suffix + tol:
+++        return False, f"read={rec['read']} > independent same-line suffix={exp_suffix}+{tol}"
+++    return True, f"read within same-line suffix+{tol} (source {rec.get('resume')})"
+++
+++
+++def twolines_calibrate(render, rep, marker):
+++    """Bounded deterministic sizing (CPU-only): B filler sections for ~15K, A seed
+++    per-result sections for ~30K first prompt. Returns (b_n, b_size, a_per, a_size, note)."""
+++    b_n, b_size, b_note = tail_find_sections(
+++        lambda n: len(render(twolines_b0_body(rep, marker, n))), TWOLINES_B_LO, TWOLINES_B_HI, 100, 1200)
+++    if b_note != "ok":
+++        return (b_n, b_size, 0, 0, f"B sizing unproven: {b_note} (size {b_size})")
+++    a_per, a_size, a_note = tail_find_sections(
+++        lambda p: len(render(twolines_a0_body(rep, marker, p))), TWOLINES_A_LO, TWOLINES_A_HI, 20, 200)
+++    if a_note != "ok":
+++        return (b_n, b_size, a_per, a_size, f"A sizing unproven: {a_note} (size {a_size})")
+++    return (b_n, b_size, a_per, a_size, "ok")
+++
+++
+++def twolines_preflight():
+++    """CPU-only sizing/setup validation BEFORE any server starts (no GPU here)."""
+++    faithful = tail_load_faithful()
+++    if not faithful.get("ok"):
+++        return {"ok": False, "reason": faithful.get("reason", "faithful unavailable")}
+++    tok, template, turn_id = faithful["tok"], faithful["template"], faithful["turn_id"]
+++
+++    def render(body):
+++        return tail_render_ids(body, template, tok)
+++
+++    try:
+++        ids0, _, tools0, _ = render(tail_body_with([{"role": "user", "content": "hi"}], TWOLINES_MAX_TOKENS))
+++    except Exception as e:
+++        return {"ok": False, "reason": f"agent base render failed: {e}"}
+++    names = [(t.get("name") if isinstance(t, dict) else t) for t in (tools0 or [])]
+++    if not tools0 or TWOLINES_TOOL not in names:
+++        return {"ok": False, "reason": f"tool shape unproven: {len(tools0 or [])} tools, need {TWOLINES_TOOL!r}"}
+++    if not (10500 <= len(ids0) <= 13000):
+++        return {"ok": False, "reason": f"agent base {len(ids0)} outside 10500..13000 (system+tool schema ~11.7K expected)"}
+++    if tail_last_turn(ids0, turn_id) is None:
+++        return {"ok": False, "reason": "agent base has no turn boundary"}
+++    b_n, b_size, a_per, a_size, note = twolines_calibrate(lambda b: render(b)[0], 0, "preflight")
+++    if note != "ok":
+++        return {"ok": False, "reason": note}
+++    try:
+++        a_final = len(render(twolines_synth_final_a(0, "preflight", a_per))[0])
+++    except Exception as e:
+++        return {"ok": False, "reason": f"synthetic final A render failed: {e}"}
+++    if not (TWOLINES_A_END_LO <= a_final <= TWOLINES_A_END_HI):
+++        return {"ok": False, "reason": f"synthetic final A {a_final} outside {TWOLINES_A_END_LO}..{TWOLINES_A_END_HI}"}
+++    return {"ok": True, "base": len(ids0), "n_tools": len(tools0), "b_n": b_n, "b_size": b_size,
+++            "a_per": a_per, "a_size": a_size, "a_final": a_final, "turn_id": turn_id,
+++            "detail": dict(faithful.get("detail") or {})}
+++
+++
+++class TwolinesEngine(Engine):
+++    """twolines-only request adapter. Identical HTTP behavior to Engine, but the
+++    post-DONE log wait polls (bounded) until the CURRENT request's metric pair
+++    arrives: positive-budget full tips flush AFTER DONE, and start()'s readiness
+++    probe also leaves a post-DONE pair, so the FIRST resume+prompt pair may be a
+++    stale probe's. Metrics are paired in log order (every resume line replaces
+++    the pending resume; the next prompt line completes that pair) and only a
+++    pair whose prompt length equals the independently rendered expect_prompt is
+++    accepted; resume from one request is never combined with prompt from
+++    another. Missing/mismatched metrics by the deadline fail explicitly with the
+++    seen pairs kept as evidence; counts are never fabricated and no next request
+++    starts with incomplete metrics. Existing Engine.req is untouched for old
+++    cases. Port is always the isolated dev 18101 (URL); only text metrics are
+++    read, no GPU work here."""
+++
+++    WAIT_S = 60.0
+++    POLL_S = 0.5
+++
+++    def req(self, body, tag, expect_prompt=None, _send=None, _now=None, _sleep=None, _deadline=None, _poll=None):
+++        import time as _time
+++        now = _now or _time.monotonic
+++        sleep = _sleep or _time.sleep
+++        deadline_s = self.WAIT_S if _deadline is None else _deadline
+++        poll_s = self.POLL_S if _poll is None else _poll
+++        self.skip()
+++        t0 = now()
+++        if _send is None:
+++            r = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+++            resp = json.load(urllib.request.urlopen(r, timeout=1800))
+++        else:
+++            resp = _send(body)
+++        wall = now() - t0
+++        rec = {"tag": tag, "wall_s": round(wall, 2)}
+++        if expect_prompt is not None:
+++            rec["expect_prompt"] = expect_prompt
+++        lines, pairs = [], []
+++        pend, saw_prompt_line, accepted = None, False, None
+++        end = now() + deadline_s
+++        while accepted is None:
+++            for l in self.new_lines():
+++                lines.append(l)
+++                mr = tail_parse_resume(l)
+++                if mr:
+++                    pend = mr  # latest resume replaces pending; paired by the next prompt line
+++                mp = tail_parse_prompt(l)
+++                if mp:
+++                    saw_prompt_line = True
+++                    if pend is not None:
+++                        pairs.append((pend, mp))
+++                        if (expect_prompt is None or mp["prompt"] == expect_prompt) and accepted is None:
+++                            accepted = (pend, mp)
+++                        pend = None
+++            if accepted is not None:
+++                break
+++            if now() >= end:
+++                break
+++            sleep(poll_s)
+++        rec["wait_s"] = round(now() - t0, 2)
+++        rec["seen_pairs"] = [{"resume": r["resume"], "k": r["k"], "suffix": r["suffix"],
+++                              "prompt": p["prompt"], "reused": p["reused"], "read": p["read"]} for r, p in pairs]
+++        if pend is not None:
+++            rec["pending_resume"] = {"resume": pend["resume"], "k": pend["k"], "suffix": pend["suffix"]}
+++        if accepted is not None:
+++            mr, mp = accepted
+++            rec.update(resume=mr["resume"], k=mr["k"], suffix=mr["suffix"], restore_ms=mr["restore_ms"])
+++            if "snapshot_ms" in mr:
+++                rec["snapshot_ms"] = mr["snapshot_ms"]
+++            rec.update(prompt=mp["prompt"], reused=mp["reused"], read=mp["read"], prefill_ms=mp["prefill_ms"],
+++                       gen=mp["gen"], tok_s=mp["tok_s"])
+++        elif expect_prompt is None:
+++            missing = "+".join([s for s, h in (("resume", pend is not None or bool(pairs)),
+++                                                ("prompt", saw_prompt_line)) if not h])
+++            rec["timeout"] = f"missing {missing} metrics after {deadline_s}s"
+++        else:
+++            rec["timeout"] = (f"no pair with prompt {expect_prompt} after {deadline_s}s "
+++                              f"({len(pairs)} other pair(s), pending={pend is not None})")
+++        rec["resume_lines"] = [l[:220] for l in lines if "resume" in l or "tip" in l.lower() or "root" in l.lower()][-6:]
+++        rec["ckpt_lines"] = [l[:220] for l in lines
+++                             if re.search(r"resume from chain at \d+ \(checkpoint row\)", l)]
+++        msg = resp["choices"][0]["message"]
+++        rec["answer"] = (msg.get("content") or "")[:120]
+++        print(json.dumps({k: v for k, v in rec.items() if k != "resume_lines"}, ensure_ascii=False), flush=True)
+++        return rec, msg
+++
+++
+++def case_twolines(eng, rep):
+++    import time as _time
+++    out = []
+++    faithful = tail_load_faithful()
+++    if not faithful.get("ok"):
+++        r = {"tag": f"twolines.r{rep}.faithful", "pass": False,
+++             "expect": "faithful pack tokenizer+template required for independent oracle",
+++             "reason": faithful.get("reason", "faithful unavailable")}
+++        print(json.dumps(r, ensure_ascii=False), flush=True)
+++        return [r]
+++    tok, template, turn_id = faithful["tok"], faithful["template"], faithful["turn_id"]
+++    tok_detail = dict(faithful.get("detail") or {})
+++
+++    def render(body):
+++        ids, _, _, _ = tail_render_ids(body, template, tok)
+++        return ids
+++
+++    def fail(rec):
+++        # Preserve earlier measured records: append, never discard out.
+++        print(json.dumps({k: v for k, v in rec.items() if k not in ("resume_lines", "ckpt_lines")}, ensure_ascii=False), flush=True)
+++        out.append(rec)
+++        return out
+++
+++    marker = f"{rep}-{_time.time_ns() % 1000000:06d}"
+++
+++    b_n, b_size, a_per, a_size, note = twolines_calibrate(render, rep, marker)
+++    if note != "ok":
+++        return fail({"tag": f"twolines.r{rep}.setup", "pass": False, "marker": marker,
+++                     "b_n": b_n, "b_size": b_size, "a_per": a_per, "a_size": a_size,
+++                     "isolation": TWOLINES_ISOLATION, "tok_detail": tok_detail,
+++                     "expect": f"faithful A first {TWOLINES_A_LO}..{TWOLINES_A_HI}, B first {TWOLINES_B_LO}..{TWOLINES_B_HI} before any GPU request",
+++                     "reason": note})
+++    try:
+++        a0_ids, _, a0_tools, _ = tail_render_ids(twolines_a0_body(rep, marker, a_per), template, tok)
+++    except Exception as e:
+++        return fail({"tag": f"twolines.r{rep}.setup", "pass": False, "marker": marker,
+++                     "reason": f"A0 agent render failed (tool shape unproven): {e}"})
+++    names = [(t.get("name") if isinstance(t, dict) else t) for t in (a0_tools or [])]
+++    if TWOLINES_TOOL not in names:
+++        return fail({"tag": f"twolines.r{rep}.setup", "pass": False, "marker": marker,
+++                     "reason": f"A0 tool shape unproven: need {TWOLINES_TOOL!r} in {len(a0_tools or [])} tools"})
+++    b0_body = twolines_b0_body(rep, marker, b_n)
+++    b0_ids = render(b0_body)
+++    if not (TWOLINES_A_LO <= len(a0_ids) <= TWOLINES_A_HI) or not (TWOLINES_B_LO <= len(b0_ids) <= TWOLINES_B_HI):
+++        return fail({"tag": f"twolines.r{rep}.setup", "pass": False, "marker": marker,
+++                     "a0": len(a0_ids), "b0": len(b0_ids),
+++                     "reason": f"re-measure outside bands A {TWOLINES_A_LO}..{TWOLINES_A_HI} / B {TWOLINES_B_LO}..{TWOLINES_B_HI}"})
+++    boundA0, boundB0 = tail_last_turn(a0_ids, turn_id), tail_last_turn(b0_ids, turn_id)
+++    if boundA0 is None or boundB0 is None:
+++        return fail({"tag": f"twolines.r{rep}.setup", "pass": False, "marker": marker,
+++                     "reason": f"missing stable turn boundary A={boundA0} B={boundB0}"})
+++    crossA = crossB = None
+++    for pr, pp in _TWOLINES_PREV.items():
+++        for line, cur_ids, cur_bound in (("A", a0_ids, boundA0), ("B", b0_ids, boundB0)):
+++            xc = tail_lcp(pp[line], cur_ids)
+++            if line == "A":
+++                crossA = xc if crossA is None or xc > crossA else crossA
+++            else:
+++                crossB = xc if crossB is None or xc > crossB else crossB
+++            if xc >= cur_bound:
+++                return fail({"tag": f"twolines.r{rep}.setup", "pass": False, "marker": marker,
+++                             "reason": f"cross-rep LCP {xc} >= {line} boundary {cur_bound}: marker not unique/early"})
+++    _TWOLINES_PREV[rep] = {"A": list(a0_ids), "B": list(b0_ids)}
+++
+++    prev = {"A": {"msgs": twolines_a0_msgs(rep, marker, a_per), "ids": a0_ids,
+++                  "root": tail_genuine_root(a0_ids, turn_id), "synth": False, "ncalls": 0, "kept": False},
+++            "B": {"msgs": twolines_b0_msgs(rep, marker, b_n), "ids": b0_ids,
+++                  "root": tail_genuine_root(b0_ids, turn_id), "synth": False, "ncalls": 0, "kept": False}}
+++    for cyc in range(TWOLINES_CYCLES):
+++        for line in ("A", "B"):
+++            st = prev[line]
+++            ok, why = twolines_check_shape(st["msgs"], line)
+++            if not ok:
+++                return fail({"tag": f"twolines.r{rep}.{line}{cyc}.shape", "pass": False, "marker": marker,
+++                             "reason": f"transcript shape unproven before request: {why}"})
+++            body = tail_body_with(st["msgs"], TWOLINES_MAX_TOKENS) if line == "A" else twolines_b_body(st["msgs"], TWOLINES_MAX_TOKENS)
+++            try:
+++                cur_ids = render(body)
+++            except Exception as e:
+++                return fail({"tag": f"twolines.r{rep}.{line}{cyc}.render", "pass": False, "marker": marker,
+++                             "prev_len": len(st["ids"]),
+++                             "reason": f"faithful render failed before request: {e}"})
+++            exp = None
+++            if cyc > 0:
+++                exp = tail_expected_reuse(st["ids"], cur_ids, turn_id)
+++                if not (tail_is_int(exp["L"]) and exp["L"] >= 0 and tail_is_int(exp["suffix"])
+++                        and exp["suffix"] == len(cur_ids) - exp["L"] and exp.get("consistent")
+++                        and exp["boundary"] is not None and tail_is_int(exp["boundary"]) and exp["boundary"] >= 0):
+++                    return fail({"tag": f"twolines.r{rep}.{line}{cyc}.setup", "pass": False, "marker": marker,
+++                                 "prev_len": len(st["ids"]), "prompt_ids": len(cur_ids),
+++                                 "exp_L": exp["L"], "exp_suffix": exp["suffix"], "method": exp["method"],
+++                                 "boundary": exp["boundary"], "lcp": exp["lcp"],
+++                                 "expect": f"same-line suffix bound (+{TWOLINES_TOL})",
+++                                 "reason": f"inconsistent same-line boundary/LCP before request: boundary={exp['boundary']} L={exp['L']}"})
+++            tag = f"twolines.r{rep}.{line}{cyc}"
+++            try:
+++                r, m = eng.req(body, tag, expect_prompt=len(cur_ids))
+++            except Exception as e:
+++                return fail({"tag": tag, "line": line, "cyc": cyc, "pass": False, "marker": marker,
+++                             "prev_len": len(st["ids"]),
+++                             "isolation": TWOLINES_ISOLATION, "turn_id": turn_id,
+++                             "reason": f"request failed: {e}"})
+++            base = {"tag": tag, "line": line, "cyc": cyc, "prompt_ids": len(cur_ids),
+++                    "prev_len": len(st["ids"]), "source": r.get("resume"), "shape": "ok",
+++                    "used_synth": st["synth"], "used_ncalls": st["ncalls"], "kept_reasoning": st["kept"],
+++                    "cross_rep_lcp": crossA if line == "A" else crossB,
+++                    "isolation": TWOLINES_ISOLATION, "turn_id": turn_id, "tok_detail": tok_detail}
+++            if cyc == 0:
+++                okc, whyc = twolines_check_metrics(r, len(cur_ids))
+++                fresh, root = r.get("k"), st["root"]
+++                fresh_ok = okc and ((fresh == 0) or (root is not None and fresh == root))
+++                r.update(base, expect="cold/setup exempt (metrics+source+fresh only)")
+++                r["pass"] = bool(okc and fresh_ok)
+++                r["reason"] = ("metrics ok; " if okc else f"metrics: {whyc}; ") + (f"fresh k={fresh} (root {root})" if fresh_ok else f"k1={fresh} not in (0, root {root})")
+++            else:
+++                ok, why = twolines_check_follow(r, exp["L"], exp["suffix"], len(cur_ids), exp["boundary"])
+++                r.update(base, exp_L=exp["L"], exp_suffix=exp["suffix"], method=exp["method"],
+++                         boundary=exp["boundary"], lcp=exp["lcp"], prompt_ids=len(cur_ids),
+++                         expect=f"read<=same-line suffix+{TWOLINES_TOL} ({exp['method']})")
+++                r["pass"], r["reason"] = bool(ok), why
+++            print(json.dumps({k: v for k, v in r.items() if k not in ("resume_lines", "ckpt_lines")}, ensure_ascii=False), flush=True)
+++            out.append(r)
+++            if not r["pass"]:
+++                return out
+++            if cyc + 1 >= TWOLINES_CYCLES:
+++                continue  # last cycle per line: no next history to build
+++            kept = bool((m.get("reasoning_content") or "").strip())
+++            if line == "A":
+++                nxt, synth, ncalls = twolines_a_next(st["msgs"], m, rep, marker, cyc)
+++                st.update(msgs=nxt, ids=cur_ids, synth=synth, ncalls=ncalls, kept=kept)
+++            else:
+++                st.update(msgs=twolines_b_next(st["msgs"], m, rep, cyc), ids=cur_ids, kept=kept)
+++    return out
+++
+++
+++def run_twolines(a, extra):
+++    """Dedicated twolines runner: start + TwolinesEngine creation + all reps run
+++    UNDER one try/finally stop, so even a startup failure stops the server.
+++    JSONL is always persisted; exit is nonzero unless every record passes (empty
+++    means failure too). Existing cases are untouched by this branch."""
+++    res = []
+++    err = None
+++    try:
+++        log = start(a.variant, extra)
+++        eng = TwolinesEngine(log)
+++        for rep in range(a.reps):
+++            res += case_twolines(eng, rep)
+++    except SystemExit as e:
+++        # start() signals startup failure via sys.exit: cleanup still runs, persist explicit failure
+++        err = f"runner startup failed (exit {e.code})"
+++    except Exception as e:
+++        err = f"runner failed: {e}"
+++    finally:
+++        stop()
+++    if err is not None:
+++        r = {"tag": "twolines.runner", "pass": False, "variant": a.variant, "reason": err}
+++        print(json.dumps(r, ensure_ascii=False), flush=True)
+++        res.append(r)
+++    want = 12 * a.reps
+++    if err is None and all(r.get("pass") for r in res) and len(res) != want:
+++        r = {"tag": "twolines.count", "pass": False, "variant": a.variant,
+++             "reason": f"expected {want} measured records, got {len(res)}"}
+++        print(json.dumps(r, ensure_ascii=False), flush=True)
+++        res.append(r)
+++    with open(OUT / f"twolines-{a.variant}.jsonl", "a", encoding="utf-8") as f:
+++        for r in res:
+++            f.write(json.dumps(dict(r, variant=a.variant, t=time.strftime("%H:%M:%S")), ensure_ascii=False) + "\n")
+++    if not res or any(not r.get("pass") for r in res):
+++        sys.exit(1)
+++
+++
++ def main():
++     ap = argparse.ArgumentParser()
++-    ap.add_argument("what", choices=["c1", "c3", "ja", "needle", "tail", "serve", "stop"])
+++    ap.add_argument("what", choices=["c1", "c3", "ja", "needle", "tail", "twolines", "serve", "stop"])
++     ap.add_argument("--variant", default="cached", choices=["cold", "cached", "prod"])
++     ap.add_argument("--extra", default="")
++     ap.add_argument("--reps", type=int, default=3)
++@@ -865,6 +1412,20 @@ def main():
++         if a.reps < 1:  # zero tests must not pass
++             sys.exit("tail needs --reps >= 1")
++         extra = extra + list(TAIL_ISOLATION)  # complete list last so its options win
+++    if a.what == "twolines":
+++        if a.variant != "cached":  # tips under test; prod runs the old binary, cold disables tips
+++            sys.exit("twolines requires --variant cached")
+++        if a.reps < 1:  # zero tests must not pass
+++            sys.exit("twolines needs --reps >= 1")
+++        pre = twolines_preflight()  # CPU-only sizing/setup BEFORE starting any server (no GPU here)
+++        if not pre.get("ok"):
+++            print(json.dumps({"tag": "twolines.preflight", "pass": False,
+++                              **{k: v for k, v in pre.items() if k != "ok"}}, ensure_ascii=False), flush=True)
+++            sys.exit(2)
+++        print(json.dumps({"tag": "twolines.preflight", "pass": True,
+++                          **{k: v for k, v in pre.items() if k != "ok"}}, ensure_ascii=False), flush=True)
+++        extra = extra + list(TWOLINES_ISOLATION)  # complete list last so its options win
+++        return run_twolines(a, extra)
++     log = start(a.variant, extra)
++     if a.what == "serve":
++         return
+-- 
+2.54.0.windows.1
+

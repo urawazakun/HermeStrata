@@ -1,0 +1,38 @@
+From 75a52845b04a451c0c8997a12906ed6bf069f11d Mon Sep 17 00:00:00 2001
+From: Muse <30615262+urawazakun@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 14:54:56 +0900
+Subject: [PATCH 19/21] Vision: bound cached embeddings at 400 by default
+
+Public form of bc4f905. Original implementation Muse, plan Claude Sonnet 5.5; maintenance integration Muse-2, reviewed Sol. Keep STRATA_VISION_CACHE configurable.
+---
+ serve/server.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index 737fcfd..bfd6d5c 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -485,6 +485,11 @@ class StrataEngine:
+                 self.ended = True
+ 
+ 
++# A long conversation keeps every screenshot in its history and each request needs all of their embedding files: a
++# cache smaller than that deleted a file the same request was about to read (FileNotFoundError at ~64 images).
++VISION_CACHE_MAX = int(os.environ.get("STRATA_VISION_CACHE", "400"))
++
++
+ class Vision:
+     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
+     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
+@@ -589,7 +594,7 @@ class Vision:
+                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                      "the vision encoder stopped"))
+             self.cache[key] = (out, int(line.split()[1]))
+-            if len(self.cache) > 64:                                   # oldest first
++            if len(self.cache) > VISION_CACHE_MAX:                     # oldest first
+                 old = next(iter(self.cache))
+                 self.cache.pop(old)[0].unlink(missing_ok=True)
+             return self.cache[key]
+-- 
+2.54.0.windows.1
+
