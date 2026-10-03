@@ -1,3 +1,7 @@
+> **FROZEN (2026-10-03): this is the one-V100 edition and it is no longer updated.** Development continues for a two-V100 machine in
+> [urawazakun/HermeStrata-2xV100](https://github.com/urawazakun/HermeStrata-2xV100), which starts from this repo's final state (`f9137fd`).
+> Tag `single-v100-final` marks it.
+
 # HermeStrata
 
 A local agent stack for **one user, one GPU, one serialized engine slot with multiple cached conversation lines**:
